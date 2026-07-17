@@ -1,9 +1,13 @@
 """OpenAI 专用 HTTP 客户端"""
+import json
+import logging
 from typing import Any, Dict, Optional, Tuple
+
+from curl_cffi import requests as cffi_requests
 
 from core.http_client import HTTPClient, HTTPClientError, RequestConfig
 from .constants import ERROR_MESSAGES
-import logging
+
 logger = logging.getLogger(__name__)
 
 class OpenAIHTTPClient(HTTPClient):

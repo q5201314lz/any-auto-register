@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -14,6 +15,15 @@ from typing import Callable, Optional
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+def _mask_phone_for_log(phone_number: str) -> str:
+    text = str(phone_number or "").strip()
+    if len(text) <= 4:
+        return text
+    if len(text) <= 8:
+        return f"{text[:2]}****{text[-2:]}"
+    return f"{text[:4]}****{text[-2:]}"
 
 
 @dataclass
@@ -191,6 +201,7 @@ HERO_SMS_PHONE_LIFETIME = 20 * 60
 _HERO_SMS_CACHE_LOCK = threading.Lock()
 _HERO_SMS_VERIFY_LOCK = threading.RLock()
 _HERO_SMS_CACHE: dict | None = None
+_PHONE_USAGE_LOCK = threading.Lock()
 
 
 def _project_data_dir() -> Path:
@@ -202,6 +213,65 @@ def _project_data_dir() -> Path:
 
 def hero_sms_cache_file() -> Path:
     return _project_data_dir() / ".herosms_phone_cache.json"
+
+
+def used_phone_numbers_file() -> Path:
+    return _project_data_dir() / ".used_phone_numbers.json"
+
+
+def _normalize_phone_identity(phone_number: str) -> str:
+    digits = "".join(ch for ch in str(phone_number or "") if ch.isdigit())
+    return digits.lstrip("0") or digits
+
+
+def _load_used_phone_numbers() -> dict:
+    path = used_phone_numbers_file()
+    if not path.exists():
+        return {"phones": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            phones = data.get("phones")
+            if isinstance(phones, dict):
+                return data
+            # 兼容旧的 list/set 格式
+            if isinstance(phones, list):
+                return {"phones": {str(x): {"legacy": True} for x in phones}}
+    except Exception:
+        pass
+    return {"phones": {}}
+
+
+def _save_used_phone_numbers(data: dict) -> None:
+    path = used_phone_numbers_file()
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def is_phone_number_used(phone_number: str) -> bool:
+    key = _normalize_phone_identity(phone_number)
+    if not key:
+        return False
+    with _PHONE_USAGE_LOCK:
+        data = _load_used_phone_numbers()
+        return key in (data.get("phones") or {})
+
+
+def mark_phone_number_used(phone_number: str, *, provider_key: str = "", activation_id: str = "", service: str = "", country: str = "") -> None:
+    key = _normalize_phone_identity(phone_number)
+    if not key:
+        return
+    with _PHONE_USAGE_LOCK:
+        data = _load_used_phone_numbers()
+        phones = data.setdefault("phones", {})
+        phones.setdefault(key, {
+            "phone_number": str(phone_number or ""),
+            "provider_key": str(provider_key or ""),
+            "activation_id": str(activation_id or ""),
+            "service": str(service or ""),
+            "country": str(country or ""),
+            "first_used_at": int(time.time()),
+        })
+        _save_used_phone_numbers(data)
 
 
 def _hash_secret(value: str) -> str:
@@ -577,6 +647,56 @@ class HeroSmsProvider(BaseSmsProvider):
             return country_id
 
         return None
+
+    def get_candidate_countries(self, service: str | None = None, *, min_stock: int = 1, max_price: float = 0, limit: int = 12) -> list[str]:
+        """Return multiple candidate countries for rental retries.
+
+        HeroSMS price/rank stock can be stale: a country may show stock but getNumber
+        immediately returns NO_NUMBERS.  For add_phone we therefore try a small
+        ordered list instead of failing after the first candidate.
+        """
+        try:
+            rows = self.get_top_countries(service=service)
+        except Exception as exc:
+            logger.warning("get_candidate_countries 查询失败: %s", exc)
+            rows = []
+
+        candidates: list[str] = []
+        preferred = [
+            str(self.default_country or "").strip(),
+            "52",   # Thailand, historically most likely to use SMS for OpenAI
+            "57",   # user/default may use Colombia-like provider ID
+            "187",  # US in SMS-Activate style mappings, sometimes supported by compatible APIs
+        ]
+        for country_id in preferred:
+            if country_id and country_id not in candidates:
+                candidates.append(country_id)
+
+        def add_from_rows(require_stock: bool):
+            for row in rows:
+                country_id = str(row.get("country") or "").strip()
+                if not country_id or country_id in candidates:
+                    continue
+                try:
+                    price = float(row.get("price") or 0)
+                except Exception:
+                    price = 0.0
+                try:
+                    count = int(row.get("count") or 0)
+                except Exception:
+                    count = 0
+                if require_stock and count < min_stock:
+                    continue
+                if max_price > 0 and price > max_price:
+                    continue
+                candidates.append(country_id)
+                if len(candidates) >= limit:
+                    return
+
+        add_from_rows(True)
+        if len(candidates) < limit:
+            add_from_rows(False)
+        return candidates[:limit]
 
     def _cache_identity(self, service: str, country: str) -> dict:
         return {
@@ -1081,7 +1201,7 @@ def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
             default_country=str(config.get("sms_country") or config.get("herosms_country") or config.get("herosms_default_country") or HERO_SMS_DEFAULT_COUNTRY),
             max_price=_safe_float(config.get("herosms_max_price"), -1),
             proxy=str(config.get("sms_proxy") or config.get("proxy") or "") or None,
-            reuse_phone_to_max=_safe_bool(config.get("register_reuse_phone_to_max"), True),
+            reuse_phone_to_max=False,
             phone_success_max=max(0, _safe_int(config.get("register_phone_extra_max") or config.get("register_phone_success_max"), 3)),
         )
     if provider_key in ("smsbower", "smsbower_api"):
@@ -1094,7 +1214,7 @@ def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
             default_country=str(config.get("sms_country") or config.get("smsbower_country") or config.get("smsbower_default_country") or HERO_SMS_DEFAULT_COUNTRY),
             max_price=_safe_float(config.get("smsbower_max_price"), -1),
             proxy=str(config.get("sms_proxy") or config.get("proxy") or "") or None,
-            reuse_phone_to_max=_safe_bool(config.get("register_reuse_phone_to_max"), True),
+            reuse_phone_to_max=False,
             phone_success_max=max(0, _safe_int(config.get("register_phone_extra_max") or config.get("register_phone_success_max"), 3)),
         )
     raise RuntimeError(f"未知的接码服务: {provider_key}")
@@ -1124,70 +1244,106 @@ class PhoneCallbackController:
     def __call__(self) -> str:
         provider = self._provider()
         if self.phase == "need_number":
-            if self.provider_key == "herosms" and not self._verify_lock_acquired:
+            if self.provider_key in ("herosms", "herosms_api", "smsbower", "smsbower_api") and not self._verify_lock_acquired:
                 _HERO_SMS_VERIFY_LOCK.acquire()
                 self._verify_lock_acquired = True
 
-            # 智能国家选择：如果启用了 auto_select_country，自动查询最优国家
+            # 智能国家选择：如果启用了 auto_select_country，生成多个候选国家逐个租号。
             effective_country = self.country
             auto_select = _safe_bool(self.config.get("herosms_auto_country") or self.config.get("smsbower_auto_country"), False)
+            countries: list[str] = []
             if auto_select and isinstance(provider, HeroSmsProvider):
-                self.log("正在查询最优国家（价格最低 + 库存充足）...")
+                self.log("正在查询可用国家（按价格/库存排序，失败自动换国家）...")
                 try:
-                    min_stock = _safe_int(self.config.get("herosms_auto_country_min_stock") or self.config.get("smsbower_auto_country_min_stock"), 20)
+                    min_stock = _safe_int(self.config.get("herosms_auto_country_min_stock") or self.config.get("smsbower_auto_country_min_stock"), 1)
                     max_price_limit = _safe_float(self.config.get("herosms_auto_country_max_price") or self.config.get("smsbower_auto_country_max_price"), 0)
-                    best = provider.get_best_country(
+                    countries = provider.get_candidate_countries(
                         service=self.service,
                         min_stock=min_stock,
                         max_price=max_price_limit,
+                        limit=12,
                     )
-                    if best:
-                        self.log(f"自动选择最优国家: {best}")
-                        effective_country = best
+                    if countries:
+                        self.log(f"候选国家: {', '.join(countries)}")
                     else:
-                        self.log("未找到满足条件的国家，使用默认配置")
+                        self.log("未查询到候选国家，使用默认配置")
                 except Exception as exc:
                     self.log(f"智能国家选择失败({exc})，使用默认配置")
 
-            country_label = effective_country or self.config.get("sms_country") or self.config.get("sms_activate_country") or "default"
-            self.log(f"已进入 add_phone，准备租用手机号: provider={self.provider_key} service={self.service} country={country_label}")
-            self.log(f"正在从 {self.provider_key} 获取手机号...")
-            try:
-                self.activation = provider.get_number(service=self.service, country=effective_country)
-            except Exception as first_exc:
-                # 如果是自动选择的国家失败了，回退到默认国家重试
-                fallback_country = self.country or self.config.get("sms_country") or self.config.get("herosms_country") or ""
-                if auto_select and effective_country != fallback_country and fallback_country:
-                    self.log(f"自动选择的国家({effective_country})获取号码失败，回退到默认国家({fallback_country})...")
+            fallback_country = self.country or self.config.get("sms_country") or self.config.get("herosms_country") or self.config.get("herosms_default_country") or ""
+            if effective_country and effective_country not in countries:
+                countries.insert(0, effective_country)
+            if fallback_country and fallback_country not in countries:
+                countries.append(str(fallback_country))
+            if not countries:
+                countries = [effective_country or fallback_country or ""]
+
+            last_exc = None
+            max_number_attempts = max(1, _safe_int(self.config.get("sms_no_reuse_max_attempts"), 5))
+            for idx, country_id in enumerate(countries, start=1):
+                country_label = country_id or self.config.get("sms_activate_country") or "default"
+                for number_attempt in range(1, max_number_attempts + 1):
+                    suffix = f" ({idx}/{len(countries)}, {number_attempt}/{max_number_attempts})"
+                    self.log(f"正在租用手机号: provider={self.provider_key} country={country_label}{suffix}")
+                    activation = None
                     try:
-                        self.activation = provider.get_number(service=self.service, country=fallback_country)
-                    except Exception:
-                        if self._verify_lock_acquired:
-                            _HERO_SMS_VERIFY_LOCK.release()
-                            self._verify_lock_acquired = False
-                        raise
-                else:
-                    if self._verify_lock_acquired:
-                        _HERO_SMS_VERIFY_LOCK.release()
-                        self._verify_lock_acquired = False
-                    raise
+                        activation = provider.get_number(service=self.service, country=country_id)
+                        if is_phone_number_used(activation.phone_number):
+                            self.log(f"跳过已用手机号: {_mask_phone_for_log(activation.phone_number)}")
+                            try:
+                                provider.cancel(activation.activation_id)
+                            except Exception:
+                                pass
+                            self.activation = None
+                            activation = None
+                            last_exc = RuntimeError("服务商返回已用手机号，已跳过")
+                            continue
+
+                        mark_phone_number_used(
+                            activation.phone_number,
+                            provider_key=self.provider_key,
+                            activation_id=activation.activation_id,
+                            service=self.service,
+                            country=str(country_id or country_label or ""),
+                        )
+                        self.activation = activation
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        self.log(f"国家({country_label})获取号码失败: {str(exc)[:160]}")
+                        try:
+                            if activation is not None:
+                                provider.cancel(activation.activation_id)
+                            if isinstance(provider, HeroSmsProvider):
+                                provider._clear_cache()
+                        except Exception:
+                            pass
+                        continue
+                if self.activation:
+                    break
+
+            if not self.activation:
+                if self._verify_lock_acquired:
+                    _HERO_SMS_VERIFY_LOCK.release()
+                    self._verify_lock_acquired = False
+                raise last_exc or RuntimeError("未获取到可用手机号")
             self.phase = "need_code"
             reused = bool((self.activation.metadata or {}).get("reused"))
             reuse_label = "复用号码" if reused else "新号码"
-            self.log(f"已成功租到号码({reuse_label}): {self.activation.phone_number} (activation_id={self.activation.activation_id})")
+            self.log(f"租号成功({reuse_label}): {_mask_phone_for_log(self.activation.phone_number)}")
             return self.activation.phone_number
 
         if self.phase == "need_code" and self.activation:
-            self.log(f"等待短信验证码... (activation_id={self.activation.activation_id})")
+            self.log("等待短信验证码...")
             code = provider.get_code(self.activation.activation_id, timeout=180)
             if code:
-                self.log(f"收到验证码: {code}")
+                self.log("收到短信验证码")
                 if getattr(provider, "auto_report_success_on_code", True):
                     self.report_success()
                 else:
                     self.awaiting_external_success = True
             else:
-                self.log(f"⚠️ 未收到验证码: activation_id={self.activation.activation_id}")
+                self.log("⚠️ 未收到短信验证码")
             return code
         return ""
 
@@ -1225,7 +1381,7 @@ class PhoneCallbackController:
             self.completed = True
             self.phase = "done"
             self.awaiting_external_success = False
-            self.log(f"短信验证成功，已标记号码完成使用: activation_id={self.activation.activation_id}")
+            self.log("短信验证成功")
         if self._verify_lock_acquired:
             _HERO_SMS_VERIFY_LOCK.release()
             self._verify_lock_acquired = False
@@ -1238,7 +1394,7 @@ class PhoneCallbackController:
                     self.report_success()
                 else:
                     provider.cancel(self.activation.activation_id)
-                    self.log(f"已释放未使用号码: activation_id={self.activation.activation_id}")
+                    self.log("已释放未使用号码")
             except Exception:
                 pass
         if self._verify_lock_acquired:

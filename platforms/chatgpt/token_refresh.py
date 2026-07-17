@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Token 刷新模块
 支持 Session Token 和 OAuth Refresh Token 两种刷新方式
@@ -54,9 +56,9 @@ class TokenRefreshManager:
             proxy_url: 代理 URL
         """
         self.proxy_url = proxy_url
-        from .constants import OAUTH_CLIENT_ID, OAUTH_REDIRECT_URI
-        self._oauth_client_id = OAUTH_CLIENT_ID
-        self._oauth_redirect_uri = OAUTH_REDIRECT_URI
+        from .constants import CODEX_CLIENT_ID, CODEX_REDIRECT_URI
+        self._oauth_client_id = CODEX_CLIENT_ID
+        self._oauth_redirect_uri = CODEX_REDIRECT_URI
 
     def _create_session(self) -> cffi_requests.Session:
         """创建 HTTP 会话"""

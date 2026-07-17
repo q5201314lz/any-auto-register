@@ -4,8 +4,12 @@ HTTP 客户端封装
 基于 curl_cffi 的 HTTP 请求封装，支持代理和错误处理
 """
 
+import os
+import subprocess
+import sys
 import time
 import json
+from functools import lru_cache
 from typing import Optional, Dict, Any, Union, Tuple
 from dataclasses import dataclass
 import logging
@@ -36,6 +40,71 @@ class HTTPClientError(Exception):
     pass
 
 
+def _is_curl_tls_connect_error(exc: BaseException) -> bool:
+    text = str(exc or "").lower()
+    return (
+        "curl: (35)" in text
+        or "tls connect error" in text
+        or "openssl_internal:invalid library" in text
+        or "invalid library (0)" in text
+    )
+
+
+def _normalize_proxy_url(proxy: Optional[str]) -> Optional[str]:
+    value = str(proxy or "").strip()
+    if not value:
+        return None
+    if "://" not in value:
+        value = f"http://{value}"
+    return value
+
+
+@lru_cache(maxsize=1)
+def _system_proxy_url() -> Optional[str]:
+    """Return the active OS/env proxy for outbound HTTPS requests.
+
+    macOS system proxy is not exposed through environment variables to services
+    started from the app.  Without this, OpenAI domains can resolve to fake-ip
+    addresses and curl_cffi fails with curl (35) TLS connect errors.
+    """
+    if str(os.environ.get("ACCOUNT_MANAGER_DISABLE_SYSTEM_PROXY") or "").lower() in {"1", "true", "yes", "on"}:
+        return None
+
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        proxy = _normalize_proxy_url(os.environ.get(key))
+        if proxy:
+            return proxy
+
+    if sys.platform != "darwin":
+        return None
+
+    try:
+        out = subprocess.check_output(["scutil", "--proxy"], text=True, timeout=2)
+    except Exception:
+        return None
+
+    data: dict[str, str] = {}
+    for line in out.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        data[key.strip()] = value.strip()
+
+    for prefix in ("HTTPS", "HTTP"):
+        if data.get(f"{prefix}Enable") != "1":
+            continue
+        host = data.get(f"{prefix}Proxy")
+        port = data.get(f"{prefix}Port")
+        if host and port:
+            return f"http://{host}:{port}"
+    return None
+
+
+def resolve_proxy_url(proxy_url: Optional[str]) -> Optional[str]:
+    """Use explicit proxy first, otherwise inherit OS/env proxy."""
+    return _normalize_proxy_url(proxy_url) or _system_proxy_url()
+
+
 class HTTPClient:
     """
     HTTP 客户端封装
@@ -56,7 +125,7 @@ class HTTPClient:
             config: 请求配置
             session: 可重用的会话对象
         """
-        self.proxy_url = proxy_url
+        self.proxy_url = resolve_proxy_url(proxy_url)
         self.config = config or RequestConfig()
         self._session = session
 
@@ -131,6 +200,11 @@ class HTTPClient:
 
             except (cffi_requests.RequestsError, ConnectionError, TimeoutError) as e:
                 last_exception = e
+                if _is_curl_tls_connect_error(e):
+                    self._session = None
+                    fallback_response = self._request_with_tls_fallback(method, url, kwargs)
+                    if fallback_response is not None:
+                        return fallback_response
                 logger.warning(
                     f"请求失败: {method} {url} (attempt {attempt + 1}/{self.config.max_retries}): {e}"
                 )
@@ -143,6 +217,40 @@ class HTTPClient:
         raise HTTPClientError(
             f"请求失败，最大重试次数已达: {method} {url} - {last_exception}"
         )
+
+    def _request_with_tls_fallback(
+        self,
+        method: str,
+        url: str,
+        kwargs: dict[str, Any],
+    ) -> Optional[Response]:
+        """Retry curl TLS connect failures with a fresh session and safer TLS profiles."""
+        fallback_profiles = ["chrome120", "chrome110"]
+        proxy_candidates: list[Optional[Dict[str, str]]] = [self.proxies]
+        if self.proxies:
+            # If the proxy itself triggers curl/OpenSSL TLS failures, allow one
+            # direct fallback so the task does not waste the reserved mailbox.
+            proxy_candidates.append(None)
+
+        for proxies in proxy_candidates:
+            for impersonate in fallback_profiles:
+                try:
+                    request_kwargs = dict(kwargs)
+                    request_kwargs["proxies"] = proxies
+                    request_kwargs.setdefault("timeout", self.config.timeout)
+                    request_kwargs.setdefault("allow_redirects", self.config.follow_redirects)
+                    session = Session(
+                        proxies=proxies,
+                        impersonate=impersonate,
+                        verify=self.config.verify_ssl,
+                        timeout=self.config.timeout,
+                    )
+                    return session.request(method, url, **request_kwargs)
+                except (cffi_requests.RequestsError, ConnectionError, TimeoutError) as exc:
+                    if _is_curl_tls_connect_error(exc):
+                        continue
+                    raise
+        return None
 
     def get(self, url: str, **kwargs) -> Response:
         """发送 GET 请求"""

@@ -20,6 +20,7 @@ _debug_*.py
 # 日志
 logs/
 *.log
+.playwright-cli/
 
 # 账号数据
 accounts.txt
@@ -55,6 +56,8 @@ docs/
 
 # macOS
 .DS_Store
+com.codex*.plist
+run-local.sh
 
 # IDE
 .idea/
@@ -71,3 +74,7 @@ docs/REFACTOR-PLAN.md
 
 # 敏感文件
 *.har
+
+# 本地调试备份
+*.bak
+*.bak.*

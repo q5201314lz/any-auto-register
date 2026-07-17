@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -51,6 +52,26 @@ ACTIVE_TASK_STATUSES = {
 
 _task_locks: dict[str, threading.Lock] = {}
 _task_locks_guard = threading.Lock()
+_task_cancel_events: dict[str, threading.Event] = {}
+_task_cancel_events_guard = threading.Lock()
+
+
+def _cancel_event(task_id: str) -> threading.Event:
+    with _task_cancel_events_guard:
+        event = _task_cancel_events.get(task_id)
+        if event is None:
+            event = threading.Event()
+            _task_cancel_events[task_id] = event
+        return event
+
+
+def _set_cancel_event(task_id: str) -> None:
+    _cancel_event(task_id).set()
+
+
+def _clear_cancel_event(task_id: str) -> None:
+    with _task_cancel_events_guard:
+        _task_cancel_events.pop(task_id, None)
 
 
 def _utcnow() -> datetime:
@@ -73,6 +94,83 @@ def _json_default(value: Any) -> Any:
 
 def _dump_json(data: Any) -> str:
     return json.dumps(data or {}, ensure_ascii=False, default=_json_default)
+
+
+_TASK_VERBOSE_LOGS = str(os.getenv("ACCOUNT_MANAGER_VERBOSE_TASK_LOGS", "") or "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+_NOISY_TASK_LOG_MARKERS = (
+    "selector",
+    "selectors",
+    "可见按钮",
+    "按钮:",
+    "按钮列表",
+    "page_type=",
+    "keys=",
+    "headers",
+    "cookie",
+    "Sentinel token",
+    "Sentinel 检查",
+    "device_id",
+    "redirect_uri",
+    "callback_url",
+    "提交注册表单状态",
+    "HTTP ",
+    "浏览器当前 URL",
+    "等待页面",
+    "已填写",
+    "已点击",
+)
+
+
+def _should_emit_task_event(message: str, *, level: str = "info", event_type: str = "log") -> bool:
+    """Keep task logs readable by default; verbose protocol/browser traces are opt-in."""
+    if _TASK_VERBOSE_LOGS:
+        return True
+    if level in {"warning", "error"} or event_type in {"state", "summary"}:
+        return True
+    text = str(message or "")
+    if not text:
+        return False
+    return not any(marker in text for marker in _NOISY_TASK_LOG_MARKERS)
+
+
+SENSITIVE_PAYLOAD_KEYS = {
+    "password",
+    "pass",
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "session_token",
+    "api_key",
+    "apikey",
+    "secret",
+    "client_secret",
+    "authorization",
+    "cookie",
+    "cookies",
+}
+
+
+def _redact_for_detail(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            lowered = str(key or "").lower()
+            if any(token in lowered for token in SENSITIVE_PAYLOAD_KEYS):
+                text = str(item or "")
+                redacted[key] = f"{text[:4]}...{text[-4:]}" if len(text) > 10 else "***"
+            else:
+                redacted[key] = _redact_for_detail(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_for_detail(item) for item in value]
+    return value
 
 
 def _task_lock(task_id: str) -> threading.Lock:
@@ -128,6 +226,7 @@ def _task_account_keys(task_type: str, payload: dict[str, Any]) -> list[str]:
 
 def serialize_task(task: TaskModel) -> dict[str, Any]:
     result = task.get_result()
+    payload = task.get_payload()
     progress_total = int(task.progress_total or 0)
     progress_current = int(task.progress_current or 0)
     return {
@@ -150,6 +249,7 @@ def serialize_task(task: TaskModel) -> dict[str, Any]:
         "cashier_urls": list(result.get("cashier_urls", [])),
         "data": result.get("data"),
         "result": result,
+        "payload": _redact_for_detail(payload),
         "error": task.error,
         "created_at": _serialize_datetime(task.created_at),
         "started_at": _serialize_datetime(task.started_at),
@@ -294,21 +394,24 @@ def append_task_event(task_id: str, message: str, *, event_type: str = "log", le
 
 
 def mark_incomplete_tasks_interrupted() -> None:
+    interrupted_task_ids: list[str] = []
     with Session(engine) as session:
         non_terminal = [TASK_STATUS_PENDING] + list(ACTIVE_TASK_STATUSES)
         tasks = session.exec(
             select(TaskModel).where(TaskModel.status.in_(non_terminal))
         ).all()
+        interrupted_task_ids = [str(task.id) for task in tasks]
+        now = _utcnow()
         for task in tasks:
             task.status = TASK_STATUS_INTERRUPTED
             task.error = task.error or "任务在服务重启后被中断"
-            task.finished_at = _utcnow()
-            task.updated_at = _utcnow()
+            task.finished_at = now
+            task.updated_at = now
             session.add(task)
         session.commit()
-    for task in tasks:
+    for task_id in interrupted_task_ids:
         append_task_event(
-            task.id,
+            task_id,
             "任务在服务重启后被标记为中断",
             event_type="state",
             level="warning",
@@ -316,25 +419,28 @@ def mark_incomplete_tasks_interrupted() -> None:
 
 
 def request_cancel(task_id: str) -> Optional[dict[str, Any]]:
+    _set_cancel_event(task_id)
     task = _mutate_task(
         task_id,
         lambda model: _request_cancel_mutation(model),
     )
     if not task:
+        _clear_cancel_event(task_id)
         return None
-    append_task_event(task_id, "已请求取消任务", event_type="state", level="warning")
+    if task.status in TERMINAL_TASK_STATUSES and task.status != TASK_STATUS_CANCELLED:
+        _clear_cancel_event(task_id)
+        append_task_event(task_id, "任务已结束，无需终止", event_type="state", level="warning")
+    else:
+        append_task_event(task_id, "已立即终止任务", event_type="state", level="warning")
     return serialize_task(task)
 
 
 def _request_cancel_mutation(task: TaskModel) -> None:
     if task.status in TERMINAL_TASK_STATUSES:
         return
-    if task.status == TASK_STATUS_PENDING:
-        task.status = TASK_STATUS_CANCELLED
-        task.finished_at = _utcnow()
-        task.error = task.error or "任务在开始前被取消"
-    else:
-        task.status = TASK_STATUS_CANCEL_REQUESTED
+    task.status = TASK_STATUS_CANCELLED
+    task.finished_at = _utcnow()
+    task.error = task.error or "任务已被手动终止"
 
 
 def claim_next_runnable_task(
@@ -373,6 +479,8 @@ class TaskLogger:
         self.task_id = task_id
 
     def log(self, message: str, *, level: str = "info", event_type: str = "log", detail: dict | None = None) -> None:
+        if not _should_emit_task_event(message, level=level, event_type=event_type):
+            return
         append_task_event(
             self.task_id,
             message,
@@ -384,6 +492,8 @@ class TaskLogger:
 
     def mark_running(self) -> None:
         def _update(task: TaskModel) -> None:
+            if task.status in TERMINAL_TASK_STATUSES:
+                return
             task.status = TASK_STATUS_RUNNING
             task.started_at = task.started_at or _utcnow()
 
@@ -391,9 +501,12 @@ class TaskLogger:
         self.log("任务已开始执行", event_type="state")
 
     def is_cancel_requested(self) -> bool:
+        event = _cancel_event(self.task_id)
+        if event.is_set():
+            return True
         with Session(engine) as session:
             task = session.get(TaskModel, self.task_id)
-            return bool(task and task.status == TASK_STATUS_CANCEL_REQUESTED)
+            return bool(task and task.status in {TASK_STATUS_CANCEL_REQUESTED, TASK_STATUS_CANCELLED, TASK_STATUS_INTERRUPTED})
 
     def set_progress(self, current: int, total: Optional[int] = None) -> None:
         current = max(int(current), 0)
@@ -442,12 +555,16 @@ class TaskLogger:
 
     def finish(self, status: str, *, error: str = "") -> None:
         def _update(task: TaskModel) -> None:
+            if task.status in TERMINAL_TASK_STATUSES and task.status != status:
+                return
             task.status = status
             task.finished_at = _utcnow()
             if error:
                 task.error = error
 
-        _mutate_task(self.task_id, _update)
+        updated = _mutate_task(self.task_id, _update)
+        if updated and updated.status != status:
+            return
         event_level = "error" if status == TASK_STATUS_FAILED else ("warning" if status in {TASK_STATUS_INTERRUPTED, TASK_STATUS_CANCELLED} else "info")
         self.log(
             f"任务结束: {status}",
@@ -455,6 +572,11 @@ class TaskLogger:
             event_type="state",
             detail={"status": status, "error": error},
         )
+        # Keep the in-memory cancel flag for cancelled tasks: a detached worker
+        # may still return from a long HTTP/browser/SMS call later and must
+        # still skip saving side effects.
+        if status in TERMINAL_TASK_STATUSES and status != TASK_STATUS_CANCELLED:
+            _clear_cancel_event(self.task_id)
 
 
 def _auto_push_any2api(task_logger: TaskLogger, account) -> None:
@@ -549,6 +671,9 @@ def _run_single_account_check(account_id: int, logger: TaskLogger | None = None)
             summary_updates = {"checked_at": _utcnow_iso(), "valid": bool(valid)}
             if hasattr(plugin, "get_last_check_overview"):
                 summary_updates.update(plugin.get_last_check_overview() or {})
+            credential_updates = None
+            if hasattr(plugin, "get_last_check_credentials"):
+                credential_updates = plugin.get_last_check_credentials() or None
             lifecycle_status = None
             if valid:
                 lifecycle_status = recover_lifecycle_status_for_valid_account(current_graph)
@@ -557,6 +682,7 @@ def _run_single_account_check(account_id: int, logger: TaskLogger | None = None)
                 model,
                 lifecycle_status=lifecycle_status,
                 summary_updates=summary_updates,
+                credential_updates=credential_updates,
             )
             session.add(model)
             session.commit()
@@ -689,6 +815,23 @@ def _auto_followup_windsurf_payment(
         logger.add_cashier_url(cashier_url)
 
 
+def _release_failed_mailbox_reservation(platform: Any, logger: "TaskLogger") -> None:
+    """Release a local mailbox-pool reservation when the account was not saved."""
+    try:
+        identity = getattr(platform, "_last_identity", None)
+        mailbox_account = getattr(identity, "mailbox_account", None)
+        mailbox = getattr(platform, "mailbox", None)
+        release = getattr(mailbox, "release_email", None)
+        if mailbox_account is None or not callable(release):
+            return
+        released = release(mailbox_account)
+        if released:
+            email = str(getattr(mailbox_account, "email", "") or "")
+            logger.log(f"失败任务已释放邮箱占用: {email}", level="warning")
+    except Exception as exc:
+        logger.log(f"释放邮箱占用失败: {exc}", level="warning")
+
+
 def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     from core.proxy_pool import proxy_pool
 
@@ -702,7 +845,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     sms_provider_key, sms_settings = _resolve_sms_provider_for_task(extra)
     herosms_enabled = sms_provider_key == "herosms" and bool(str(sms_settings.get("herosms_api_key") or "").strip())
     hero_extra_max = max(_int_config(sms_settings.get("register_phone_extra_max"), 3), 0) if herosms_enabled else 0
-    hero_reuse_to_max = _bool_config(sms_settings.get("register_reuse_phone_to_max"), True) if herosms_enabled else False
+    hero_reuse_to_max = False
     target_success = count
     max_success = count + hero_extra_max if herosms_enabled and hero_reuse_to_max else count
     progress_total = max_success if herosms_enabled else count
@@ -710,8 +853,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     logger.set_progress(0, progress_total)
     if herosms_enabled:
         logger.log(
-            f"HeroSMS 模式: 成功目标 {target_success}，失败自动补尝试，"
-            f"号码仍可复用时最多额外成功 {hero_extra_max} 个"
+            f"HeroSMS 模式: 成功目标 {target_success}，失败自动补尝试；手机号不复用"
         )
 
     try:
@@ -757,6 +899,15 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             if resolved_proxy:
                 logger.log(f"使用代理: {resolved_proxy}")
             account = platform.register(email=email, password=password)
+            if platform_name == "chatgpt":
+                account_extra = dict(getattr(account, "extra", {}) or {})
+                if not str(account_extra.get("refresh_token") or account_extra.get("rt") or "").strip():
+                    _release_failed_mailbox_reservation(platform, logger)
+                    raise RuntimeError("ChatGPT/Codex 未获取到 refresh_token(rt)，不计入成功")
+            if logger.is_cancel_requested():
+                _release_failed_mailbox_reservation(platform, logger)
+                logger.log("任务已终止，跳过保存本次账号", level="warning")
+                return "__cancel_requested__"
             save_account(account)
             _auto_followup_windsurf_payment(
                 platform_name=platform_name,
@@ -782,6 +933,10 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         except Exception as exc:
             if resolved_proxy:
                 proxy_pool.report_fail(resolved_proxy)
+            if logger.is_cancel_requested():
+                _release_failed_mailbox_reservation(platform, logger)
+                return "__cancel_requested__"
+            _release_failed_mailbox_reservation(platform, logger)
             error = str(exc)
             logger.record_error(error)
             logger.log(f"✗ 注册失败: {error}", level="error")
@@ -824,15 +979,27 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 return False
             return _hero_phone_alive()
 
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        pool = ThreadPoolExecutor(max_workers=concurrency)
+        cancelled = False
+        try:
             while _should_submit_more() and len(futures) < concurrency:
                 futures[pool.submit(_do_one, submitted)] = submitted
                 submitted += 1
 
             while futures:
-                done, _ = wait(set(futures.keys()), return_when=FIRST_COMPLETED)
+                if logger.is_cancel_requested():
+                    cancelled = True
+                    for future in list(futures.keys()):
+                        future.cancel()
+                    futures.clear()
+                    break
+                done, _ = wait(set(futures.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
                 for future in done:
                     futures.pop(future, None)
+                    if future.cancelled():
+                        continue
                     result = future.result()
                     completed += 1
                     if result is True:
@@ -843,9 +1010,12 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 while _should_submit_more() and len(futures) < concurrency:
                     futures[pool.submit(_do_one, submitted)] = submitted
                     submitted += 1
-                if logger.is_cancel_requested() and not futures:
-                    break
+        finally:
+            pool.shutdown(wait=not cancelled, cancel_futures=cancelled)
     except Exception as exc:
+        if logger.is_cancel_requested():
+            logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+            return
         logger.log(f"致命错误: {exc}", level="error")
         logger.finish(TASK_STATUS_FAILED, error=str(exc))
         return
@@ -857,7 +1027,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             "success": success,
             "fail": len(errors),
             "extra_success": max(0, success - target_success),
-            "hero_sms_reuse": True,
+            "hero_sms_reuse": False,
         })
     summary = f"完成: 成功 {success} 个, 失败 {len(errors)} 个"
     logger.log(summary, event_type="summary")

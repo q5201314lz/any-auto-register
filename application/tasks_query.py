@@ -48,6 +48,8 @@ class TasksQueryService:
             "type": item.type,
             "platform": item.platform,
             "status": item.status,
+            "terminal": item.terminal,
+            "cancellable": item.cancellable,
             "progress": item.progress.label,
             "progress_detail": {
                 "current": item.progress.current,
@@ -64,4 +66,5 @@ class TasksQueryService:
             "finished_at": serialize_datetime(item.finished_at),
             "updated_at": serialize_datetime(item.updated_at),
             "result": item.result,
+            "payload": item.payload,
         }

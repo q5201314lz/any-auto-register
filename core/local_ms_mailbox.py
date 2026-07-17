@@ -1,9 +1,11 @@
-"""Local Microsoft mailbox pool provider.
+"""Local mailbox pool provider.
 
-The importer accepts Xinlan/BH Mailer "common" account rows.  Microsoft
-accounts with Client Id + refresh token are read through Microsoft Graph;
-rows without OAuth material fall back to IMAP only when inbound server fields
-are present and usable.
+The importer accepts:
+
+* Xinlan/BH Mailer "common" account rows. Microsoft accounts with Client Id +
+  refresh token are read through Microsoft Graph; rows without OAuth material
+  fall back to IMAP only when inbound server fields are present and usable.
+* iCloud relay rows in the form: email@icloud.com----https://.../email@icloud.com
 """
 
 from __future__ import annotations
@@ -19,8 +21,11 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from email.header import decode_header
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -30,7 +35,11 @@ from core.base_mailbox import BaseMailbox, MailboxAccount, _extract_verification
 GRAPH_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
 DEFAULT_GRAPH_SCOPE = "https://graph.microsoft.com/Mail.Read offline_access"
-DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / ".local_ms_mailbox_pool_state.json"
+DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / ".local_mailbox_pool_state.json"
+LEGACY_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / ".local_ms_mailbox_pool_state.json"
+LOCAL_MAIL_POOL_PROVIDER_NAME = "local_mail_pool"
+LEGACY_LOCAL_MS_POOL_PROVIDER_NAME = "local_ms_pool"
+ICLOUD_RELAY_DOMAINS = {"icloud.com", "me.com", "mac.com"}
 
 
 @dataclass(frozen=True)
@@ -54,6 +63,8 @@ class LocalMicrosoftMailboxEntry:
     client_id: str = ""
     refresh_token: str = ""
     totp_secret: str = ""
+    receive_provider: str = "microsoft"
+    icloud_api_url: str = ""
     raw: str = ""
 
     @property
@@ -67,6 +78,16 @@ class LocalMicrosoftMailboxEntry:
     @property
     def imap_ready(self) -> bool:
         return bool(self.imap_host and (self.login_account or self.email) and self.password)
+
+    @property
+    def icloud_api_ready(self) -> bool:
+        return self.receive_provider == "icloud_api" and bool(self.icloud_api_url)
+
+    @property
+    def source(self) -> str:
+        if self.icloud_api_ready:
+            return "icloud_api"
+        return "xinlan_common"
 
     def credentials(self) -> dict:
         return {
@@ -82,6 +103,8 @@ class LocalMicrosoftMailboxEntry:
             "recovery_email": self.recovery_email,
             "recovery_password": self.recovery_password,
             "totp_secret": self.totp_secret,
+            "receive_provider": self.receive_provider,
+            "icloud_api_url": self.icloud_api_url,
         }
 
 
@@ -115,6 +138,18 @@ def split_xinlan_common_line(line: str) -> list[str]:
     return [item.strip() for item in re.split(r"\s+", text) if item.strip()]
 
 
+def _email_domain(value: str) -> str:
+    return str(value or "").strip().lower().rsplit("@", 1)[-1]
+
+
+def _looks_like_http_url(value: str) -> bool:
+    try:
+        parsed = urlparse(str(value or "").strip())
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
 def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
     entries: list[LocalMicrosoftMailboxEntry] = []
     seen: set[str] = set()
@@ -129,28 +164,78 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
         email = _safe_text(padded[0])
         if "@" not in email:
             continue
-        entry = LocalMicrosoftMailboxEntry(
-            email=email,
-            password=_safe_text(padded[1]),
-            login_account=_safe_text(padded[2]) or email,
-            imap_host=_safe_text(padded[3]),
-            imap_port=_safe_text(padded[4]),
-            imap_account_type=_safe_text(padded[5]),
-            imap_security=_safe_text(padded[6]),
-            smtp_host=_safe_text(padded[7]),
-            smtp_port=_safe_text(padded[8]),
-            smtp_security=_safe_text(padded[9]),
-            note=_safe_text(padded[10]),
-            proxy_mode=_safe_text(padded[11]),
-            proxy=_safe_text(padded[12]),
-            label=_safe_text(padded[13]),
-            recovery_email=_safe_text(padded[14]),
-            recovery_password=_safe_text(padded[15]),
-            client_id=_safe_text(padded[16]),
-            refresh_token=_safe_text(padded[17]),
-            totp_secret=_safe_text(padded[18]),
-            raw=line,
+
+        # iCloud 接码地址格式：
+        #   cracked-xxx@icloud.com----https://icloud-api.top/show/.../cracked-xxx@icloud.com
+        # 只有两列且第二列是 URL 时，不按心蓝 19 列格式解释，避免把 URL 当密码/IMAP 字段。
+        icloud_api_row = (
+            len(parts) >= 2
+            and _email_domain(email) in ICLOUD_RELAY_DOMAINS
+            and _looks_like_http_url(_safe_text(parts[1]))
         )
+        if icloud_api_row:
+            entry = LocalMicrosoftMailboxEntry(
+                email=email,
+                login_account=email,
+                receive_provider="icloud_api",
+                icloud_api_url=_safe_text(parts[1]),
+                raw=line,
+            )
+            if entry.key in seen:
+                continue
+            seen.add(entry.key)
+            entries.append(entry)
+            continue
+
+        # 常见导出格式有两类：
+        # 1) 心蓝/BH 19 列通用格式：邮箱、密码、登录账号、IMAP...、client_id、refresh_token...
+        # 2) 简化 OAuth 格式：邮箱----密码----client_id----refresh_token[----totp]
+        # 旧逻辑会把 4 列格式的 refresh_token 误当作 imap_host，随后 socket
+        # DNS 解析抛出 "label too long"。这里优先识别简化 OAuth 格式。
+        simplified_oauth = False
+        if len(parts) in (4, 5):
+            maybe_client_id = _safe_text(parts[2])
+            maybe_refresh_token = _safe_text(parts[3])
+            simplified_oauth = bool(
+                maybe_client_id
+                and maybe_refresh_token
+                and len(maybe_refresh_token) > 80
+                and "." not in maybe_client_id.strip("{}")
+            )
+
+        if simplified_oauth:
+            entry = LocalMicrosoftMailboxEntry(
+                email=email,
+                password=_safe_text(parts[1]),
+                login_account=email,
+                client_id=_safe_text(parts[2]),
+                refresh_token=_safe_text(parts[3]),
+                totp_secret=_safe_text(parts[4]) if len(parts) > 4 else "",
+                raw=line,
+            )
+        else:
+            entry = LocalMicrosoftMailboxEntry(
+                email=email,
+                password=_safe_text(padded[1]),
+                login_account=_safe_text(padded[2]) or email,
+                imap_host=_safe_text(padded[3]),
+                imap_port=_safe_text(padded[4]),
+                imap_account_type=_safe_text(padded[5]),
+                imap_security=_safe_text(padded[6]),
+                smtp_host=_safe_text(padded[7]),
+                smtp_port=_safe_text(padded[8]),
+                smtp_security=_safe_text(padded[9]),
+                note=_safe_text(padded[10]),
+                proxy_mode=_safe_text(padded[11]),
+                proxy=_safe_text(padded[12]),
+                label=_safe_text(padded[13]),
+                recovery_email=_safe_text(padded[14]),
+                recovery_password=_safe_text(padded[15]),
+                client_id=_safe_text(padded[16]),
+                refresh_token=_safe_text(padded[17]),
+                totp_secret=_safe_text(padded[18]),
+                raw=line,
+            )
         if entry.key in seen:
             continue
         seen.add(entry.key)
@@ -159,7 +244,7 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
 
 
 class LocalMicrosoftMailboxPool(BaseMailbox):
-    """Use existing Outlook/Hotmail/Live accounts from a local text pool."""
+    """Use existing mailbox accounts from a local text pool."""
 
     _lock = threading.Lock()
 
@@ -183,11 +268,11 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
     @classmethod
     def from_config(cls, config: dict) -> "LocalMicrosoftMailboxPool":
         return cls(
-            pool_text=config.get("local_ms_pool_text", ""),
-            pool_file=config.get("local_ms_pool_file", ""),
-            state_file=config.get("local_ms_pool_state_file", ""),
+            pool_text=config.get("local_mail_pool_text") or config.get("local_ms_pool_text", ""),
+            pool_file=config.get("local_mail_pool_file") or config.get("local_ms_pool_file", ""),
+            state_file=config.get("local_mail_pool_state_file") or config.get("local_ms_pool_state_file", ""),
             graph_scope=config.get("local_ms_graph_scope", ""),
-            allow_reuse=_truthy(config.get("local_ms_pool_allow_reuse")),
+            allow_reuse=_truthy(config.get("local_mail_pool_allow_reuse") if "local_mail_pool_allow_reuse" in config else config.get("local_ms_pool_allow_reuse")),
             proxy=config.get("proxy") or None,
         )
 
@@ -198,23 +283,28 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         if self.pool_file:
             path = Path(self.pool_file).expanduser()
             if not path.exists():
-                raise RuntimeError(f"本地微软邮箱池文件不存在: {path}")
+                raise RuntimeError(f"本地邮箱池文件不存在: {path}")
             chunks.append(path.read_text(encoding="utf-8-sig"))
         combined = "\n".join(chunks)
         if not combined.strip():
-            raise RuntimeError("本地微软邮箱池为空，请粘贴心蓝通用格式或配置文件路径")
+            raise RuntimeError("本地邮箱池为空，请粘贴心蓝通用格式、iCloud 接码地址格式或配置文件路径")
         return combined
 
     def _entries(self) -> list[LocalMicrosoftMailboxEntry]:
         entries = parse_xinlan_common_rows(self._load_pool_text())
         if not entries:
-            raise RuntimeError("本地微软邮箱池未解析到有效邮箱")
+            raise RuntimeError("本地邮箱池未解析到有效邮箱")
         return entries
 
     def _state(self) -> dict:
         try:
             return json.loads(self.state_file.read_text(encoding="utf-8"))
         except Exception:
+            if self.state_file == DEFAULT_STATE_FILE and LEGACY_STATE_FILE.exists():
+                try:
+                    return json.loads(LEGACY_STATE_FILE.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
             return {"used": {}}
 
     def _save_state(self, state: dict) -> None:
@@ -238,6 +328,29 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         state["used"] = used
         self._save_state(state)
 
+    def release_email(self, account_or_email) -> bool:
+        """Release a reservation made by get_email() for failed tasks.
+
+        Successful tasks intentionally keep the reservation so the same imported
+        account is not processed again. Failed tasks can call this to make the
+        mailbox available for retry.
+        """
+        if self.allow_reuse:
+            return False
+        email_value = getattr(account_or_email, "email", account_or_email)
+        key = str(email_value or "").strip().lower()
+        if not key:
+            return False
+        with self._lock:
+            state = self._state()
+            used = dict(state.get("used") or {})
+            if key not in used:
+                return False
+            used.pop(key, None)
+            state["used"] = used
+            self._save_state(state)
+            return True
+
     def _available_entry(self) -> LocalMicrosoftMailboxEntry:
         entries = self._entries()
         state = self._state()
@@ -245,7 +358,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         for entry in entries:
             if self.allow_reuse or entry.key not in used:
                 return entry
-        raise RuntimeError(f"本地微软邮箱池已用尽: total={len(entries)}")
+        raise RuntimeError(f"本地邮箱池已用尽: total={len(entries)}")
 
     def peek_email(self) -> str:
         return self._available_entry().email
@@ -263,26 +376,29 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             extra={
                 "provider_account": {
                     "provider_type": "mailbox",
-                    "provider_name": "local_ms_pool",
+                    "provider_name": LOCAL_MAIL_POOL_PROVIDER_NAME,
                     "login_identifier": entry.login_account or entry.email,
                     "display_name": entry.email,
                     "credentials": credentials,
                     "metadata": {
-                        "source": "xinlan_common",
+                        "source": entry.source,
+                        "legacy_provider_name": LEGACY_LOCAL_MS_POOL_PROVIDER_NAME,
                         "has_graph_refresh_token": bool(entry.graph_ready),
                         "has_imap_config": bool(entry.imap_ready),
+                        "has_icloud_api_url": bool(entry.icloud_api_ready),
                     },
                 },
                 "provider_resource": {
                     "provider_type": "mailbox",
-                    "provider_name": "local_ms_pool",
+                    "provider_name": LOCAL_MAIL_POOL_PROVIDER_NAME,
                     "resource_type": "mailbox",
                     "resource_identifier": entry.key,
                     "handle": entry.email,
                     "display_name": entry.email,
                     "metadata": {
                         "email": entry.email,
-                        "source": "xinlan_common",
+                        "source": entry.source,
+                        "legacy_provider_name": LEGACY_LOCAL_MS_POOL_PROVIDER_NAME,
                         "reserved": not self.allow_reuse,
                     },
                 },
@@ -308,12 +424,14 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 recovery_email=str(credentials.get("recovery_email") or ""),
                 recovery_password=str(credentials.get("recovery_password") or ""),
                 totp_secret=str(credentials.get("totp_secret") or ""),
+                receive_provider=str(credentials.get("receive_provider") or "microsoft"),
+                icloud_api_url=str(credentials.get("icloud_api_url") or ""),
             )
 
         for entry in self._entries():
             if entry.key == account_email:
                 return entry
-        raise RuntimeError(f"本地微软邮箱池未找到账号: {getattr(account, 'email', '')}")
+        raise RuntimeError(f"本地邮箱池未找到账号: {getattr(account, 'email', '')}")
 
     @staticmethod
     def _decode_mime(value: str) -> str:
@@ -419,10 +537,20 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                     payload = msg.get_payload(decode=True)
                     if payload:
                         parts.append(payload.decode(msg.get_content_charset() or "utf-8", errors="replace"))
+                received_at = ""
+                try:
+                    msg_date = parsedate_to_datetime(str(msg.get("Date", "") or ""))
+                    if msg_date:
+                        if msg_date.tzinfo is None:
+                            msg_date = msg_date.replace(tzinfo=timezone.utc)
+                        received_at = msg_date.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+                except Exception:
+                    received_at = ""
                 messages.append({
                     "id": str(msg.get("Message-ID") or mid.decode("ascii", errors="ignore")),
                     "subject": subject,
                     "bodyPreview": " ".join(parts),
+                    "receivedDateTime": received_at,
                 })
         finally:
             try:
@@ -431,8 +559,111 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 pass
         return messages
 
+    @staticmethod
+    def _json_message_candidates(payload: Any) -> list[Any]:
+        if isinstance(payload, list):
+            return payload
+        if not isinstance(payload, dict):
+            return []
+        for key in ("messages", "mails", "emails", "mail", "list", "rows", "items", "data", "result"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = LocalMicrosoftMailboxPool._json_message_candidates(value)
+                if nested:
+                    return nested
+        return [payload]
+
+    @staticmethod
+    def _first_json_text(item: dict, keys: tuple[str, ...]) -> str:
+        for key in keys:
+            value = item.get(key)
+            if value not in (None, "", [], {}):
+                return str(value)
+        return ""
+
+    @staticmethod
+    def _stable_message_id(*parts: object) -> str:
+        material = "\n".join(str(part or "") for part in parts)
+        return hashlib.sha256(material.encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+    def _icloud_api_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
+        if not entry.icloud_api_ready:
+            raise RuntimeError(f"iCloud 邮箱缺少接码地址: {entry.email}")
+        response = requests.get(
+            entry.icloud_api_url,
+            headers={
+                "accept": "application/json,text/html,text/plain,*/*",
+                "user-agent": "Mozilla/5.0",
+            },
+            proxies=self.proxy,
+            timeout=25,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"iCloud 接码地址读取失败: HTTP {response.status_code} {response.text[:200]}")
+
+        text = response.text or ""
+        messages: list[dict] = []
+        payload: Any = None
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if "json" in content_type:
+            try:
+                payload = response.json()
+            except Exception:
+                payload = None
+        else:
+            stripped = text.strip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                try:
+                    payload = response.json()
+                except Exception:
+                    payload = None
+
+        if payload is not None:
+            for item in self._json_message_candidates(payload):
+                if not isinstance(item, dict):
+                    body = str(item or "")
+                    if body:
+                        messages.append({
+                            "id": self._stable_message_id(entry.email, body),
+                            "subject": "",
+                            "bodyPreview": body,
+                            "receivedDateTime": "",
+                        })
+                    continue
+                subject = self._first_json_text(item, ("subject", "title", "mail_subject", "sub"))
+                body = " ".join(
+                    value
+                    for value in (
+                        subject,
+                        self._first_json_text(item, ("body", "content", "html", "text", "message", "mail_text", "mail_content")),
+                        self._first_json_text(item, ("from", "sender", "from_email")),
+                    )
+                    if value
+                )
+                received = self._first_json_text(item, ("receivedDateTime", "created_at", "createdAt", "date", "time", "timestamp"))
+                mid = self._first_json_text(item, ("id", "mail_id", "message_id", "uid"))
+                messages.append({
+                    "id": mid or self._stable_message_id(entry.email, subject, body, received),
+                    "subject": subject,
+                    "bodyPreview": body or json.dumps(item, ensure_ascii=False),
+                    "receivedDateTime": received,
+                })
+            if messages:
+                return messages
+
+        return [{
+            "id": self._stable_message_id(entry.email, text),
+            "subject": "",
+            "bodyPreview": text,
+            "receivedDateTime": "",
+        }]
+
     def _messages(self, account: MailboxAccount) -> list[dict]:
         entry = self._entry_for_account(account)
+        if entry.icloud_api_ready:
+            return self._icloud_api_messages(entry)
         if entry.graph_ready:
             return self._graph_messages(entry)
         return self._imap_messages(entry)
@@ -447,9 +678,38 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
     def _clean_search_text(text: str) -> str:
         cleaned = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
         cleaned = re.sub(r"<script[^>]*>.*?</script>", " ", cleaned, flags=re.I | re.S)
+        cleaned = re.sub(r"https?://[^\s<>'\"]+", " ", cleaned, flags=re.I)
         cleaned = re.sub(r"<[^>]+>", " ", cleaned)
         cleaned = re.sub(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", " ", cleaned)
         return cleaned
+
+    @staticmethod
+    def _extract_code_from_text(text: str, pattern: re.Pattern) -> str:
+        # Prefer numbers near verification wording to avoid matching timestamps,
+        # counters, URL tokens, or unrelated 6-digit values on HTML inbox pages.
+        hinted = re.search(
+            r"(?:验证码|驗證碼|校验码|code|verification|verify|otp|one[- ]?time|openai|chatgpt|codex)"
+            r"[\s\S]{0,120}?(?<!#)(?<!\d)(\d{6})(?!\d)",
+            text,
+            flags=re.I,
+        )
+        if hinted:
+            return hinted.group(1)
+        match = pattern.search(text)
+        if match:
+            return match.group(1) if match.groups() else match.group(0)
+        return ""
+
+    @staticmethod
+    def _message_received_ts(mail: dict) -> float:
+        value = str(mail.get("receivedDateTime") or mail.get("createdDateTime") or "").strip()
+        if not value:
+            return 0.0
+        try:
+            normalized = value.replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized).timestamp()
+        except Exception:
+            return 0.0
 
     def wait_for_code(
         self,
@@ -458,23 +718,36 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         timeout: int = 120,
         before_ids: set = None,
         code_pattern: str = None,
+        otp_sent_at: float | None = None,
     ) -> str:
         seen = set(before_ids or [])
         pattern = re.compile(code_pattern or r"(?<!#)(?<!\d)(\d{6})(?!\d)")
         start = time.time()
+        # Microsoft Graph 的 receivedDateTime 与本机触发时间之间可能有 1-2 秒偏差，
+        # 给少量宽限；但仍然拒绝明显早于本次 OTP 发送的旧验证码。
+        min_received_ts = (float(otp_sent_at) - 15.0) if otp_sent_at else 0.0
         while time.time() - start < timeout:
             for mail in self._messages(account):
                 mid = self._message_id(mail)
                 if mid and mid in seen:
                     continue
-                if mid:
-                    seen.add(mid)
+                received_ts = self._message_received_ts(mail)
+                if min_received_ts and received_ts and received_ts < min_received_ts:
+                    if mid:
+                        seen.add(mid)
+                    continue
                 text = self._clean_search_text(self._message_text(mail))
                 if keyword and keyword.lower() not in text.lower():
+                    if mid:
+                        seen.add(mid)
                     continue
-                match = pattern.search(text)
-                if match:
-                    return match.group(1) if match.groups() else match.group(0)
+                code = self._extract_code_from_text(text, pattern)
+                if code:
+                    if mid:
+                        seen.add(mid)
+                    return code
+                if mid:
+                    seen.add(mid)
             time.sleep(5)
         raise TimeoutError(f"等待验证码超时 ({timeout}s)")
 
@@ -499,3 +772,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                     return link
             time.sleep(5)
         raise TimeoutError(f"等待验证链接超时 ({timeout}s)")
+
+
+# New generic name; keep LocalMicrosoftMailboxPool for import/backward compatibility.
+LocalMailboxPool = LocalMicrosoftMailboxPool

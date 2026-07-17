@@ -48,6 +48,7 @@ function Sidebar({
   const navigate = useNavigate()
   const [platforms, setPlatforms] = useState<{ key: string; label: string }[]>([])
   const [accountsOpen, setAccountsOpen] = useState(location.pathname.startsWith('/accounts'))
+  const [settingsOpen, setSettingsOpen] = useState(location.pathname.startsWith('/settings'))
 
   useEffect(() => {
     getPlatforms()
@@ -59,8 +60,12 @@ function Sidebar({
     if (location.pathname.startsWith('/accounts')) setAccountsOpen(true)
   }, [location.pathname])
 
+  useEffect(() => {
+    if (location.pathname.startsWith('/settings')) setSettingsOpen(true)
+  }, [location.pathname])
+
   const isAccounts = location.pathname.startsWith('/accounts')
-  const isSettings = location.pathname === '/settings'
+  const isSettings = location.pathname.startsWith('/settings')
 
   const navLinkClass = (active: boolean) =>
     cn(
@@ -162,7 +167,10 @@ function Sidebar({
             onClick={() => {
               if (collapsed) {
                 navigate('/settings')
+              } else if (isSettings) {
+                setSettingsOpen(!settingsOpen)
               } else {
+                setSettingsOpen(true)
                 navigate('/settings')
               }
             }}
@@ -170,9 +178,14 @@ function Sidebar({
             title={collapsed ? '设置' : undefined}
           >
             <SettingsIcon className={iconClass(isSettings)} />
-            {!collapsed && <span>设置</span>}
+            {!collapsed && (
+              <>
+                <span className="flex-1 text-left">设置</span>
+                <ChevronRight className={cn('h-3 w-3 text-[var(--text-muted)] transition-transform duration-150', settingsOpen && 'rotate-90')} />
+              </>
+            )}
           </button>
-          {!collapsed && isSettings && (
+          {!collapsed && settingsOpen && (
             <div className="ml-[21px] mt-0.5 space-y-px border-l border-[var(--border)] pl-3">
               {[
                 { label: '通用', hash: 'general' },

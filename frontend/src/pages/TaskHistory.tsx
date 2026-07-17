@@ -3,8 +3,9 @@ import { getPlatforms } from '@/lib/app-data'
 import { apiFetch } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { TaskLogPanel } from '@/components/tasks/TaskLogPanel'
 import { getTaskStatusText, TASK_STATUS_VARIANTS } from '@/lib/tasks'
-import { RefreshCw, Activity, CheckCircle2, AlertTriangle, Clock3, ChevronDown } from 'lucide-react'
+import { RefreshCw, Activity, CheckCircle2, AlertTriangle, Clock3, ChevronDown, Eye, Square, X } from 'lucide-react'
 
 function shortId(id: string) {
   if (!id) return '-'
@@ -37,6 +38,9 @@ export default function TaskHistory() {
   const [status, setStatus] = useState('')
   const [platforms, setPlatforms] = useState<any[]>([])
   const [loading, setLoading] = useState(false)
+  const [selectedTask, setSelectedTask] = useState<any | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [cancellingId, setCancellingId] = useState('')
 
   const load = async () => {
     setLoading(true)
@@ -48,6 +52,42 @@ export default function TaskHistory() {
       setTasks(data.items || [])
     } finally {
       setLoading(false)
+    }
+  }
+
+  const openDetail = async (task: any) => {
+    setSelectedTask(task)
+    setDetailLoading(true)
+    try {
+      const latest = await apiFetch(`/tasks/${task.id}`)
+      setSelectedTask(latest)
+    } finally {
+      setDetailLoading(false)
+    }
+  }
+
+  const terminateTask = async (task: any) => {
+    if (!task?.id || !task.cancellable) return
+    setCancellingId(task.id)
+    const optimistic = {
+      ...task,
+      status: 'cancelled',
+      terminal: true,
+      cancellable: false,
+      error: task.error || '任务已被手动终止',
+      finished_at: task.finished_at || new Date().toISOString(),
+    }
+    setTasks(prev => prev.map(item => item.id === task.id ? optimistic : item))
+    if (selectedTask?.id === task.id) setSelectedTask(optimistic)
+    try {
+      const latest = await apiFetch(`/tasks/${task.id}/cancel`, { method: 'POST' })
+      setTasks(prev => prev.map(item => item.id === task.id ? latest : item))
+      if (selectedTask?.id === task.id) setSelectedTask(latest)
+    } catch (error: any) {
+      window.alert(error?.message || '终止任务失败')
+      load().catch(() => {})
+    } finally {
+      setCancellingId('')
     }
   }
 
@@ -158,12 +198,13 @@ export default function TaskHistory() {
                 <th className="px-4 py-2.5 text-left text-xs font-medium text-[var(--text-muted)]">进度</th>
                 <th className="px-4 py-2.5 text-left text-xs font-medium text-[var(--text-muted)]">成功/失败</th>
                 <th className="px-4 py-2.5 text-left text-xs font-medium text-[var(--text-muted)]">错误</th>
+                <th className="px-4 py-2.5 text-right text-xs font-medium text-[var(--text-muted)]">操作</th>
               </tr>
             </thead>
             <tbody>
               {tasks.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="px-4 py-12 text-center text-sm text-[var(--text-muted)]">
+                  <td colSpan={8} className="px-4 py-12 text-center text-sm text-[var(--text-muted)]">
                     暂无任务记录
                   </td>
                 </tr>
@@ -249,6 +290,31 @@ export default function TaskHistory() {
                         <span className="text-xs text-[var(--text-muted)]">-</span>
                       )}
                     </td>
+                    <td className="px-4 py-3">
+                      <div className="flex justify-end gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => openDetail(task)}
+                          className="h-7 px-2 text-xs"
+                        >
+                          <Eye className="mr-1 h-3 w-3" />
+                          详情
+                        </Button>
+                        {task.cancellable && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => terminateTask(task)}
+                            disabled={cancellingId === task.id}
+                            className="h-7 border-red-500/40 px-2 text-xs text-red-400 hover:bg-red-500/10 hover:text-red-300"
+                          >
+                            <Square className="mr-1 h-3 w-3" />
+                            {cancellingId === task.id ? '终止中' : '终止'}
+                          </Button>
+                        )}
+                      </div>
+                    </td>
                   </tr>
                 )
               })}
@@ -256,6 +322,97 @@ export default function TaskHistory() {
           </table>
         </div>
       </div>
+
+      {selectedTask && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4">
+          <div className="flex max-h-[90vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] shadow-2xl">
+            <div className="flex items-start justify-between gap-4 border-b border-[var(--border)] px-5 py-4">
+              <div>
+                <div className="flex items-center gap-2">
+                  <h2 className="text-base font-semibold text-[var(--text-primary)]">任务详情</h2>
+                  <Badge variant={TASK_STATUS_VARIANTS[selectedTask.status] || 'secondary'}>
+                    {getTaskStatusText(selectedTask.status)}
+                  </Badge>
+                </div>
+                <div className="mt-1 font-mono text-xs text-[var(--text-muted)]">{selectedTask.id}</div>
+              </div>
+              <div className="flex items-center gap-2">
+                {selectedTask.cancellable && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => terminateTask(selectedTask)}
+                    disabled={cancellingId === selectedTask.id}
+                    className="border-red-500/40 text-red-400 hover:bg-red-500/10 hover:text-red-300"
+                  >
+                    <Square className="mr-1 h-3.5 w-3.5" />
+                    立即终止
+                  </Button>
+                )}
+                <button
+                  onClick={() => setSelectedTask(null)}
+                  className="rounded-full p-2 text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+            <div className="grid min-h-0 flex-1 gap-4 overflow-y-auto p-5 lg:grid-cols-[320px_minmax(0,1fr)]">
+              <div className="space-y-3">
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)] p-4">
+                  <div className="mb-3 text-sm font-medium text-[var(--text-primary)]">基础信息</div>
+                  <div className="space-y-2 text-xs">
+                    {[
+                      ['平台', selectedTask.platform || '-'],
+                      ['类型', selectedTask.type || '-'],
+                      ['进度', selectedTask.progress || '-'],
+                      ['成功', selectedTask.success ?? 0],
+                      ['失败', selectedTask.error_count ?? 0],
+                      ['创建', selectedTask.created_at ? new Date(selectedTask.created_at).toLocaleString('zh-CN') : '-'],
+                      ['开始', selectedTask.started_at ? new Date(selectedTask.started_at).toLocaleString('zh-CN') : '-'],
+                      ['结束', selectedTask.finished_at ? new Date(selectedTask.finished_at).toLocaleString('zh-CN') : '-'],
+                    ].map(([label, value]) => (
+                      <div key={String(label)} className="flex justify-between gap-3">
+                        <span className="text-[var(--text-muted)]">{label}</span>
+                        <span className="text-right text-[var(--text-secondary)]">{String(value)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                {selectedTask.error && (
+                  <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-4">
+                    <div className="mb-2 text-sm font-medium text-red-300">错误</div>
+                    <div className="break-words text-xs text-red-200/90">{selectedTask.error}</div>
+                  </div>
+                )}
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)] p-4">
+                  <div className="mb-2 flex items-center justify-between">
+                    <div className="text-sm font-medium text-[var(--text-primary)]">参数 / 结果</div>
+                    {detailLoading && <span className="text-xs text-[var(--text-muted)]">刷新中...</span>}
+                  </div>
+                  <pre className="max-h-[360px] overflow-auto rounded-lg bg-black/20 p-3 text-[11px] leading-5 text-[var(--text-secondary)]">
+                    {JSON.stringify({ payload: selectedTask.payload, result: selectedTask.result }, null, 2)}
+                  </pre>
+                </div>
+              </div>
+              <div className="min-h-[520px]">
+                <TaskLogPanel
+                  taskId={selectedTask.id}
+                  onDone={async () => {
+                    try {
+                      const latest = await apiFetch(`/tasks/${selectedTask.id}`)
+                      setSelectedTask(latest)
+                      await load()
+                    } catch {
+                      // ignore
+                    }
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

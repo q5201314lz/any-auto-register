@@ -18,6 +18,155 @@ CHATGPT_PLATFORM = "chatgpt"
 DEFAULT_CHATGPT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 
+SUB2API_OPENAI_MODEL_IDS = [
+    # Upstream Sub2API DefaultModels (backend/internal/pkg/openai/constants.go).
+    "gpt-5.6",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+    "codex-auto-review",
+    "gpt-5.2",
+    "gpt-image-1",
+    "gpt-image-1.5",
+    "gpt-image-2",
+    # Backward-compatible/observed Codex aliases that older exports already used
+    # or that Sub2API tests/routes accept even if not in DefaultModels.
+    "gpt-5",
+    "gpt-5.1",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+    "gpt-5.2-codex",
+    "gpt-5.3",
+    "gpt-5.3-codex",
+    "gpt-5.4-nano",
+]
+
+
+def _identity_model_mapping(model_ids: list[str] | tuple[str, ...]) -> dict[str, str]:
+    return {model_id: model_id for model_id in model_ids}
+
+
+def _first_text(*values: object) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _first_meaningful_text(*values: object, ignored: tuple[str, ...] = ("", "unknown", "none", "null")) -> str:
+    ignored_set = {str(value).strip().lower() for value in ignored}
+    fallback = ""
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        if not fallback:
+            fallback = text
+        if text.lower() not in ignored_set:
+            return text
+    return fallback
+
+
+def _value_from_dicts(*containers: dict | None, keys: tuple[str, ...]) -> str:
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in keys:
+            value = container.get(key)
+            if value not in (None, "", [], {}):
+                return str(value).strip()
+    return ""
+
+
+def _normalize_chatgpt_plan_type(value: str) -> str:
+    text = (value or "").strip().lower()
+    if not text:
+        return ""
+    compact = text.replace("_", "").replace("-", "").replace(" ", "")
+    aliases = {
+        "chatgptplusplan": "plus",
+        "plusplan": "plus",
+        "chatgptproplan": "pro",
+        "proplan": "pro",
+        "chatgptteamplan": "team",
+        "teamplan": "team",
+        "businessplan": "team",
+        "chatgptbusinessplan": "team",
+        "enterpriseplan": "enterprise",
+        "chatgptenterpriseplan": "enterprise",
+        "freeplan": "free",
+        "chatgptfreeplan": "free",
+    }
+    return aliases.get(compact, text)
+
+
+def _chatgpt_plan_info(item: AccountRecord, auth_info: dict | None = None) -> dict[str, str]:
+    overview = item.overview if isinstance(item.overview, dict) else {}
+    display_summary = item.display_summary if isinstance(item.display_summary, dict) else {}
+    auth_info = auth_info if isinstance(auth_info, dict) else {}
+
+    raw_plan_type = _first_text(
+        _credential_value(item, "plan_type", "chatgpt_plan_type", "workspace_plan_type"),
+        _value_from_dicts(auth_info, keys=("chatgpt_plan_type", "plan_type", "workspace_plan_type")),
+        _value_from_dicts(overview, display_summary, keys=("plan_type", "chatgpt_plan_type", "workspace_plan_type", "plan", "plan_name")),
+        item.plan_name,
+    )
+    state_only_plan_values = {"active", "subscribed", "registered", "valid", "invalid", "expired", "cancelled", "canceled"}
+    plan_type = _normalize_chatgpt_plan_type(raw_plan_type)
+    raw_plan_type_is_state = (raw_plan_type or "").strip().lower() in state_only_plan_values
+    if plan_type in state_only_plan_values:
+        plan_type = ""
+    plan_name = _first_text(
+        item.plan_name,
+        _value_from_dicts(overview, display_summary, keys=("plan_name", "plan", "plan_type", "chatgpt_plan_type")),
+        raw_plan_type,
+        plan_type,
+    )
+    plan_state = _first_meaningful_text(
+        _value_from_dicts(overview, display_summary, keys=("plan_state", "subscription_state", "status", "plan", "plan_name")),
+        item.plan_state,
+        item.display_status,
+        ignored=("", "unknown", "registered"),
+    ).lower()
+
+    explicit_subscription_type = _value_from_dicts(
+        overview,
+        display_summary,
+        keys=("subscription_type", "billing_type"),
+    ).lower()
+    paid_plan_markers = ("plus", "pro", "team", "enterprise", "business", "edu")
+    subscribed_state_markers = ("subscribed", "subscription", "paid", "active", "trial")
+    free_plan_markers = ("free", "registered", "unknown", "none")
+    if explicit_subscription_type in ("standard", "subscription"):
+        subscription_type = explicit_subscription_type
+    elif any(marker in plan_type for marker in paid_plan_markers) or any(marker in plan_state for marker in subscribed_state_markers):
+        subscription_type = "subscription"
+    elif plan_type in free_plan_markers:
+        subscription_type = "standard"
+    else:
+        # Sub2API 的账号导入不会自动改 group；这里保守暴露 standard，
+        # 同时保留 raw_plan_type/plan_state 供后续手工或脚本判定。
+        subscription_type = "standard"
+
+    return {
+        "plan_type": plan_type or ("" if raw_plan_type_is_state else raw_plan_type) or "unknown",
+        "raw_plan_type": raw_plan_type,
+        "plan_name": plan_name,
+        "plan_state": plan_state or "unknown",
+        "subscription_type": subscription_type,
+    }
+
+
 @dataclass(slots=True)
 class ExportArtifact:
     filename: str
@@ -89,6 +238,7 @@ def _chatgpt_export_payload(item: AccountRecord) -> dict:
     workspace_id = _credential_value(item, "workspace_id", "workspaceId")
     payload = _decode_jwt_payload(access_token) if access_token else {}
     auth_info = _chatgpt_auth_info(access_token, id_token)
+    plan_info = _chatgpt_plan_info(item, auth_info)
     client_id = _credential_value(item, "client_id", "clientId") or str(payload.get("client_id", "") or DEFAULT_CHATGPT_CLIENT_ID)
     cookies = _credential_value(item, "cookies", "cookie")
     account_id = item.user_id or _credential_value(item, "account_id", "chatgpt_account_id") or ""
@@ -124,6 +274,11 @@ def _chatgpt_export_payload(item: AccountRecord) -> dict:
         "last_refresh": _isoformat(last_refresh_at),
         "expires_at": _isoformat(expires_at),
         "status": item.display_status,
+        "plan_type": plan_info["plan_type"],
+        "raw_plan_type": plan_info["raw_plan_type"],
+        "plan_name": plan_info["plan_name"],
+        "plan_state": plan_info["plan_state"],
+        "subscription_type": plan_info["subscription_type"],
         "expires_at_unix": int(expires_at.timestamp()) if expires_at else 0,
     }
 
@@ -163,32 +318,49 @@ def _generate_cpa_token_json(item: AccountRecord) -> dict:
 
 def _make_sub2api_json(item: AccountRecord) -> dict:
     payload = _chatgpt_export_payload(item)
+    model_mapping = _identity_model_mapping(SUB2API_OPENAI_MODEL_IDS)
+    credentials = {
+        "access_token": payload["access_token"],
+        "chatgpt_account_id": payload["account_id"],
+        "chatgpt_user_id": "",
+        "client_id": payload["client_id"],
+        "expires_at": payload["expires_at_unix"],
+        "expires_in": 863999,
+        "model_mapping": model_mapping,
+        "organization_id": payload["workspace_id"],
+        "refresh_token": payload["refresh_token"],
+        # Sub2API 的调度缓存会保留 credentials.plan_type；这里显式导出，
+        # 避免导入后看不到 ChatGPT Plus/Pro/Team 等套餐信息。
+        "plan_type": payload["plan_type"],
+        "subscription_type": payload["subscription_type"],
+    }
+    if payload.get("id_token"):
+        credentials["id_token"] = payload["id_token"]
+    if payload.get("raw_plan_type"):
+        credentials["raw_plan_type"] = payload["raw_plan_type"]
+
+    extra = {
+        "subscription_type": payload["subscription_type"],
+        "billing_type": payload["subscription_type"],
+        "plan_type": payload["plan_type"],
+        "raw_plan_type": payload["raw_plan_type"],
+        "plan_name": payload["plan_name"],
+        "plan_state": payload["plan_state"],
+        "source": "any-auto-register",
+    }
+
     return {
+        "type": "sub2api-data",
+        "version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
         "proxies": [],
         "accounts": [
             {
                 "name": payload["email"],
                 "platform": "openai",
                 "type": "oauth",
-                "credentials": {
-                    "access_token": payload["access_token"],
-                    "chatgpt_account_id": payload["account_id"],
-                    "chatgpt_user_id": "",
-                    "client_id": payload["client_id"],
-                    "expires_at": payload["expires_at_unix"],
-                    "expires_in": 863999,
-                    "model_mapping": {
-                        "gpt-5.1": "gpt-5.1",
-                        "gpt-5.1-codex": "gpt-5.1-codex",
-                        "gpt-5.1-codex-max": "gpt-5.1-codex-max",
-                        "gpt-5.1-codex-mini": "gpt-5.1-codex-mini",
-                        "gpt-5.2": "gpt-5.2",
-                        "gpt-5.2-codex": "gpt-5.2-codex",
-                    },
-                    "organization_id": payload["workspace_id"],
-                    "refresh_token": payload["refresh_token"],
-                },
-                "extra": {},
+                "credentials": credentials,
+                "extra": extra,
                 "concurrency": 10,
                 "priority": 1,
                 "rate_multiplier": 1,

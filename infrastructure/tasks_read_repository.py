@@ -27,6 +27,9 @@ def _to_task_summary(data: dict) -> TaskSummary:
         finished_at=ensure_utc_datetime(data.get("finished_at")),
         updated_at=ensure_utc_datetime(data.get("updated_at")),
         result=dict(data.get("result", {}) or {}),
+        payload=dict(data.get("payload", {}) or {}),
+        terminal=bool(data.get("terminal", False)),
+        cancellable=bool(data.get("cancellable", False)),
     )
 
 

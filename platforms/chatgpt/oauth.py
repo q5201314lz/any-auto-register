@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from curl_cffi import requests as cffi_requests
+from core.http_client import resolve_proxy_url
 
 from .constants import (
     OAUTH_CLIENT_ID,
@@ -21,6 +22,16 @@ from .constants import (
     OAUTH_REDIRECT_URI,
     OAUTH_SCOPE,
 )
+
+
+def _is_curl_tls_connect_error(exc: BaseException) -> bool:
+    text = str(exc or "").lower()
+    return (
+        "curl: (35)" in text
+        or "tls connect error" in text
+        or "openssl_internal:invalid library" in text
+        or "invalid library (0)" in text
+    )
 
 
 def _b64url_no_pad(raw: bytes) -> str:
@@ -141,11 +152,12 @@ def _post_form(
         响应 JSON 数据
     """
     # 构建代理配置
+    resolved_proxy = resolve_proxy_url(proxy_url)
     proxies = None
-    if proxy_url:
+    if resolved_proxy:
         proxies = {
-            "http": proxy_url,
-            "https": proxy_url,
+            "http": resolved_proxy,
+            "https": resolved_proxy,
         }
 
     headers = {
@@ -155,26 +167,43 @@ def _post_form(
                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
 
-    try:
-        # 使用 curl_cffi 发送请求，支持代理和浏览器指纹
-        response = cffi_requests.post(
-            url,
-            data=data,
-            headers=headers,
-            timeout=timeout,
-            proxies=proxies,
-            impersonate="chrome"
-        )
+    attempts: list[tuple[Optional[dict], Optional[str], bool, str]] = [
+        (proxies, "chrome136", True, "proxy/chrome136"),
+        (proxies, "chrome120", True, "proxy/chrome120"),
+    ]
+    # 某些代理会触发 curl_cffi/OpenSSL 的 TLS connect error；token 交换阶段
+    # 不强依赖同一出口，最后允许无代理兜底一次。
+    if proxies:
+        attempts.append((None, "chrome136", True, "direct/chrome136"))
 
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"token exchange failed: {response.status_code}: {response.text}"
-            )
+    last_error: BaseException | None = None
+    for attempt_proxies, impersonate, verify, label in attempts:
+        try:
+            request_kwargs = {
+                "data": data,
+                "headers": headers,
+                "timeout": timeout,
+                "proxies": attempt_proxies,
+                "verify": verify,
+            }
+            if impersonate:
+                request_kwargs["impersonate"] = impersonate
+            response = cffi_requests.post(url, **request_kwargs)
 
-        return response.json()
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"token exchange failed({label}): {response.status_code}: {response.text}"
+                )
 
-    except cffi_requests.RequestsError as e:
-        raise RuntimeError(f"token exchange failed: network error: {e}") from e
+            return response.json()
+
+        except cffi_requests.RequestsError as e:
+            last_error = e
+            if _is_curl_tls_connect_error(e):
+                continue
+            raise RuntimeError(f"token exchange failed: network error: {e}") from e
+
+    raise RuntimeError(f"token exchange failed: network error: {last_error}") from last_error
 
 
 @dataclass(frozen=True)
@@ -337,7 +366,7 @@ class OAuthManager:
         self.token_url = token_url
         self.redirect_uri = redirect_uri
         self.scope = scope
-        self.proxy_url = proxy_url
+        self.proxy_url = resolve_proxy_url(proxy_url)
 
     def start_oauth(self) -> OAuthStart:
         """开始 OAuth 流程"""

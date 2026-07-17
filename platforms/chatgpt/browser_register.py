@@ -1,6 +1,7 @@
 """ChatGPT 浏览器注册流程（Camoufox）。"""
 import base64
 import json
+import os
 import random
 import re
 import secrets
@@ -209,11 +210,11 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log) -> bo
     和一个可视的 button trigger + listbox 弹出层。
     """
     if not dial_code and not country_name:
-        log("  无法识别国家码，跳过国家选择")
+        _phone_debug(log, "  无法识别国家码，跳过国家选择")
         return False
 
     iso_code = PHONE_DIAL_TO_ISO.get(dial_code, "")
-    log(f"  目标国家: {country_name} (+{dial_code}) ISO={iso_code}")
+    _phone_debug(log, f"  目标国家: {country_name} (+{dial_code}) ISO={iso_code}")
 
     # 先检查当前下拉框是否已经是目标国家
     dial_pattern = f"(+{dial_code})"
@@ -238,7 +239,7 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log) -> bo
         dial_pattern,
     )
     if already:
-        log(f"  国家已是目标值: (+{dial_code})")
+        _phone_debug(log, f"  国家已是目标值: (+{dial_code})")
         return True
 
     # ═══════════════════════════════════════════════════════════════════
@@ -286,7 +287,7 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log) -> bo
         {"isoCode": iso_code, "dialCode": dial_code, "countryName": country_name},
     )
     if native_selected and native_selected.get("ok"):
-        log(f"  ✓ 通过原生 <select> 选择成功: value={native_selected.get('value')}")
+        _phone_debug(log, f"  ✓ 通过原生 <select> 选择成功: value={native_selected.get('value')}")
         time.sleep(0.5)
         # 验证 UI 是否同步更新
         verify = page.evaluate(
@@ -294,9 +295,9 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log) -> bo
             dial_pattern,
         )
         if f"+{dial_code}" in (verify or ""):
-            log(f"  ✓ UI 已同步: {verify}")
+            _phone_debug(log, f"  ✓ UI 已同步: {verify}")
             return True
-        log(f"  原生 select 已设置但 UI 未同步 ({verify})，尝试 UI 交互...")
+        _phone_debug(log, f"  原生 select 已设置但 UI 未同步 ({verify})，尝试 UI 交互...")
 
     # ═══════════════════════════════════════════════════════════════════
     # 策略 2: 通过 React Aria 的 key 属性直接操作
@@ -337,7 +338,7 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log) -> bo
             if iso_code:
                 try:
                     select_el.select_option(value=iso_code)
-                    log(f"  ✓ Playwright selectOption(value={iso_code}) 成功")
+                    _phone_debug(log, f"  ✓ Playwright selectOption(value={iso_code}) 成功")
                     time.sleep(0.5)
                     return True
                 except Exception:
@@ -362,13 +363,13 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log) -> bo
                 )
                 if match_value:
                     select_el.select_option(value=match_value)
-                    log(f"  ✓ Playwright selectOption(value={match_value}) 成功")
+                    _phone_debug(log, f"  ✓ Playwright selectOption(value={match_value}) 成功")
                     time.sleep(0.5)
                     return True
             except Exception as e:
-                log(f"  selectOption label 匹配失败: {e}")
+                _phone_debug(log, f"  selectOption label 匹配失败: {e}")
     except Exception as e:
-        log(f"  Playwright selectOption 策略失败: {e}")
+        _phone_debug(log, f"  Playwright selectOption 策略失败: {e}")
 
     # ═══════════════════════════════════════════════════════════════════
     # 策略 4: 点击 trigger 按钮打开 listbox，然后在 listbox 中选择
@@ -405,13 +406,13 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log) -> bo
             """,
         )
         if not trigger:
-            log("  ⚠️ 未找到国家选择器触发按钮")
+            _phone_debug(log, "  ⚠️ 未找到国家选择器触发按钮")
             return False
-        log("  已通过 JS 点击触发按钮")
+        _phone_debug(log, "  已通过 JS 点击触发按钮")
     else:
         trigger.scroll_into_view_if_needed()
         trigger.click()
-        log("  已点击国家选择器下拉框")
+        _phone_debug(log, "  已点击国家选择器下拉框")
 
     time.sleep(0.8)
 
@@ -424,10 +425,10 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log) -> bo
         time.sleep(0.3)
 
     if not listbox:
-        log("  ⚠️ 下拉框 listbox 未出现")
+        _phone_debug(log, "  ⚠️ 下拉框 listbox 未出现")
         return False
 
-    log("  listbox 已出现")
+    _phone_debug(log, "  listbox 已出现")
 
     # 在 listbox 中查找并点击目标 option
     option = None
@@ -438,7 +439,7 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log) -> bo
             if not option:
                 option = page.query_selector(f'[role="option"][{attr}*="{iso_code}"]')
             if option:
-                log(f"  找到 option: [{attr} 含 {iso_code}]")
+                _phone_debug(log, f"  找到 option: [{attr} 含 {iso_code}]")
                 break
 
     if not option:
@@ -468,7 +469,7 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log) -> bo
             options = page.query_selector_all('[role="option"]')
             if option_idx < len(options):
                 option = options[option_idx]
-                log(f"  找到 option: 文本匹配 index={option_idx}")
+                _phone_debug(log, f"  找到 option: 文本匹配 index={option_idx}")
 
     if option:
         option.scroll_into_view_if_needed()
@@ -481,13 +482,13 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log) -> bo
               return btn ? (btn.innerText || '').trim() : '';
             }""",
         )
-        log(f"  选择后下拉框显示: {new_text}")
+        _phone_debug(log, f"  选择后下拉框显示: {new_text}")
         if f"+{dial_code}" in (new_text or ""):
-            log(f"  ✓ 国家选择成功: {new_text}")
+            _phone_debug(log, f"  ✓ 国家选择成功: {new_text}")
             return True
 
     # 键盘 type-ahead 搜索
-    log(f"  尝试键盘 type-ahead: {country_name}")
+    _phone_debug(log, f"  尝试键盘 type-ahead: {country_name}")
     page.keyboard.type(country_name, delay=80)
     time.sleep(0.8)
 
@@ -504,10 +505,10 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log) -> bo
         }""",
     )
     if f"+{dial_code}" in (final_text or ""):
-        log(f"  ✓ type-ahead 选择成功: {final_text}")
+        _phone_debug(log, f"  ✓ type-ahead 选择成功: {final_text}")
         return True
 
-    log(f"  ⚠️ 下拉框已展开但未找到匹配国家: {country_name} (+{dial_code})")
+    _phone_debug(log, f"  ⚠️ 下拉框已展开但未找到匹配国家: {country_name} (+{dial_code})")
     try:
         page.keyboard.press("Escape")
     except Exception:
@@ -527,6 +528,27 @@ def _build_proxy_config(proxy: Optional[str]) -> Optional[dict]:
     if parsed.password:
         config["password"] = parsed.password
     return config
+
+
+def _camoufox_launch_options(*, headless: bool = True, proxy: Optional[dict] = None) -> dict:
+    """Build Camoufox launch options without requiring optional geoip extra.
+
+    Camoufox raises NotInstalledGeoIPExtra when `geoip=True` is passed but the
+    optional `camoufox[geoip]` dependency is absent.  Proxy still works without
+    geoip, so only enable it explicitly when the extra is installed and the env
+    switch is on.
+    """
+    opts = {"headless": headless}
+    if proxy:
+        opts["proxy"] = proxy
+        use_geoip = str(os.environ.get("ACCOUNT_MANAGER_CAMOUFOX_GEOIP") or "").strip().lower() in {"1", "true", "yes", "on"}
+        if use_geoip:
+            try:
+                import geoip2  # type: ignore  # noqa: F401
+                opts["geoip"] = True
+            except Exception:
+                pass
+    return opts
 
 
 def _wait_for_url(page, substring: str, timeout: int = 60) -> bool:
@@ -568,6 +590,265 @@ def _click_first(page, selectors: list[str], *, timeout: int = 10) -> str | None
         return found
     except Exception:
         return None
+
+def _visible_button_texts(page) -> list[str]:
+    try:
+        return list(page.evaluate(
+            """
+            () => Array.from(document.querySelectorAll('button, [role="button"], a'))
+              .filter((el) => {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              })
+              .map((el) => String(el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim())
+              .filter(Boolean)
+              .slice(0, 20)
+            """
+        ) or [])
+    except Exception:
+        return []
+
+
+def _mask_debug_text(value: object) -> str:
+    text = str(value or "")
+    text = re.sub(r"(?<!\d)\+?\d{7,15}(?!\d)", lambda m: m.group(0)[:4] + "****" + m.group(0)[-2:], text)
+    return text[:800]
+
+
+def _debug_add_phone_enabled() -> bool:
+    return str(os.environ.get("CHATGPT_DEBUG_ADD_PHONE") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_log(log, message: str, level: str | None = None) -> None:
+    try:
+        if level:
+            try:
+                log(message, level)
+                return
+            except TypeError:
+                pass
+        log(message)
+    except Exception:
+        pass
+
+
+def _phone_debug(log, message: str, level: str | None = None) -> None:
+    if _debug_add_phone_enabled():
+        _safe_log(log, message, level=level)
+
+
+def _log_add_phone_dom_summary(page, log, *, label: str = "") -> None:
+    try:
+        data = page.evaluate(
+            """
+            () => {
+              const visible = (el) => {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return !!(style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0);
+              };
+              const txt = (el) => String(el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+              const attrs = (el) => ({
+                tag: el.tagName.toLowerCase(),
+                type: el.getAttribute('type') || '',
+                name: el.getAttribute('name') || '',
+                id: el.getAttribute('id') || '',
+                value: el.getAttribute('value') || '',
+                role: el.getAttribute('role') || '',
+                aria: el.getAttribute('aria-label') || '',
+                dataTestId: el.getAttribute('data-testid') || '',
+                disabled: !!el.disabled,
+                visible: visible(el),
+                text: txt(el),
+              });
+              const controls = Array.from(document.querySelectorAll('button, [role="button"], a, input[type="submit"], input[type="radio"], input[type="checkbox"], label'))
+                .map(attrs);
+              const inputs = Array.from(document.querySelectorAll('input, textarea, select'))
+                .map((el) => ({...attrs(el), placeholder: el.getAttribute('placeholder') || '', autocomplete: el.getAttribute('autocomplete') || '', checked: !!el.checked, selected: el.tagName.toLowerCase() === 'select' ? el.value : ''}));
+              const forms = Array.from(document.querySelectorAll('form')).map((f) => ({action: f.getAttribute('action') || '', method: f.getAttribute('method') || '', text: txt(f).slice(0, 240)}));
+              const bodyText = txt(document.body).slice(0, 1200);
+              return {url: location.href, controls, inputs, forms, bodyText};
+            }
+            """
+        ) or {}
+        log(f"  add_phone DOM摘要{('('+label+')') if label else ''}: url={_mask_debug_text(data.get('url'))}")
+        keywords = re.compile(r"sms|text message|short message|whats\s*app|whatsapp|phone|code|continue|send|resend", re.I)
+        controls = list(data.get('controls') or [])
+        inputs = list(data.get('inputs') or [])
+        forms = list(data.get('forms') or [])
+        interesting_controls = [x for x in controls if keywords.search(' '.join(str(x.get(k,'')) for k in ('text','aria','name','id','value','dataTestId','role','type')))]
+        interesting_inputs = [x for x in inputs if keywords.search(' '.join(str(x.get(k,'')) for k in ('text','aria','name','id','value','placeholder','autocomplete','dataTestId','role','type')))]
+        log(f"  add_phone DOM控件: controls={len(controls)} interesting={len(interesting_controls)} inputs={len(inputs)} interesting_inputs={len(interesting_inputs)} forms={len(forms)}")
+        for i, item in enumerate(interesting_controls[:18], 1):
+            log(f"  DOM control[{i}]: visible={item.get('visible')} disabled={item.get('disabled')} tag={item.get('tag')} type={item.get('type')} role={item.get('role')} name={item.get('name')} id={item.get('id')} value={item.get('value')} text={_mask_debug_text(item.get('text') or item.get('aria'))}")
+        for i, item in enumerate(interesting_inputs[:12], 1):
+            log(f"  DOM input[{i}]: visible={item.get('visible')} tag={item.get('tag')} type={item.get('type')} name={item.get('name')} id={item.get('id')} value={_mask_debug_text(item.get('value'))} placeholder={item.get('placeholder')} autocomplete={item.get('autocomplete')} checked={item.get('checked')} selected={item.get('selected')}")
+        for i, form in enumerate(forms[:4], 1):
+            log(f"  DOM form[{i}]: method={form.get('method')} action={_mask_debug_text(form.get('action'))} text={_mask_debug_text(form.get('text'))}")
+        body = str(data.get('bodyText') or '')
+        log("  add_phone 页面关键字: " + ", ".join([f"{kw}={'yes' if re.search(kw, body, re.I) else 'no'}" for kw in ['sms', 'text message', 'WhatsApp', 'Resend WhatsApp']]))
+    except Exception as exc:
+        log(f"  add_phone DOM摘要失败: {exc}")
+
+
+def _install_add_phone_network_logger(page, log):
+    events: list[str] = []
+
+    def _interesting(url: str) -> bool:
+        u = str(url or '')
+        return 'auth.openai.com' in u and any(k in u.lower() for k in ['phone', 'add-phone', 'otp', 'challenge', 'verify', 'authorize', 'login'])
+
+    def on_request(req):
+        try:
+            if not _interesting(req.url):
+                return
+            body = req.post_data or ''
+            item = f"REQ {req.method} {req.url}"
+            if body:
+                item += f" body={_mask_debug_text(body)}"
+            events.append(item)
+        except Exception:
+            pass
+
+    def on_response(resp):
+        try:
+            if not _interesting(resp.url):
+                return
+            events.append(f"RES {resp.status} {resp.url}")
+        except Exception:
+            pass
+
+    try:
+        page.on('request', on_request)
+        page.on('response', on_response)
+    except Exception as exc:
+        log(f"  add_phone 网络监听安装失败: {exc}")
+
+    def dump(label: str = ''):
+        if not events:
+            log(f"  add_phone 网络事件{('('+label+')') if label else ''}: none")
+            return
+        log(f"  add_phone 网络事件{('('+label+')') if label else ''}: {len(events)}")
+        for item in events[-16:]:
+            log("  " + _mask_debug_text(item))
+
+    return dump
+
+
+def _select_sms_phone_channel(page, log) -> bool:
+    """Select the Text Message/SMS radio channel on add-phone if present."""
+    try:
+        result = page.evaluate(
+            """
+            () => {
+              const visible = (el) => {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return !!(style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0);
+              };
+              const fire = (el) => {
+                el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                el.click();
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+              };
+              const smsRadio = document.querySelector('input[type="radio"][value="sms"], input[name*="channel" i][value="sms"]');
+              if (smsRadio) {
+                const id = smsRadio.getAttribute('id');
+                const labelByFor = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+                const labels = Array.from(document.querySelectorAll('label'));
+                const textLabel = labels.find((el) => /sms|text message|short message/i.test(String(el.innerText || el.textContent || '')));
+                const target = labelByFor || textLabel || smsRadio;
+                fire(target);
+                // If the visible label click did not update React state, force the radio too.
+                if (!smsRadio.checked) fire(smsRadio);
+              }
+              const hidden = document.querySelector('input[type="hidden"][name="channel"]');
+              if (hidden && smsRadio && smsRadio.checked) {
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                if (setter) setter.call(hidden, 'sms'); else hidden.value = 'sms';
+                hidden.dispatchEvent(new Event('input', { bubbles: true }));
+                hidden.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+              const checked = document.querySelector('input[type="radio"][value="sms"]')?.checked || false;
+              const hiddenValue = document.querySelector('input[type="hidden"][name="channel"]')?.value || '';
+              const pageText = String(document.body?.innerText || document.body?.textContent || '');
+              return { ok: !!checked || hiddenValue === 'sms', checked, hiddenValue, hasSmsText: /sms|text message|short message/i.test(pageText) };
+            }
+            """
+        ) or {}
+        if result.get('ok'):
+            _phone_debug(log, f"  已选择短信验证渠道: checked_sms={result.get('checked')} channel={result.get('hiddenValue') or '-'}")
+            return True
+        if result.get('hasSmsText'):
+            _phone_debug(log, f"  检测到 Text Message 选项但未能切换成功: checked_sms={result.get('checked')} channel={result.get('hiddenValue') or '-'}", "warning")
+    except Exception as exc:
+        _phone_debug(log, f"  选择短信验证渠道失败: {exc}", "warning")
+    return False
+
+
+def _click_sms_send_button(page, log) -> str | None:
+    """Click an add-phone send button while avoiding WhatsApp-only paths."""
+    _select_sms_phone_channel(page, log)
+    time.sleep(0.3)
+    buttons = _visible_button_texts(page)
+    if buttons:
+        _phone_debug(log, "  add_phone 可见按钮: " + " | ".join(buttons[:10]))
+
+    # First click a button explicitly advertising SMS.
+    try:
+        clicked = page.evaluate(
+            """
+            () => {
+              const nodes = Array.from(document.querySelectorAll('button, [role="button"], a'));
+              const visible = (el) => {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              };
+              const textOf = (el) => String(el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+              const sms = nodes.find((el) => visible(el) && /sms|text message|short message/i.test(textOf(el)) && !/whatsapp/i.test(textOf(el)));
+              if (sms) { sms.click(); return { ok: true, text: textOf(sms) || 'sms-button' }; }
+              return { ok: false, text: '' };
+            }
+            """
+        ) or {}
+        if clicked.get("ok"):
+            return f"sms-button:{clicked.get('text') or ''}"
+    except Exception:
+        pass
+
+    # If the page exposes WhatsApp wording and no SMS button, fail loudly instead of clicking submit.
+    page_text = _get_visible_page_text(page)
+    if re.search(r"whats\s*app|whatsapp", page_text, flags=re.I) and not re.search(r"sms|text message|short message", page_text, flags=re.I):
+        raise RuntimeError("add_phone 页面只显示 WhatsApp 验证，未找到 SMS 发送入口")
+
+    # Fallback: click a submit/continue only if its own text is not WhatsApp.
+    try:
+        clicked = page.evaluate(
+            """
+            () => {
+              const nodes = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"]'));
+              const visible = (el) => {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && !el.disabled && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              };
+              const textOf = (el) => String(el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+              const target = nodes.find((el) => visible(el) && !/whats\s*app|whatsapp/i.test(textOf(el)) && /send|continue|submit|发送|继续/i.test(textOf(el) || 'submit'));
+              if (target) { target.click(); return { ok: true, text: textOf(target) || target.tagName.toLowerCase() }; }
+              return { ok: false, text: '' };
+            }
+            """
+        ) or {}
+        if clicked.get("ok"):
+            return f"fallback-button:{clicked.get('text') or ''}"
+    except Exception:
+        pass
+
+    return None
 
 
 def _is_login_password_url(url: str) -> bool:
@@ -2045,6 +2326,100 @@ def _is_invalid_phone_otp_response(result: dict) -> bool:
     return "invalid otp code" in text
 
 
+def _extract_phone_error_text(page) -> str:
+    """Best-effort extraction for add_phone errors.
+
+    The add-phone page does not always expose errors through the same alert
+    selector.  Some failures (number used, unsupported number, rate limit,
+    invalid OTP) only show as visible page text near the phone form.
+    """
+    direct = _extract_auth_error_text(page)
+    if direct:
+        return direct
+    try:
+        text = _get_visible_page_text(page)
+    except Exception:
+        text = ""
+    if not text:
+        return ""
+    patterns = [
+        r"(?:phone number|number|手机号|電話番号|n[uú]mero)[\s\S]{0,160}(?:already|used|in use|linked|taken|invalid|unsupported|not supported|too many|limit|try again|无法|已使用|已绑定|无效|不支持|次数)",
+        r"(?:already|used|in use|linked|taken|invalid|unsupported|not supported|too many|limit|try again|无法|已使用|已绑定|无效|不支持|次数)[\s\S]{0,160}(?:phone number|number|手机号|電話番号|n[uú]mero)",
+        r"(?:wrong|incorrect|invalid|expired)[\s\S]{0,120}(?:code|otp|验证码|驗證碼)",
+        r"(?:code|otp|验证码|驗證碼)[\s\S]{0,120}(?:wrong|incorrect|invalid|expired)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            return re.sub(r"\s+", " ", match.group(0)).strip()[:300]
+    return ""
+
+
+def _reset_phone_callback_for_retry(phone_callback, reason: str = "") -> None:
+    if hasattr(phone_callback, "mark_send_failed") and reason:
+        try:
+            phone_callback.mark_send_failed(reason)
+        except Exception:
+            pass
+    if hasattr(phone_callback, "cleanup"):
+        try:
+            phone_callback.cleanup()
+        except Exception:
+            pass
+    for attr, value in (
+        ("phase", "need_number"),
+        ("activation", None),
+        ("completed", False),
+        ("awaiting_external_success", False),
+    ):
+        if hasattr(phone_callback, attr):
+            try:
+                setattr(phone_callback, attr, value)
+            except Exception:
+                pass
+
+
+def _is_retryable_add_phone_error(message: str) -> bool:
+    text = str(message or "").lower()
+    retry_hints = (
+        "未获取到短信验证码",
+        "未获取到手机号",
+        "未找到手机号输入框",
+        "手机号输入框填写失败",
+        "未找到发送验证码按钮",
+        "手机号提交失败",
+        "whatsapp",
+        "短信验证码校验失败",
+        "未找到短信验证码输入框",
+        "phone_number_in_use",
+        "phone number",
+        "already",
+        "in use",
+        "used",
+        "linked",
+        "taken",
+        "invalid",
+        "unsupported",
+        "not supported",
+        "try again",
+        "too many",
+        "limit",
+        "rate",
+        "wrong",
+        "incorrect",
+        "expired",
+        "timeout",
+        "timed out",
+        "验证码",
+        "手机号",
+        "已使用",
+        "已绑定",
+        "无效",
+        "不支持",
+    )
+    return any(hint.lower() in text for hint in retry_hints)
+
+
 def _handle_add_phone_challenge(
     page,
     phone_callback,
@@ -2053,12 +2428,13 @@ def _handle_add_phone_challenge(
     user_agent: str,
     log,
     resume_url: str = "",
-    max_phone_attempts: int = 3,
+    max_phone_attempts: int = 5,
 ) -> dict:
     """在 add-phone 页面通过 UI 交互完成手机号验证。
 
     流程: 选择国家 -> 输入本地号码 -> 点击发送 -> 填写 OTP -> 点击验证。
-    如果验证码超时未收到，自动换号重试（最多 max_phone_attempts 次）。
+    如果手机号被使用、页面拒绝、验证码错误/超时等，自动换号重试
+    （最多 max_phone_attempts 次）。
     """
     if not phone_callback:
         raise RuntimeError(
@@ -2087,24 +2463,14 @@ def _handle_add_phone_challenge(
         except RuntimeError as exc:
             last_error = exc
             error_msg = str(exc)
-            # 验证码超时或号码已被使用时换号重试，其他错误直接抛出
-            should_retry = (
-                "未获取到短信验证码" in error_msg
-                or "phone_number_in_use" in error_msg
-                or "already" in error_msg.lower()
-                or "in use" in error_msg.lower()
-            )
-            if not should_retry:
+            should_retry = _is_retryable_add_phone_error(error_msg)
+            if not should_retry or phone_attempt >= max_phone_attempts - 1:
+                if should_retry:
+                    log(f"⚠️ 手机验证第 {phone_attempt + 1}/{max_phone_attempts} 次失败，已达到最大换号次数: {error_msg[:180]}")
+                    _reset_phone_callback_for_retry(phone_callback, error_msg)
                 raise
-            log(f"⚠️ 验证码超时未收到，准备换号重试...")
-            # 取消当前号码
-            if hasattr(phone_callback, "cleanup"):
-                phone_callback.cleanup()
-            # 重置 phone_callback 状态为 need_number
-            if hasattr(phone_callback, "phase"):
-                phone_callback.phase = "need_number"
-                phone_callback.activation = None
-                phone_callback.completed = False
+            log(f"⚠️ 手机验证第 {phone_attempt + 1}/{max_phone_attempts} 次失败: {error_msg[:180]}，准备换号重试...")
+            _reset_phone_callback_for_retry(phone_callback, error_msg)
 
     raise last_error or RuntimeError("短信验证失败: 多次换号均未收到验证码")
 
@@ -2147,23 +2513,23 @@ def _do_add_phone_attempt(
             'a:has-text("Resend code")',
         ], timeout=3)
         if resend_clicked:
-            log(f"  phone-otp/resend -> 已点击页面 Resend 按钮: {resend_clicked}")
+            _phone_debug(log, f"  phone-otp/resend -> 已点击页面 Resend 按钮: {resend_clicked}")
         else:
-            log("  phone-otp/resend -> 页面未找到 Resend 按钮，跳过（浏览器模式不走 HTTP）")
+            _phone_debug(log, "  phone-otp/resend -> 页面未找到 Resend 按钮，跳过（浏览器模式不走 HTTP）")
 
     if hasattr(phone_callback, "set_resend_callback"):
         phone_callback.set_resend_callback(_request_openai_resend)
 
     # ---- 第1步: 获取手机号 ----
-    log("注册流程已进入 add_phone，开始准备租号并接收短信验证码...")
+    log("进入 add_phone，准备短信验证...")
     phone_number = str(phone_callback() or "").strip()
     if not phone_number:
         raise RuntimeError("未获取到手机号")
-    log(f"检测到 add_phone，提交手机号(UI): {_mask_phone_number(phone_number)}")
+    log(f"提交手机号: {_mask_phone_number(phone_number)}")
 
     # 解析国家拨号码和本地号码
     dial_code, local_number, country_name = _parse_phone_country_and_local(phone_number)
-    log(f"  解析号码: 国家={country_name or '未知'} 拨号码=+{dial_code} 本地号={local_number[:4]}...")
+    _phone_debug(log, f"  解析号码: 国家={country_name or '未知'} 拨号码=+{dial_code} 本地号={local_number[:4]}...")
 
     # 确保在 add-phone 页面
     current_url = str(page.url or "")
@@ -2192,12 +2558,12 @@ def _do_add_phone_attempt(
                 # 如果 input 值包含我们的号码（可能前面有 +56 之类的前缀），认为成功
                 if fill_value and fill_value in actual_val.replace(" ", "").replace("-", ""):
                     filled = True
-                    log(f"  手机号已填写(含前缀): {actual_val[:12]}...")
+                    _phone_debug(log, f"  手机号已填写(含前缀): {actual_val[:12]}...")
             except Exception:
                 pass
         if not filled:
             # fallback: 尝试先清空再用 keyboard.type 输入
-            log(f"  _fill_input_like_user 失败，尝试 keyboard fallback...")
+            _phone_debug(log, f"  _fill_input_like_user 失败，尝试 keyboard fallback...")
             try:
                 page.click(phone_input_sel)
                 time.sleep(0.3)
@@ -2217,9 +2583,9 @@ def _do_add_phone_attempt(
                 actual_clean = str(actual or "").replace(" ", "").replace("-", "")
                 if fill_value in actual_clean:
                     filled = True
-                    log(f"  keyboard fallback 成功: {str(actual or '')[:12]}...")
+                    _phone_debug(log, f"  keyboard fallback 成功: {str(actual or '')[:12]}...")
             except Exception as e:
-                log(f"  keyboard fallback 失败: {e}")
+                _phone_debug(log, f"  keyboard fallback 失败: {e}")
         if not filled:
             # 最终 fallback: 直接用 JS 设置值
             try:
@@ -2245,30 +2611,53 @@ def _do_add_phone_attempt(
                 )
                 if js_ok:
                     filled = True
-                    log(f"  JS setValue fallback 成功")
+                    _phone_debug(log, f"  JS setValue fallback 成功")
             except Exception as e:
-                log(f"  JS setValue fallback 失败: {e}")
+                _phone_debug(log, f"  JS setValue fallback 失败: {e}")
         if not filled:
             raise RuntimeError(f"手机号输入框填写失败: {phone_input_sel}")
-        log(f"  手机号输入框已填写: {phone_input_sel} value={fill_value[:4]}...")
+        _phone_debug(log, f"  手机号输入框已填写: {phone_input_sel} value={fill_value[:4]}...")
     else:
         raise RuntimeError("未找到手机号输入框")
     _browser_pause(page)
 
     # ---- 第4步: 点击发送按钮 ----
-    send_sel = _click_first(page, PHONE_SEND_SELECTORS, timeout=8)
+    debug_add_phone = str(os.environ.get("CHATGPT_DEBUG_ADD_PHONE") or "").strip().lower() in {"1", "true", "yes", "on"}
+    if debug_add_phone:
+        _log_add_phone_dom_summary(page, log, label="before-send")
+        dump_phone_net = _install_add_phone_network_logger(page, log)
+    else:
+        dump_phone_net = lambda _label="": None
+    send_sel = _click_sms_send_button(page, log)
     if send_sel:
-        log(f"  已点击发送按钮: {send_sel}")
+        _phone_debug(log, f"  已点击发送按钮: {send_sel}")
     elif _submit_form_with_fallback(page, phone_input_sel):
-        log("  未找到发送按钮，已使用表单 fallback 提交")
+        _phone_debug(log, "  未找到明确 SMS 按钮，已使用表单 fallback 提交")
     else:
         raise RuntimeError("未找到发送验证码按钮")
 
     # 等待页面响应（可能显示 OTP 输入框或错误）
     time.sleep(2)
+    after_buttons = _visible_button_texts(page)
+    if after_buttons:
+        _phone_debug(log, "  发送后可见按钮: " + " | ".join(after_buttons[:10]))
+    try:
+        dump_phone_net("after-send")
+    except Exception:
+        pass
+    if debug_add_phone:
+        _log_add_phone_dom_summary(page, log, label="after-send")
 
-    # 检查发送是否成功（页面应出现 OTP 输入框或 URL 变化）
-    error_text = _extract_auth_error_text(page)
+    # 检查发送是否成功（页面应出现 OTP 输入框或 URL 变化）。
+    # OpenAI add-phone 页面在某些地区会默认走 WhatsApp；这种情况下 HeroSMS 不会收到 SMS，
+    # 不能把它误判为“手机号提交成功”。
+    after_text = _get_visible_page_text(page)
+    if re.search(r"whats\s*app|whatsapp", after_text, flags=re.I):
+        if hasattr(phone_callback, "mark_send_failed"):
+            phone_callback.mark_send_failed("页面进入 WhatsApp 验证，不是 SMS 验证")
+        raise RuntimeError("手机号提交后进入 WhatsApp 验证，未触发 SMS 短信发送")
+
+    error_text = _extract_phone_error_text(page)
     if error_text:
         if hasattr(phone_callback, "mark_send_failed"):
             phone_callback.mark_send_failed(error_text)
@@ -2276,7 +2665,7 @@ def _do_add_phone_attempt(
 
     if hasattr(phone_callback, "mark_send_succeeded"):
         phone_callback.mark_send_succeeded()
-    log("手机号提交成功(UI)，开始等待短信验证码...")
+    log("手机号已提交，等待短信验证码...")
 
     # ---- 第5步: 等待 SMS 验证码并在页面 OTP 输入框中填写 ----
     for code_attempt in range(3):
@@ -2295,7 +2684,7 @@ def _do_add_phone_attempt(
         # 使用与邮箱 OTP 相同的填写逻辑
         otp_resp = _submit_otp_via_page(page, sms_code, log)
         otp_status = int(otp_resp.get("status") or 0)
-        log(f"  phone-otp 页面提交状态: {otp_status}")
+        _phone_debug(log, f"  phone-otp 页面提交状态: {otp_status}")
 
         if otp_resp.get("ok") or otp_status in (200, 201, 204):
             if hasattr(phone_callback, "report_success"):
@@ -2310,21 +2699,43 @@ def _do_add_phone_attempt(
                 state = _derive_registration_state_from_page(page)
             next_url = _normalize_url(resume_url, OPENAI_AUTH) if resume_url else ""
             if next_url:
-                page.goto(next_url, wait_until="domcontentloaded", timeout=30000)
-                return _extract_flow_state(None, page.url)
+                try:
+                    page.goto(next_url, wait_until="domcontentloaded", timeout=30000)
+                    return _extract_flow_state(None, page.url)
+                except Exception as exc:
+                    callback_url = _extract_callback_url_from_exception(exc)
+                    if callback_url:
+                        return _extract_flow_state(None, callback_url)
+                    raise
             return state
 
         # 检查是否是无效验证码
-        page_error = _extract_auth_error_text(page)
+        page_error = _extract_phone_error_text(page)
+        response_error_text = ""
+        otp_data = otp_resp.get("data")
+        if isinstance(otp_data, dict):
+            err = otp_data.get("error")
+            if isinstance(err, dict):
+                response_error_text = str(err.get("message") or err.get("code") or "")
+        if not response_error_text:
+            response_error_text = str(otp_resp.get("text") or "")
+        combined_error = page_error or response_error_text
+        if _is_invalid_phone_otp_response(otp_resp):
+            combined_error = combined_error or "invalid otp code"
         if page_error and any(kw in page_error.lower() for kw in ("invalid", "incorrect", "wrong", "expired")):
             log(f"短信验证码被判定无效: {page_error[:100]}，继续等待下一条...")
             if hasattr(phone_callback, "mark_code_failed"):
                 phone_callback.mark_code_failed(page_error or "invalid otp code")
             continue
+        if _is_invalid_phone_otp_response(otp_resp):
+            log(f"短信验证码被判定无效: {combined_error[:100]}，继续等待下一条...")
+            if hasattr(phone_callback, "mark_code_failed"):
+                phone_callback.mark_code_failed(combined_error or "invalid otp code")
+            continue
 
         if hasattr(phone_callback, "mark_code_failed"):
-            phone_callback.mark_code_failed(page_error or f"status {otp_status}")
-        raise RuntimeError(f"短信验证码校验失败: {page_error[:200] if page_error else f'status {otp_status}'}")
+            phone_callback.mark_code_failed(combined_error or f"status {otp_status}")
+        raise RuntimeError(f"短信验证码校验失败: {combined_error[:200] if combined_error else f'status {otp_status}'}")
 
     raise RuntimeError("短信验证码校验失败: 多次验证码均无效或未通过")
 
@@ -2925,7 +3336,7 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
                     break
             if done >= len(otp):
                 filled = True
-                log(f"验证码页已填写 {done} 位分格输入框")
+                _phone_debug(log, f"验证码页已填写 {done} 位分格输入框")
     except Exception:
         pass
 
@@ -2950,7 +3361,7 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
                 final_value = str(target.input_value() or "").strip()
                 if final_value:
                     filled = True
-                    log("验证码页已填写单输入框")
+                    _phone_debug(log, "验证码页已填写单输入框")
                     break
             except Exception:
                 continue
@@ -2973,7 +3384,7 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
                     target.type(otp, delay=random.randint(18, 45))
                     if str(target.input_value() or "").strip():
                         filled = True
-                        log("验证码页已填写单输入框(重试)")
+                        _phone_debug(log, "验证码页已填写单输入框(重试)")
                         break
             except Exception:
                 continue
@@ -2998,7 +3409,7 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
     )
     if not submit_selector:
         return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到 Continue 按钮"}
-    log(f"验证码页已点击继续按钮: {submit_selector}")
+    _phone_debug(log, f"验证码页已点击继续按钮: {submit_selector}")
 
     deadline = time.time() + 20
     last_url = page.url
@@ -3846,10 +4257,7 @@ class ChatGPTBrowserRegister:
 
     def run(self, email: str, password: str) -> dict:
         proxy = _build_proxy_config(self.proxy)
-        launch_opts = {"headless": self.headless}
-        if proxy:
-            launch_opts["proxy"] = proxy
-            launch_opts["geoip"] = True
+        launch_opts = _camoufox_launch_options(headless=self.headless, proxy=proxy)
 
         with Camoufox(**launch_opts) as browser:
             page = browser.new_page()
@@ -3891,9 +4299,7 @@ class ChatGPTBrowserRegister:
     def _retry_oauth_fresh_browser(self, email, password):
         """在全新浏览器 context 里做 Codex OAuth（绕过 add_phone session）。"""
         proxy = _build_proxy_config(self.proxy)
-        launch_opts = {"headless": self.headless}
-        if proxy:
-            launch_opts["proxy"] = proxy
+        launch_opts = _camoufox_launch_options(headless=self.headless, proxy=proxy)
         try:
             with Camoufox(**launch_opts) as browser:
                 page = browser.new_page()

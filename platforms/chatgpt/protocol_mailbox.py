@@ -7,10 +7,11 @@ from platforms.chatgpt.register import RegistrationEngine
 
 
 class _MailboxEmailService:
-    def __init__(self, *, mailbox, mailbox_account, provider: str):
+    def __init__(self, *, mailbox, mailbox_account, provider: str, before_ids: set | None = None):
         self.service_type = type("ST", (), {"value": provider})()
         self._mailbox = mailbox
         self._mailbox_account = mailbox_account
+        self._before_ids = set(before_ids or [])
         self._acct = None
 
     def create_email(self, config=None):
@@ -23,7 +24,28 @@ class _MailboxEmailService:
 
     def get_verification_code(self, email=None, email_id=None, timeout=120, pattern=None, otp_sent_at=None):
         acct = self._acct or self._mailbox_account
-        return self._mailbox.wait_for_code(acct, keyword="", timeout=timeout, code_pattern=pattern)
+        try:
+            code = self._mailbox.wait_for_code(
+                acct,
+                keyword="",
+                timeout=timeout,
+                code_pattern=pattern,
+                before_ids=self._before_ids,
+                otp_sent_at=otp_sent_at,
+            )
+        except TypeError:
+            code = self._mailbox.wait_for_code(
+                acct,
+                keyword="",
+                timeout=timeout,
+                code_pattern=pattern,
+                before_ids=self._before_ids,
+            )
+        try:
+            self._before_ids = self._mailbox.get_current_ids(acct)
+        except Exception:
+            pass
+        return code
 
     def update_status(self, success, error=None):
         return None
@@ -42,6 +64,9 @@ class ChatGPTProtocolMailboxWorker:
         provider: str,
         proxy_url: str | None = None,
         log_fn: Callable[[str], None] = print,
+        before_ids: set | None = None,
+        phone_callback: Callable[[], str] | None = None,
+        phone_cleanup: Callable[[], None] | None = None,
     ):
         if not mailbox or not mailbox_account:
             raise ValueError("ChatGPT 注册流程依赖 mailbox provider，当前未获取到邮箱账号")
@@ -49,17 +74,67 @@ class ChatGPTProtocolMailboxWorker:
             mailbox=mailbox,
             mailbox_account=mailbox_account,
             provider=provider,
+            before_ids=before_ids,
         )
+        self.phone_cleanup = phone_cleanup
         self.engine = RegistrationEngine(
             email_service=email_service,
             proxy_url=proxy_url,
             callback_logger=log_fn,
+            phone_callback=phone_callback,
         )
+
+    def _mailbox_credential_password(self) -> str:
+        extra = dict(getattr(self.engine.email_service._mailbox_account, "extra", {}) or {})
+        provider_account = dict(extra.get("provider_account") or {})
+        credentials = dict(provider_account.get("credentials") or {})
+        return str(credentials.get("password") or "")
+
+    def _is_existing_account_pool(self) -> bool:
+        provider = str(getattr(self.engine.email_service.service_type, "value", "") or "").strip()
+        extra = dict(getattr(self.engine.email_service._mailbox_account, "extra", {}) or {})
+        provider_account = dict(extra.get("provider_account") or {})
+        provider_resource = dict(extra.get("provider_resource") or {})
+        names = {
+            provider,
+            str(provider_account.get("provider_name") or ""),
+            str(provider_resource.get("provider_name") or ""),
+        }
+        return bool({"local_ms_pool", "local_mail_pool"} & names)
 
     def run(self, *, email: str, password: str):
         self.engine.email = email
-        self.engine.password = password
-        result = self.engine.run()
-        if not result or not result.success:
-            raise RuntimeError(result.error_message if result else "注册失败")
-        return result
+        credential_password = self._mailbox_credential_password()
+        self.engine.password = credential_password or password
+
+        # 本地邮箱池导入的是“已注册好的号”。这里直接走 Codex OAuth 登录，
+        # 不再走 ChatGPT create-account 注册链路，避免 invalid_state / user_exists 类错误。
+        success = False
+        try:
+            if self._is_existing_account_pool():
+                result = self.engine.login_existing_via_codex_auth(
+                    email=email,
+                    password=credential_password or "",
+                )
+            else:
+                result = self.engine.run()
+
+            if not result or not result.success:
+                raise RuntimeError(result.error_message if result else "注册失败")
+            success = True
+            return result
+        finally:
+            if not success:
+                try:
+                    release = getattr(self.engine.email_service._mailbox, "release_email", None)
+                    if callable(release):
+                        released = release(self.engine.email_service._mailbox_account)
+                        if released:
+                            self.engine._log(f"失败任务已释放邮箱占用: {self.engine.email_service._mailbox_account.email}")
+                except Exception as exc:
+                    try:
+                        self.engine._log(f"释放邮箱占用失败: {exc}")
+                    except Exception:
+                        pass
+            if callable(self.phone_cleanup):
+                self.phone_cleanup()

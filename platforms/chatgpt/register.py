@@ -12,6 +12,7 @@ import random
 import logging
 import secrets
 import string
+import os
 from typing import Optional, Dict, Any, Tuple, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -40,6 +41,92 @@ from .constants import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _is_curl_tls_connect_error(exc: BaseException) -> bool:
+    text = str(exc or "").lower()
+    return (
+        "curl: (35)" in text
+        or "tls connect error" in text
+        or "openssl_internal:invalid library" in text
+        or "invalid library (0)" in text
+    )
+
+
+def _copy_session_cookies(src, dst) -> None:
+    try:
+        dst.cookies.update(src.cookies)
+    except Exception:
+        try:
+            for cookie in src.cookies.jar:
+                dst.cookies.set(cookie.name, cookie.value, domain=cookie.domain, path=cookie.path)
+        except Exception:
+            pass
+
+
+class _TLSFallbackSession:
+    """curl_cffi session wrapper for Codex login TLS fallback.
+
+    The Codex login flow needs cookie continuity.  This wrapper retries curl
+    TLS connect failures with a fresh session/profile while preserving cookies.
+    """
+
+    def __init__(self, session, *, proxy_url: str | None = None, log_fn: Callable[[str, str], None] | None = None):
+        self._session = session
+        self.proxy_url = proxy_url
+        self.log_fn = log_fn
+
+    @property
+    def cookies(self):
+        return self._session.cookies
+
+    def __getattr__(self, name: str):
+        return getattr(self._session, name)
+
+    def _new_session(self, impersonate: str, proxy_url: str | None):
+        session = cffi_requests.Session(impersonate=impersonate)
+        if proxy_url:
+            try:
+                session.proxies = {"http": proxy_url, "https": proxy_url}
+            except Exception:
+                pass
+        _copy_session_cookies(self._session, session)
+        return session
+
+    def request(self, method: str, url: str, **kwargs):
+        try:
+            return self._session.request(method, url, **kwargs)
+        except cffi_requests.RequestsError as exc:
+            if not _is_curl_tls_connect_error(exc):
+                raise
+            last_error: BaseException = exc
+            first_hop = "proxy" if self.proxy_url else "direct"
+            attempts: list[tuple[str, str | None, str]] = [
+                ("chrome120", self.proxy_url, f"{first_hop}/chrome120"),
+                ("chrome110", self.proxy_url, f"{first_hop}/chrome110"),
+            ]
+            if self.proxy_url:
+                attempts.append(("chrome120", None, "direct/chrome120"))
+            for impersonate, proxy_url, label in attempts:
+                try:
+                    if self.log_fn:
+                        self.log_fn(f"Codex TLS 连接失败，切换 {label} 重试...", "warning")
+                    session = self._new_session(impersonate, proxy_url)
+                    response = session.request(method, url, **kwargs)
+                    self._session = session
+                    return response
+                except cffi_requests.RequestsError as retry_exc:
+                    last_error = retry_exc
+                    if _is_curl_tls_connect_error(retry_exc):
+                        continue
+                    raise
+            raise last_error
+
+    def get(self, url: str, **kwargs):
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs):
+        return self.request("POST", url, **kwargs)
 
 
 @dataclass
@@ -195,7 +282,8 @@ class RegistrationEngine:
         email_service: Any,
         proxy_url: Optional[str] = None,
         callback_logger: Optional[Callable[[str], None]] = None,
-        task_uuid: Optional[str] = None
+        task_uuid: Optional[str] = None,
+        phone_callback: Optional[Callable[[], str]] = None,
     ):
         """
         初始化注册引擎
@@ -207,12 +295,14 @@ class RegistrationEngine:
             task_uuid: 任务 UUID（用于数据库记录）
         """
         self.email_service = email_service
-        self.proxy_url = proxy_url
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
+        self.phone_callback = phone_callback
 
         # 创建 HTTP 客户端
         self.http_client = OpenAIHTTPClient(proxy_url=proxy_url)
+        # 没显式传代理时自动继承系统代理，避免 macOS fake-ip 直连导致 curl (35)。
+        self.proxy_url = self.http_client.proxy_url
 
         # 创建 OAuth 管理器
         from .constants import OAUTH_CLIENT_ID, OAUTH_AUTH_URL, OAUTH_TOKEN_URL, OAUTH_REDIRECT_URI, OAUTH_SCOPE
@@ -222,7 +312,7 @@ class RegistrationEngine:
             token_url=OAUTH_TOKEN_URL,
             redirect_uri=OAUTH_REDIRECT_URI,
             scope=OAUTH_SCOPE,
-            proxy_url=proxy_url  # 传递代理配置
+            proxy_url=self.proxy_url  # 传递代理配置
         )
 
         # 状态变量
@@ -242,6 +332,15 @@ class RegistrationEngine:
         self._create_account_continue_url: Optional[str] = None
         self._otp_continue_url: Optional[str] = None
         self._otp_page_type: Optional[str] = None
+        self._last_codex_error: str = ""
+
+    @staticmethod
+    def _debug_auth_enabled() -> bool:
+        return str(
+            os.environ.get("CHATGPT_DEBUG_CODEX_AUTH")
+            or os.environ.get("CHATGPT_DEBUG_AUTH")
+            or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -270,6 +369,10 @@ class RegistrationEngine:
             logger.warning(message)
         else:
             logger.info(message)
+
+    def _debug_log(self, message: str, level: str = "info"):
+        if self._debug_auth_enabled():
+            self._log(message, level)
 
     def _generate_password(self, length: int = DEFAULT_PASSWORD_LENGTH) -> str:
         """生成随机密码"""
@@ -310,10 +413,37 @@ class RegistrationEngine:
             self._log(f"检查 IP 地理位置失败: {e}", "error")
             return False, None
 
+    def _preflight_codex_auth_network(self) -> Tuple[bool, str]:
+        """Codex Auth 前置连通性自测。
+
+        这一步必须在占用本地邮箱池账号之前执行；否则线路不通时会白白把
+        邮箱标记为 used。这里只做轻量 GET，不提交邮箱、不发 OTP。
+        """
+        try:
+            from .constants import OPENAI_AUTH
+
+            client = OpenAIHTTPClient(proxy_url=self.proxy_url)
+            session = _TLSFallbackSession(
+                client.session,
+                proxy_url=client.proxy_url,
+                log_fn=self._debug_log,
+            )
+            resp = session.get(f"{OPENAI_AUTH}/", timeout=12, allow_redirects=False)
+            if resp.status_code in (200, 301, 302, 303, 307, 308, 401, 403, 404):
+                self.proxy_url = client.proxy_url
+                return True, f"status={resp.status_code} proxy={self.proxy_url or 'direct'}"
+            return False, f"status={resp.status_code} proxy={client.proxy_url or 'direct'}"
+        except Exception as exc:
+            self._last_codex_error = str(exc)
+            return False, f"{type(exc).__name__}: {exc} proxy={self.proxy_url or 'direct'}"
+
     def _create_email(self) -> bool:
         """创建邮箱"""
         try:
-            self._log(f"正在创建 {self.email_service.service_type.value} 邮箱...")
+            service_name = self.email_service.service_type.value
+            if service_name in {"local_ms_pool", "local_mail_pool"}:
+                service_name = "本地邮箱池"
+            self._log(f"正在创建 {service_name} 邮箱...")
             self.email_info = self.email_service.create_email()
 
             if not self.email_info or "email" not in self.email_info:
@@ -823,12 +953,443 @@ class RegistrationEngine:
             self._log(f"创建账户失败: {e}", "error")
             return False
 
+    def _session_cookies_for_browser(self, session) -> list[dict]:
+        """Convert curl_cffi session cookies to browser-context cookies."""
+        cookies: list[dict] = []
+        try:
+            jar = getattr(getattr(session, "cookies", None), "jar", None) or getattr(session, "cookies", None)
+            for c in list(jar or []):
+                name = str(getattr(c, "name", "") or "")
+                value = str(getattr(c, "value", "") or "")
+                if not name:
+                    continue
+                domain = str(getattr(c, "domain", "") or "auth.openai.com")
+                if "openai.com" not in domain and "chatgpt.com" not in domain:
+                    continue
+                item = {
+                    "name": name,
+                    "value": value,
+                    "domain": domain,
+                    "path": str(getattr(c, "path", "") or "/"),
+                    "secure": bool(getattr(c, "secure", True)),
+                    "httpOnly": bool(getattr(c, "has_nonstandard_attr", lambda _n: False)("HttpOnly")),
+                }
+                expires = getattr(c, "expires", None)
+                if expires:
+                    try:
+                        item["expires"] = int(expires)
+                    except Exception:
+                        pass
+                cookies.append(item)
+        except Exception as exc:
+            self._log(f"导出登录 cookies 失败: {exc}", "warning")
+        return cookies
+
+    def _sync_browser_cookies_to_session(self, page, session) -> None:
+        """把临时浏览器里的 auth/chatgpt cookies 回灌到 curl_cffi session。
+
+        add_phone 只能走浏览器页面时，手机号验证后的登录态经常只存在于
+        browser context。回灌后可继续用原 OAuth state 走 workspace/consent，
+        避免再完整跑一遍 Codex Auth 邮箱 OTP。
+        """
+        try:
+            cookies = page.context.cookies()
+        except Exception as exc:
+            self._debug_log(f"回灌浏览器 cookies 失败: {exc}", "warning")
+            return
+
+        for cookie in cookies or []:
+            try:
+                name = str(cookie.get("name") or "")
+                value = str(cookie.get("value") or "")
+                domain = str(cookie.get("domain") or "").strip() or "auth.openai.com"
+                path = str(cookie.get("path") or "/")
+                if not name or not value:
+                    continue
+                if "openai.com" not in domain and "chatgpt.com" not in domain:
+                    continue
+                try:
+                    session.cookies.set(name, value, domain=domain, path=path)
+                except TypeError:
+                    session.cookies.set(name, value)
+                if domain.startswith("."):
+                    try:
+                        session.cookies.set(name, value, domain=domain.lstrip("."), path=path)
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+
+    def _codex_api_auth_url(self, codex_oauth) -> str:
+        from .constants import OPENAI_AUTH
+
+        try:
+            query = codex_oauth.auth_url.split("?", 1)[1]
+        except Exception:
+            return codex_oauth.auth_url
+        return f"{OPENAI_AUTH}/api/oauth/oauth2/auth?{query}"
+
+    def _extract_codex_callback_from_state(self, state: dict | None) -> str:
+        try:
+            from platforms.chatgpt.browser_register import _extract_code_from_url
+        except Exception:
+            return ""
+        raw = state if isinstance(state, dict) else {}
+        for key in ("current_url", "continue_url"):
+            url = str(raw.get(key) or "")
+            if _extract_code_from_url(url) and "state=" in url:
+                return url
+        return ""
+
+    def _try_codex_callback_with_session(self, login_session, codex_oauth, login_client=None, *, quiet: bool = False) -> Optional[str]:
+        """Try to continue the current Codex OAuth session without redoing email OTP."""
+        try:
+            from platforms.chatgpt.browser_register import _follow_redirects_for_code
+
+            log = self._debug_log if quiet else self._log
+            callback = self._complete_codex_consent_with_session(
+                login_session,
+                codex_oauth,
+                login_client,
+                quiet=quiet,
+            )
+            if callback:
+                return callback
+
+            for next_url in (self._codex_api_auth_url(codex_oauth), codex_oauth.auth_url):
+                callback = _follow_redirects_for_code(
+                    login_session,
+                    next_url,
+                    log,
+                    max_redirects=12,
+                )
+                if callback:
+                    return callback
+            return None
+        except Exception as exc:
+            self._debug_log(f"Codex OAuth session 续接失败: {exc}", "warning")
+            return None
+
+    def _click_codex_continue_in_browser(self, page) -> bool:
+        """Best-effort click/submit for Codex consent/workspace pages."""
+        try:
+            clicked = bool(page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return !!(style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0);
+                  };
+                  const forms = Array.from(document.querySelectorAll('form'));
+                  for (const form of forms) {
+                    const buttons = Array.from(form.querySelectorAll('button[type="submit"], input[type="submit"], button, [role="button"]'));
+                    const target = buttons.find((el) => visible(el) && /continue|allow|authorize|select|继续|授权/i.test(String(el.innerText || el.textContent || el.value || ''))) ||
+                                   buttons.find((el) => visible(el));
+                    if (target) {
+                      if (form.requestSubmit && target.tagName.toLowerCase() === 'button') form.requestSubmit(target);
+                      else target.click();
+                      return true;
+                    }
+                  }
+                  const nodes = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], a'));
+                  const target = nodes.find((el) => visible(el) && /continue|allow|authorize|select|next|继续|授权|下一步/i.test(String(el.innerText || el.textContent || el.getAttribute('aria-label') || ''))) ||
+                                 nodes.find((el) => visible(el) && String(el.getAttribute('type') || '').toLowerCase() === 'submit');
+                  if (target) {
+                    target.click();
+                    return true;
+                  }
+                  return false;
+                }
+                """
+            ))
+            return clicked
+        except Exception as exc:
+            self._debug_log(f"Codex browser continue 点击失败: {exc}", "warning")
+            return False
+
+    def _wait_browser_codex_callback(self, page, timeout: float = 10.0) -> str:
+        try:
+            from platforms.chatgpt.browser_register import _extract_code_from_url
+        except Exception:
+            return ""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                current_url = str(page.url or "")
+            except Exception:
+                current_url = ""
+            if _extract_code_from_url(current_url) and "state=" in current_url:
+                return current_url
+            time.sleep(0.5)
+        return ""
+
+    def _continue_codex_oauth_in_browser_after_phone(self, page, login_session, codex_oauth, login_client=None) -> Optional[str]:
+        """手机号验证完成后，只做几秒钟快速 callback 探测。
+
+        add_phone 完成后旧 OAuth session 经常不会继续吐 callback。这里不再长时间
+        导航/轮询；几秒内拿不到就交给外层重新跑一遍 Codex Auth。
+        """
+        try:
+            from platforms.chatgpt.browser_register import (
+                _derive_registration_state_from_page,
+                _extract_callback_url_from_exception,
+                _extract_code_from_url,
+            )
+        except Exception as exc:
+            self._debug_log(f"加载 Codex OAuth browser 续接工具失败: {exc}", "warning")
+            return None
+
+        def _check_current() -> str:
+            try:
+                current = str(page.url or "")
+            except Exception:
+                current = ""
+            if _extract_code_from_url(current) and "state=" in current:
+                return current
+            try:
+                state = _derive_registration_state_from_page(page)
+            except Exception:
+                state = {}
+            return self._extract_codex_callback_from_state(state)
+
+        # 先回灌 cookies，只检查当前 URL/state。不要在旧会话里长时间 goto/redirect。
+        self._sync_browser_cookies_to_session(page, login_session)
+        deadline = time.time() + 3.0
+        round_idx = 0
+        while time.time() < deadline:
+            round_idx += 1
+            callback = _check_current()
+            if callback:
+                return callback
+            try:
+                state = _derive_registration_state_from_page(page)
+            except Exception:
+                state = {}
+            page_type = str(state.get("page_type") or "")
+            current_url = str(state.get("current_url") or getattr(page, "url", "") or "")
+            self._debug_log(f"Codex add_phone 后快速探测[{round_idx}]: page={page_type or '-'} url={current_url[:120]}")
+
+            if page_type in {"consent", "sign_in_with_chatgpt_codex_consent", "workspace_selection", "organization_selection", "external_url"}:
+                if self._click_codex_continue_in_browser(page):
+                    callback = self._wait_browser_codex_callback(page, timeout=1.5)
+                    if callback:
+                        return callback
+
+            time.sleep(0.4)
+        return None
+
+    def _complete_add_phone_in_browser(self, login_session, codex_oauth, did: str, login_client=None) -> Optional[str]:
+        """Use the existing browser add-phone implementation to finish SMS verification."""
+        if not self.phone_callback:
+            self._log("Codex CLI 登录进入 add_phone，但未配置可用 SMS phone_callback", "error")
+            return None
+        try:
+            from camoufox.sync_api import Camoufox
+            from platforms.chatgpt.browser_register import (
+                _build_proxy_config,
+                _camoufox_launch_options,
+                _handle_add_phone_challenge,
+                _extract_code_from_url,
+                _derive_registration_state_from_page,
+                _extract_callback_url_from_exception,
+            )
+            from .constants import OPENAI_AUTH
+
+            ua = ""
+            try:
+                ua = str((login_client.default_headers or {}).get("User-Agent") or "") if login_client else ""
+            except Exception:
+                ua = ""
+            proxy = _build_proxy_config(self.proxy_url)
+            launch_opts = _camoufox_launch_options(headless=True, proxy=proxy)
+
+            self._log("Codex Auth 需要手机验证，开始短信验证...")
+            with Camoufox(**launch_opts) as browser:
+                page = browser.new_page()
+                cookies = self._session_cookies_for_browser(login_session)
+                if cookies:
+                    page.context.add_cookies(cookies)
+                try:
+                    page.context.add_cookies([
+                        {"name": "oai-did", "value": did, "domain": "auth.openai.com", "path": "/"},
+                        {"name": "oai-did", "value": did, "domain": ".auth.openai.com", "path": "/"},
+                    ])
+                except Exception:
+                    pass
+
+                try:
+                    page.goto(f"{OPENAI_AUTH}/add-phone", wait_until="domcontentloaded", timeout=30000)
+                except Exception as exc:
+                    callback_url = _extract_callback_url_from_exception(exc)
+                    if callback_url:
+                        self._log("Codex add_phone 前已获取到 callback URL")
+                        return callback_url
+                    raise
+                state = _handle_add_phone_challenge(
+                    page,
+                    self.phone_callback,
+                    device_id=did,
+                    user_agent=ua,
+                    log=self._log,
+                    resume_url="",
+                )
+                self._debug_log(f"Codex add_phone 完成: page={state.get('page_type') or '-'}")
+
+                callback_url = self._extract_codex_callback_from_state(state)
+                if callback_url:
+                    self._log("手机验证后获取到 Codex callback URL")
+                    return callback_url
+
+                self._sync_browser_cookies_to_session(page, login_session)
+                callback_url = self._continue_codex_oauth_in_browser_after_phone(
+                    page,
+                    login_session,
+                    codex_oauth,
+                    login_client,
+                )
+                if callback_url:
+                    self._log("手机验证完成，已续接 Codex OAuth")
+                    return callback_url
+                self._log("手机验证已完成，旧 OAuth 会话 3 秒内未返回 callback，准备重跑 Codex Auth...")
+            return None
+        except Exception as exc:
+            self._log(f"Codex add_phone 浏览器处理失败: {exc}", "error")
+            return None
+
+    def _cookies_dict_from_session(self, session) -> dict:
+        cookies: dict[str, str] = {}
+        try:
+            for c in session.cookies.jar:
+                name = str(getattr(c, "name", "") or "")
+                value = str(getattr(c, "value", "") or "")
+                if name and value:
+                    cookies[name] = value
+        except Exception:
+            try:
+                cookies.update(dict(session.cookies))
+            except Exception:
+                pass
+        return cookies
+
+    def _complete_codex_consent_with_session(self, login_session, codex_oauth, login_client=None, *, quiet: bool = False) -> Optional[str]:
+        """Complete Codex consent/workspace selection in the protocol session and return OAuth callback URL."""
+        try:
+            from platforms.chatgpt.browser_register import (
+                _decode_oauth_session_cookie,
+                _extract_workspace_from_consent_html,
+                _extract_flow_state,
+                _follow_redirects_for_code,
+                _normalize_url,
+            )
+            from .constants import OPENAI_AUTH
+            import urllib.parse
+
+            consent_url = f"{OPENAI_AUTH}/sign-in-with-chatgpt/codex/consent"
+            log = self._debug_log if quiet else self._log
+            cookies_dict = self._cookies_dict_from_session(login_session)
+            session_meta = _decode_oauth_session_cookie(cookies_dict)
+            workspaces = list(session_meta.get("workspaces") or [])
+            if not workspaces:
+                session_meta = _extract_workspace_from_consent_html(login_session, consent_url)
+                workspaces = list(session_meta.get("workspaces") or [])
+            if not workspaces:
+                log("Codex consent 缺少 workspace 信息", "warning")
+                return None
+
+            workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
+            if not workspace_id:
+                log("Codex consent workspace_id 为空", "warning")
+                return None
+            log(f"Codex consent 选择 workspace: {workspace_id}")
+
+            ua = ""
+            try:
+                ua = str((login_client.default_headers or {}).get("User-Agent") or "") if login_client else ""
+            except Exception:
+                ua = ""
+            headers = {
+                "accept": "application/json",
+                "referer": consent_url,
+                "origin": OPENAI_AUTH,
+                "content-type": "application/json",
+            }
+            if ua:
+                headers["user-agent"] = ua
+            ws_resp = login_session.post(
+                f"{OPENAI_AUTH}/api/accounts/workspace/select",
+                headers=headers,
+                data=json.dumps({"workspace_id": workspace_id}),
+                allow_redirects=False,
+                timeout=30,
+            )
+            log(f"Codex workspace/select: {ws_resp.status_code}")
+
+            next_url = str(ws_resp.headers.get("Location") or "").strip()
+            next_data = {}
+            if not next_url:
+                try:
+                    next_data = ws_resp.json() or {}
+                except Exception:
+                    next_data = {}
+                next_url = str(next_data.get("continue_url") or "").strip()
+            next_url = _normalize_url(next_url, consent_url)
+            if next_url and "code=" in next_url and "state=" in next_url:
+                log("Codex consent 直接得到 callback URL")
+                return next_url
+
+            orgs = list((((next_data.get("data") or {}).get("orgs")) or []))
+            if orgs and orgs[0].get("id"):
+                org_id = str(orgs[0].get("id") or "").strip()
+                org_body = {"org_id": org_id}
+                projects = list(orgs[0].get("projects") or [])
+                if projects and projects[0].get("id"):
+                    org_body["project_id"] = str(projects[0].get("id") or "").strip()
+                log(f"Codex consent 选择 organization: {org_id}")
+                org_resp = login_session.post(
+                    f"{OPENAI_AUTH}/api/accounts/organization/select",
+                    headers=headers,
+                    data=json.dumps(org_body),
+                    allow_redirects=False,
+                    timeout=30,
+                )
+                log(f"Codex organization/select: {org_resp.status_code}")
+                next_url = str(org_resp.headers.get("Location") or "").strip() or next_url
+                if not next_url:
+                    try:
+                        org_data = org_resp.json() or {}
+                        next_url = str(org_data.get("continue_url") or "").strip()
+                        if not next_url:
+                            org_state = _extract_flow_state(org_data, str(org_resp.url))
+                            next_url = org_state.get("continue_url") or org_state.get("current_url") or ""
+                    except Exception:
+                        next_url = ""
+                next_url = _normalize_url(next_url, consent_url)
+
+            if not next_url and next_data:
+                state = _extract_flow_state(next_data, str(ws_resp.url))
+                next_url = state.get("continue_url") or state.get("current_url") or ""
+                next_url = _normalize_url(next_url, consent_url)
+            if not next_url:
+                next_url = f"{OPENAI_AUTH}/api/oauth/oauth2/auth?" + codex_oauth.auth_url.split("?", 1)[1]
+            log(f"Codex consent continue: {next_url[:100]}...")
+            callback_url = _follow_redirects_for_code(login_session, next_url, log, max_redirects=12)
+            if callback_url:
+                log("Codex consent 获取到 callback URL")
+                return callback_url
+            log("Codex consent 未能跟到 callback URL", "warning")
+            return None
+        except Exception as exc:
+            (self._debug_log if quiet else self._log)(f"Codex consent 处理失败: {exc}", "error")
+            return None
+
     def _acquire_codex_callback(self) -> Optional[str]:
         """
         注册完成后，通过 Codex CLI OAuth 完整登录流程获取 callback URL。
         使用新 session，走 authorize → authorize/continue → OTP → callback 流程。
         """
         try:
+            self._last_codex_error = ""
             from .constants import (
                 CODEX_CLIENT_ID, CODEX_REDIRECT_URI, CODEX_SCOPE,
                 OPENAI_AUTH, OPENAI_API_ENDPOINTS,
@@ -839,7 +1400,11 @@ class RegistrationEngine:
 
             # 1. 创建新 HTTP client + session
             login_client = OpenAIHTTPClient(proxy_url=self.proxy_url)
-            login_session = login_client.session
+            login_session = _TLSFallbackSession(
+                login_client.session,
+                proxy_url=self.proxy_url,
+                log_fn=self._log,
+            )
 
             # 2. 生成 Codex CLI OAuth URL (Hydra)
             codex_oauth = generate_oauth_url(
@@ -852,7 +1417,7 @@ class RegistrationEngine:
             # 3. 访问 authorize URL 获取 device_id + session cookies
             response = login_session.get(codex_oauth.auth_url, timeout=15)
             did = login_session.cookies.get("oai-did")
-            self._log(f"Codex login device_id: {did}")
+            self._debug_log(f"Codex login device_id: {did}")
             if not did:
                 self._log("Codex login 获取 device_id 失败", "error")
                 return None
@@ -892,7 +1457,7 @@ class RegistrationEngine:
                         except Exception:
                             pass
                     sen_payload = SentinelPayload(p=sent_p, t=t_val, c=str(data.get("token") or ""), flow="authorize_continue")
-                    self._log("Codex login Sentinel 已获取")
+                    self._debug_log("Codex login Sentinel 已获取")
             except Exception as e:
                 self._log(f"Codex login Sentinel 失败: {e}", "warning")
 
@@ -910,16 +1475,27 @@ class RegistrationEngine:
                 }, separators=(",", ":"))
 
             resp = login_session.post(OPENAI_API_ENDPOINTS["signup"], headers=headers, data=signup_body)
-            self._log(f"Codex login authorize/continue: {resp.status_code}")
+            self._debug_log(f"Codex login authorize/continue: {resp.status_code}")
             if resp.status_code != 200:
                 self._log(f"Codex login authorize/continue 失败: {resp.text[:200]}", "error")
                 return None
 
             resp_data = resp.json()
             page_type = resp_data.get("page", {}).get("type", "")
-            self._log(f"Codex login page_type: {page_type}")
+            self._debug_log(f"Codex login page_type: {page_type}")
 
-            # 6. 如果需要 OTP，等待第二次验证码
+            # 6. 如果需要 OTP/手机号验证，继续完成挑战
+            if page_type == "add_phone":
+                self._log("Codex login 直接进入 add_phone，开始短信验证...")
+                callback = self._complete_add_phone_in_browser(login_session, codex_oauth, did, login_client)
+                if callback:
+                    return callback
+                if getattr(self.phone_callback, "completed", False) and not getattr(self, "_codex_retry_after_phone", False):
+                    self._codex_retry_after_phone = True
+                    self._log("手机验证已完成，旧 OAuth 会话未返回 callback，立即重跑 Codex Auth...")
+                    return self._acquire_codex_callback()
+                return None
+
             if page_type == "email_otp_verification":
                 self._log("等待第二次验证码...")
                 self._otp_sent_at = time.time()
@@ -939,17 +1515,24 @@ class RegistrationEngine:
                     },
                     data=code_body,
                 )
-                self._log(f"Codex login OTP 校验: {otp_resp.status_code}")
+                self._debug_log(f"Codex login OTP 校验: {otp_resp.status_code}")
                 if otp_resp.status_code != 200:
                     self._log(f"Codex login OTP 失败: {otp_resp.text[:200]}", "error")
                     return None
 
                 otp_data = otp_resp.json()
                 otp_page = otp_data.get("page", {}).get("type", "")
-                self._log(f"Codex login OTP -> page_type={otp_page}")
+                self._debug_log(f"Codex login OTP -> page_type={otp_page}")
 
                 if otp_page == "add_phone":
-                    self._log("Codex CLI 登录仍需 add_phone，无法跳过", "error")
+                    self._log("Codex CLI 登录进入 add_phone，开始短信验证...")
+                    callback = self._complete_add_phone_in_browser(login_session, codex_oauth, did, login_client)
+                    if callback:
+                        return callback
+                    if getattr(self.phone_callback, "completed", False) and not getattr(self, "_codex_retry_after_phone", False):
+                        self._codex_retry_after_phone = True
+                        self._log("手机验证已完成，旧 OAuth 会话未返回 callback，立即重跑 Codex Auth...")
+                        return self._acquire_codex_callback()
                     return None
 
             # 7. 需要密码登录
@@ -984,7 +1567,7 @@ class RegistrationEngine:
                             try: tv2 = gen2.decrypt_turnstile(tr2, sp2)
                             except: pass
                         pwd_sentinel = SentinelPayload(p=sp2, t=tv2, c=str(d2.get("token") or ""), flow="login_password")
-                        self._log("Codex login 密码 Sentinel 已获取")
+                        self._debug_log("Codex login 密码 Sentinel 已获取")
                 except Exception as e:
                     self._log(f"Codex login 密码 Sentinel 失败: {e}", "warning")
 
@@ -1004,14 +1587,14 @@ class RegistrationEngine:
 
                 pwd_body = json.dumps({"password": self.password, "username": self.email})
                 pwd_resp = login_session.post(OPENAI_API_ENDPOINTS["register"], headers=pwd_headers, data=pwd_body)
-                self._log(f"Codex login 密码提交: {pwd_resp.status_code}")
+                self._debug_log(f"Codex login 密码提交: {pwd_resp.status_code}")
                 if pwd_resp.status_code != 200:
                     self._log(f"Codex login 密码失败: {pwd_resp.text[:200]}", "error")
                     return None
 
                 pwd_data = pwd_resp.json()
                 pwd_page = pwd_data.get("page", {}).get("type", "")
-                self._log(f"Codex login 密码 -> page_type={pwd_page}")
+                self._debug_log(f"Codex login 密码 -> page_type={pwd_page}")
 
                 # 密码后可能需要 OTP
                 if pwd_page == "email_otp_verification" or pwd_page == "email_otp_send":
@@ -1031,19 +1614,34 @@ class RegistrationEngine:
                         headers={"referer": f"{OPENAI_AUTH}/email-verification", "accept": "application/json", "content-type": "application/json"},
                         data=code_body,
                     )
-                    self._log(f"Codex login OTP: {otp_resp.status_code}")
+                    self._debug_log(f"Codex login OTP: {otp_resp.status_code}")
                     if otp_resp.status_code != 200:
                         self._log(f"Codex login OTP 失败: {otp_resp.text[:200]}", "error")
                         return None
                     otp_data = otp_resp.json()
                     otp_page = otp_data.get("page", {}).get("type", "")
-                    self._log(f"Codex login OTP -> page_type={otp_page}")
+                    self._debug_log(f"Codex login OTP -> page_type={otp_page}")
                     if otp_page == "add_phone":
-                        self._log("Codex CLI 登录仍需 add_phone", "error")
+                        self._log("Codex CLI 登录进入 add_phone，开始短信验证...")
+                        callback = self._complete_add_phone_in_browser(login_session, codex_oauth, did, login_client)
+                        if callback:
+                            return callback
+                        if getattr(self.phone_callback, "completed", False) and not getattr(self, "_codex_retry_after_phone", False):
+                            self._codex_retry_after_phone = True
+                            self._log("手机验证已完成，旧 OAuth 会话未返回 callback，立即重跑 Codex Auth...")
+                            return self._acquire_codex_callback()
                         return None
 
-            # 8. 重新访问 authorize URL 获取回调
-            self._log("Codex login: 重新访问 OAuth URL 获取回调...")
+            # 8. 如果 OTP 后进入 Codex consent/workspace 页面，先完成 workspace/organization 选择。
+            current_page_type = locals().get("otp_page") or locals().get("pwd_page") or locals().get("page_type") or ""
+            if current_page_type == "sign_in_with_chatgpt_codex_consent":
+                self._log("Codex login 进入 consent，开始选择 workspace...")
+                callback = self._complete_codex_consent_with_session(login_session, codex_oauth, login_client)
+                if callback:
+                    return callback
+
+            # 9. 重新访问 authorize URL 获取回调
+            self._debug_log("Codex login: 重新访问 OAuth URL 获取回调...")
             response = login_session.get(codex_oauth.auth_url, allow_redirects=False, timeout=15)
             max_redirects = 10
             current_url = codex_oauth.auth_url
@@ -1054,7 +1652,7 @@ class RegistrationEngine:
                 if not location:
                     break
                 next_url = urllib.parse.urljoin(current_url, location)
-                self._log(f"Codex login 重定向 {i+1}: {next_url[:80]}...")
+                self._debug_log(f"Codex login 重定向 {i+1}: {next_url[:80]}...")
                 if "code=" in next_url and "state=" in next_url:
                     self._log("找到 Codex CLI 回调 URL")
                     return next_url
@@ -1065,6 +1663,7 @@ class RegistrationEngine:
             return None
 
         except Exception as e:
+            self._last_codex_error = str(e)
             self._log(f"Codex CLI 登录流程失败: {e}", "error")
             return None
 
@@ -1209,6 +1808,96 @@ class RegistrationEngine:
             self._log(f"处理 OAuth 回调失败: {e}", "error")
             return None
 
+    def login_existing_via_codex_auth(self, *, email: str = "", password: str = "") -> RegistrationResult:
+        """已注册账号入口：只走 Codex OAuth 登录，不走 create-account 注册链路。"""
+        result = RegistrationResult(success=False, logs=self.logs)
+        try:
+            self._log("=" * 60)
+            self._log("开始已注册账号 Codex Auth 登录流程")
+            self._log("=" * 60)
+
+            ok, preflight = self._preflight_codex_auth_network()
+            if not ok:
+                result.error_message = f"Codex Auth 网络自测失败，未占用邮箱: {preflight}"
+                self._log(result.error_message, "error")
+                return result
+            self._debug_log(f"Codex Auth 网络自测通过: {preflight}")
+
+            # 1. 获取/绑定邮箱账号。邮箱池在 create_email() 里完成占用和元数据绑定。
+            if email:
+                self.email = email
+            self.password = password or self.password or ""
+            if not self.email_info:
+                self._log("1. 获取邮箱池账号...")
+                if not self._create_email():
+                    result.error_message = "获取邮箱账号失败"
+                    return result
+            elif not self.email and self.email_info.get("email"):
+                self.email = self.email_info.get("email")
+
+            result.email = self.email or email
+            self._is_existing_account = True
+
+            # 2. 直接走 Codex CLI OAuth。该流程会根据 OpenAI 返回的 page_type 决定是否取邮箱 OTP。
+            self._log("2. 走 Codex Auth 获取 OAuth callback...")
+            callback_url = self._acquire_codex_callback()
+            if not callback_url:
+                if self._last_codex_error:
+                    result.error_message = f"Codex Auth 未获取到 callback URL: {self._last_codex_error}"
+                else:
+                    result.error_message = "Codex Auth 未获取到 callback URL"
+                return result
+
+            self._log("3. 交换 Codex OAuth token...")
+            from .constants import CODEX_CLIENT_ID, CODEX_REDIRECT_URI
+            token_json = submit_callback_url(
+                callback_url=callback_url,
+                expected_state=self._codex_oauth.state,
+                code_verifier=self._codex_oauth.code_verifier,
+                redirect_uri=CODEX_REDIRECT_URI,
+                client_id=CODEX_CLIENT_ID,
+                proxy_url=self.proxy_url,
+            )
+            token_info = json.loads(token_json)
+
+            access_token = str(token_info.get("access_token") or "")
+            refresh_token = str(token_info.get("refresh_token") or token_info.get("rt") or "")
+            if not access_token:
+                result.error_message = "Codex Auth token 响应缺少 access_token"
+                return result
+            if not refresh_token:
+                result.error_message = "Codex Auth token 响应缺少 refresh_token(rt)，不计入成功"
+                self._log(result.error_message, "error")
+                return result
+
+            result.success = True
+            result.email = str(token_info.get("email") or result.email or self.email or email)
+            result.password = self.password or password or ""
+            result.account_id = str(token_info.get("account_id") or "")
+            result.access_token = access_token
+            result.refresh_token = refresh_token
+            result.id_token = str(token_info.get("id_token") or "")
+            result.source = "login"
+            result.metadata = {
+                "email_service": self.email_service.service_type.value,
+                "proxy_used": self.proxy_url,
+                "registered_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "is_existing_account": True,
+                "auth_flow": "codex_auth",
+            }
+
+            self._log("=" * 60)
+            self._log("Codex Auth 登录成功! (已注册账号)")
+            self._log(f"邮箱: {result.email}")
+            self._log(f"Account ID: {result.account_id}")
+            self._log("=" * 60)
+            return result
+
+        except Exception as e:
+            self._log(f"Codex Auth 登录过程中发生错误: {e}", "error")
+            result.error_message = str(e)
+            return result
+
     def run(self) -> RegistrationResult:
         """
         执行完整的注册流程
@@ -1237,6 +1926,13 @@ class RegistrationEngine:
                 return result
 
             self._log(f"IP 位置: {location}")
+
+            ok, preflight = self._preflight_codex_auth_network()
+            if not ok:
+                result.error_message = f"OpenAI Auth 网络自测失败，未占用邮箱: {preflight}"
+                self._log(result.error_message, "error")
+                return result
+            self._debug_log(f"OpenAI Auth 网络自测通过: {preflight}")
 
             # 2. 创建邮箱
             self._log("2. 创建邮箱...")
@@ -1388,7 +2084,11 @@ class RegistrationEngine:
 
                 # 用全新 session（Hydra 需要干净 session）
                 login_client = OpenAIHTTPClient(proxy_url=self.proxy_url)
-                login_session = login_client.session
+                login_session = _TLSFallbackSession(
+                    login_client.session,
+                    proxy_url=self.proxy_url,
+                    log_fn=self._log,
+                )
 
                 # 访问 Codex OAuth URL，跟随重定向到 /log-in
                 login_session.get(codex_oauth.auth_url, timeout=15)
@@ -1521,20 +2221,22 @@ class RegistrationEngine:
             except Exception as e:
                 self._log(f"Codex CLI 登录失败: {e}", "warning")
 
-            # 提取账户信息（优先 Codex token，fallback 到 NextAuth session）
+            # 提取账户信息：必须使用 Codex CLI token，且必须带 refresh_token(rt)。
             if codex_token_info and codex_token_info.get("access_token"):
                 self._log("使用 Codex CLI token（完整 refresh_token + id_token）")
                 result.account_id = codex_token_info.get("account_id", "") or account_cookie or ""
                 result.access_token = codex_token_info.get("access_token", "")
-                result.refresh_token = codex_token_info.get("refresh_token", "")
+                result.refresh_token = codex_token_info.get("refresh_token", "") or codex_token_info.get("rt", "")
                 result.id_token = codex_token_info.get("id_token", "")
             else:
-                self._log("使用 NextAuth session token", "warning")
-                result.account_id = account_cookie or ""
-                result.access_token = access_token
-                result.refresh_token = ""
-                # access_token JWT 包含 chatgpt_account_id 等同于 id_token 的 claims
-                result.id_token = access_token
+                result.error_message = "未获取到 Codex CLI token/refresh_token(rt)，不计入成功"
+                self._log(result.error_message, "error")
+                return result
+
+            if not result.refresh_token:
+                result.error_message = "Codex CLI token 缺少 refresh_token(rt)，不计入成功"
+                self._log(result.error_message, "error")
+                return result
 
             result.password = self.password or ""
             result.source = "login" if self._is_existing_account else "register"

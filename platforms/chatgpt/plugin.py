@@ -14,13 +14,13 @@ def _result_text(result, key: str) -> str:
 
 
 def _assert_complete_oauth_callback(result) -> None:
-    # NextAuth 流程只返回 account_id + access_token (+ session_token)
-    # 传统 Codex CLI 流程返回全部 4 个字段
-    required = ("account_id", "access_token")
+    # 只有拿到 Codex CLI OAuth 的 refresh_token(rt) 才算完整成功；
+    # NextAuth session/access_token 不能计入成功。
+    required = ("account_id", "access_token", "refresh_token")
     missing = [key for key in required if not _result_text(result, key)]
     if missing:
         raise RuntimeError(
-            "ChatGPT 注册未完成完整 OAuth callback，缺少: " + ", ".join(missing)
+            "ChatGPT/Codex OAuth 未完成或缺少 rt，不计入成功，缺少: " + ", ".join(missing)
         )
 
 
@@ -71,16 +71,36 @@ class ChatGPTPlatform(BasePlatform):
 
     def check_valid(self, account: Account) -> bool:
         self._last_check_overview = {}
+        self._last_check_credentials = {}
         try:
             from platforms.chatgpt.payment import fetch_subscription_status_details
             from core.proxy_pool import proxy_pool
             class _A: pass
             a = _A()
+            a.email = account.email
             extra = account.extra or {}
             a.access_token = extra.get("access_token") or account.token
+            a.refresh_token = extra.get("refresh_token", "")
+            a.session_token = extra.get("session_token", "")
             a.id_token = extra.get("id_token", "")
             a.cookies = extra.get("cookies", "")
             a.extra = extra
+            from .constants import CODEX_CLIENT_ID
+            a.client_id = extra.get("client_id", CODEX_CLIENT_ID)
+
+            if a.refresh_token or a.session_token:
+                try:
+                    from platforms.chatgpt.token_refresh import TokenRefreshManager
+
+                    refreshed = TokenRefreshManager(proxy_url=self.config.proxy if self.config else None).refresh_account(a)
+                    if refreshed.success and refreshed.access_token:
+                        a.access_token = refreshed.access_token
+                        self._last_check_credentials["access_token"] = refreshed.access_token
+                        if refreshed.refresh_token:
+                            a.refresh_token = refreshed.refresh_token
+                            self._last_check_credentials["refresh_token"] = refreshed.refresh_token
+                except Exception:
+                    pass
 
             region = str(getattr(account, "region", "") or extra.get("region", "") or "").strip()
             configured_proxy = self.config.proxy if self.config else None
@@ -118,6 +138,9 @@ class ChatGPTPlatform(BasePlatform):
 
     def get_last_check_overview(self) -> dict:
         return dict(getattr(self, "_last_check_overview", {}) or {})
+
+    def get_last_check_credentials(self) -> dict:
+        return dict(getattr(self, "_last_check_credentials", {}) or {})
 
     def _prepare_registration_password(self, password: str | None) -> str | None:
         if password:
@@ -185,13 +208,18 @@ class ChatGPTPlatform(BasePlatform):
     def build_protocol_mailbox_adapter(self):
         def _build_worker(ctx, artifacts):
             from platforms.chatgpt.protocol_mailbox import ChatGPTProtocolMailboxWorker
+            from core.registration.helpers import build_phone_callbacks
 
+            phone_callback, phone_cleanup = build_phone_callbacks(ctx, service=ctx.platform_name)
             return ChatGPTProtocolMailboxWorker(
                 mailbox=self.mailbox,
                 mailbox_account=ctx.identity.mailbox_account,
                 provider=(self.config.extra or {}).get("mail_provider", ""),
                 proxy_url=ctx.proxy,
                 log_fn=ctx.log,
+                before_ids=getattr(ctx.identity, "before_ids", set()),
+                phone_callback=phone_callback,
+                phone_cleanup=phone_cleanup,
             )
 
         def _map_result(ctx, result):
@@ -226,10 +254,10 @@ class ChatGPTPlatform(BasePlatform):
 
     def get_platform_actions(self) -> list:
         return [
-            {"id": "switch_account", "label": "切换到 Codex 桌面端", "params": []},
-            {"id": "get_account_state", "label": "查询账号状态/订阅", "params": []},
+            {"id": "switch_desktop", "label": "切换到 Codex 桌面端", "params": []},
+            {"id": "query_state", "label": "查询账号状态/额度", "params": []},
             {"id": "refresh_token", "label": "刷新 Token", "params": []},
-            {"id": "payment_link", "label": "生成支付链接",
+            {"id": "generate_link", "label": "生成支付链接",
              "params": [
                  {"key": "country", "label": "地区", "type": "select",
                   "options": ["US","SG","TR","HK","JP","GB","AU","CA"]},
@@ -253,8 +281,21 @@ class ChatGPTPlatform(BasePlatform):
 
         return get_codex_desktop_state()
 
+    def execute_action(self, action_id: str, account: Account, params: dict) -> dict:
+        aliases = {
+            "switch_account": "switch_desktop",
+            "get_account_state": "query_state",
+            "payment_link": "generate_link",
+        }
+        return super().execute_action(aliases.get(action_id, action_id), account, params)
+
     def _execute_platform_action(self, action_id: str, account: Account, params: dict) -> dict:
         """Handle ChatGPT-specific actions."""
+        if action_id in {"get_account_state", "query_state"}:
+            return self._handle_query_state(account, params)
+        if action_id in {"payment_link", "generate_link"}:
+            return self._handle_generate_link(account, params)
+
         proxy = self.config.proxy if self.config else None
         extra = account.extra or {}
 
@@ -265,13 +306,13 @@ class ChatGPTPlatform(BasePlatform):
         a.refresh_token = extra.get("refresh_token", "")
         a.id_token = extra.get("id_token", "")
         a.session_token = extra.get("session_token", "")
-        from .constants import OAUTH_CLIENT_ID
-        a.client_id = extra.get("client_id", OAUTH_CLIENT_ID)
+        from .constants import CODEX_CLIENT_ID
+        a.client_id = extra.get("client_id", CODEX_CLIENT_ID)
         a.cookies = extra.get("cookies", "")
         a.user_id = account.user_id or ""
         a.account_id = account.user_id or ""
 
-        if action_id == "switch_desktop":
+        if action_id in {"switch_desktop", "switch_account"}:
             from platforms.chatgpt.switch import (
                 close_codex_app,
                 extract_session_token,
@@ -324,13 +365,13 @@ class ChatGPTPlatform(BasePlatform):
             token_data = generate_token_json(a)
             ok, msg = upload_to_cpa(token_data, api_url=params.get("api_url"),
                                     api_key=params.get("api_key"))
-            return {"ok": ok, "data": msg}
+            return {"ok": ok, "data": {"message": msg}, "error": "" if ok else msg}
 
         if action_id == "upload_tm":
             from platforms.chatgpt.cpa_upload import upload_to_team_manager
             ok, msg = upload_to_team_manager(a, api_url=params.get("api_url"),
                                              api_key=params.get("api_key"))
-            return {"ok": ok, "data": msg}
+            return {"ok": ok, "data": {"message": msg}, "error": "" if ok else msg}
 
         raise NotImplementedError(f"Unknown action: {action_id}")
 
@@ -365,10 +406,13 @@ class ChatGPTPlatform(BasePlatform):
 
         class _A: pass
         a = _A()
+        a.email = account.email
         a.access_token = extra.get("access_token") or account.token
         a.refresh_token = extra.get("refresh_token", "")
         a.session_token = extra.get("session_token", "")
         a.cookies = extra.get("cookies", "")
+        from .constants import CODEX_CLIENT_ID
+        a.client_id = extra.get("client_id", CODEX_CLIENT_ID)
 
         from platforms.chatgpt.token_refresh import TokenRefreshManager
         manager = TokenRefreshManager(proxy_url=proxy)
@@ -387,6 +431,14 @@ class ChatGPTPlatform(BasePlatform):
                 pass
             return {"ok": True, "data": data}
         return {"ok": False, "error": result.error_message}
+
+    def _handle_upload_cpa(self, account: Account, params: dict) -> dict:
+        """Handle upload_cpa capability for ChatGPT."""
+        return self._execute_platform_action("upload_cpa", account, params)
+
+    def _handle_upload_tm(self, account: Account, params: dict) -> dict:
+        """Handle upload_tm capability for ChatGPT."""
+        return self._execute_platform_action("upload_tm", account, params)
 
     def _handle_generate_link(self, account: Account, params: dict) -> dict:
         """Handle generate_link capability for ChatGPT."""

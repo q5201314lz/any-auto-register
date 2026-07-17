@@ -229,17 +229,25 @@ def _create_testmail(extra: dict, proxy: str | None) -> 'BaseMailbox':
     )
 
 
-def _create_local_ms_pool(extra: dict, proxy: str | None) -> 'BaseMailbox':
-    from core.local_ms_mailbox import LocalMicrosoftMailboxPool
+def _create_local_mail_pool(extra: dict, proxy: str | None) -> 'BaseMailbox':
+    from core.local_ms_mailbox import LocalMailboxPool
 
-    return LocalMicrosoftMailboxPool(
-        pool_text=extra.get("local_ms_pool_text", ""),
-        pool_file=extra.get("local_ms_pool_file", ""),
-        state_file=extra.get("local_ms_pool_state_file", ""),
+    return LocalMailboxPool(
+        pool_text=extra.get("local_mail_pool_text") or extra.get("local_ms_pool_text", ""),
+        pool_file=extra.get("local_mail_pool_file") or extra.get("local_ms_pool_file", ""),
+        state_file=extra.get("local_mail_pool_state_file") or extra.get("local_ms_pool_state_file", ""),
         graph_scope=extra.get("local_ms_graph_scope", ""),
-        allow_reuse=str(extra.get("local_ms_pool_allow_reuse", "")).strip().lower() in {"1", "true", "yes", "on"},
+        allow_reuse=str(
+            extra.get("local_mail_pool_allow_reuse")
+            if "local_mail_pool_allow_reuse" in extra
+            else extra.get("local_ms_pool_allow_reuse", "")
+        ).strip().lower() in {"1", "true", "yes", "on"},
         proxy=proxy,
     )
+
+
+def _create_local_ms_pool(extra: dict, proxy: str | None) -> 'BaseMailbox':
+    return _create_local_mail_pool(extra, proxy)
 
 
 def _create_laoudo(extra: dict, proxy: str | None) -> 'BaseMailbox':
@@ -270,6 +278,7 @@ MAILBOX_FACTORY_REGISTRY = {
     "moemail_api": _create_moemail,
     "cfworker_admin_api": _create_cfworker,
     "testmail_api": _create_testmail,
+    "local_mail_pool": _create_local_mail_pool,
     "local_ms_pool": _create_local_ms_pool,
     "laoudo_api": _create_laoudo,
     # backward-compat fallback
@@ -281,6 +290,7 @@ MAILBOX_FACTORY_REGISTRY = {
     "moemail": _create_moemail,
     "cfworker": _create_cfworker,
     "testmail": _create_testmail,
+    "local_mail": _create_local_mail_pool,
     "local_ms": _create_local_ms_pool,
     "laoudo": _create_laoudo,
 }

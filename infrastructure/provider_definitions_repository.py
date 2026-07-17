@@ -180,8 +180,8 @@ _BUILTIN_DEFINITIONS: list[dict] = [
     {
         "provider_type": "mailbox",
         "provider_key": "local_ms_pool",
-        "label": "本地微软邮箱池",
-        "description": "导入心蓝邮箱助手通用格式账号池，优先使用 Client Id + 刷新令牌通过 Microsoft Graph 收验证码",
+        "label": "本地邮箱池",
+        "description": "导入本地账号池：微软邮箱保持原心蓝/OAuth/IMAP 逻辑，iCloud 支持 邮箱----接码地址 格式",
         "driver_type": "local_ms_pool",
         "default_auth_mode": "pool",
         "enabled": True,
@@ -191,16 +191,16 @@ _BUILTIN_DEFINITIONS: list[dict] = [
             {
                 "key": "local_ms_pool_file",
                 "label": "账号池文件路径",
-                "placeholder": "/Users/you/ms-mail-pool.txt",
+                "placeholder": "/Users/you/mail-pool.txt",
                 "category": "connection",
-                "hint": "可选；每行一条心蓝邮箱助手通用格式。配置文件路径后无需把账号明文粘贴到设置页。",
+                "hint": "可选；每行一条账号。微软支持心蓝邮箱助手通用格式；iCloud 支持 email@icloud.com----https://.../email@icloud.com。",
             },
             {
                 "key": "local_ms_pool_text",
                 "label": "账号池文本",
                 "type": "textarea",
                 "category": "auth",
-                "hint": "可选；直接粘贴心蓝邮箱助手通用格式。支持逗号、中文逗号、TAB、---- 分隔。",
+                "hint": "可选；直接粘贴账号池。微软支持逗号、中文逗号、TAB、---- 分隔的心蓝格式；iCloud 每行格式：邮箱----接码地址。",
             },
             {
                 "key": "local_ms_graph_scope",
@@ -211,7 +211,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
             {
                 "key": "local_ms_pool_state_file",
                 "label": "占用状态文件",
-                "placeholder": "默认 data/.local_ms_mailbox_pool_state.json",
+                "placeholder": "默认 data/.local_mailbox_pool_state.json",
                 "category": "connection",
                 "hint": "用于避免同一个邮箱被重复分配；清空该文件可重置账号池占用状态。",
             },

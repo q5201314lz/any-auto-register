@@ -29,6 +29,9 @@ class TaskSummary:
     finished_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     result: dict[str, Any] = field(default_factory=dict)
+    payload: dict[str, Any] = field(default_factory=dict)
+    terminal: bool = False
+    cancellable: bool = False
 
 
 @dataclass(slots=True)

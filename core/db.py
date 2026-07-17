@@ -304,6 +304,12 @@ def save_account(account) -> 'AccountModel':
     """从 base_platform.Account 存入数据库（同平台同邮箱则更新）"""
     from core.account_graph import sync_platform_account_graph
 
+    if str(getattr(account, "platform", "") or "").lower() == "chatgpt":
+        extra = dict(getattr(account, "extra", {}) or {})
+        refresh_token = str(extra.get("refresh_token") or extra.get("rt") or "").strip()
+        if not refresh_token:
+            raise RuntimeError("ChatGPT/Codex 未获取到 refresh_token(rt)，禁止保存账号")
+
     with Session(engine) as session:
         existing = session.exec(
             select(AccountModel)
