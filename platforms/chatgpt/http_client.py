@@ -34,6 +34,9 @@ class OpenAIHTTPClient(HTTPClient):
         if config is None:
             self.config.timeout = 30
             self.config.max_retries = 3
+            # chrome136 is challenged by Cloudflare on some TUN/proxy exits.
+            # chrome131 reaches the same OAuth endpoint and receives oai-did.
+            self.config.impersonate = "chrome131"
 
         # 默认请求头
         self.default_headers = {

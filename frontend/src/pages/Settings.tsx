@@ -295,6 +295,13 @@ const TABS: { id: string; label: string; icon: any; sections?: any[] }[] = [
         { key: 'any2api_url', label: 'API URL', placeholder: 'https://your-any2api.example.com' },
         { key: 'any2api_password', label: 'Password', secret: true },
       ],
+    }, {
+      section: 'Sub2API',
+      desc: 'ChatGPT 注册完成后自动上传到 Sub2API',
+      items: [
+        { key: 'sub2api_url', label: 'API URL', placeholder: 'https://your-sub2api.example.com' },
+        { key: 'sub2api_api_key', label: 'Admin API Key', secret: true },
+      ],
     }],
   },
 ]

@@ -196,7 +196,8 @@ function RegisterModal({
   })
   const [configLoading, setConfigLoading] = useState(true)
   const [regCount, setRegCount] = useState(1)
-  const [concurrency, setConcurrency] = useState(1)
+  const [concurrency, setConcurrency] = useState(5)
+  const [runAllMailboxes, setRunAllMailboxes] = useState(true)
   const [selection, setSelection] = useState({
     identityProvider: '',
     oauthProvider: '',
@@ -316,6 +317,7 @@ function RegisterModal({
   const defaultMailboxProvider = (configOptions.mailbox_settings || []).find(item => item.is_default) || configOptions.mailbox_settings?.[0] || null
 
   const start = async () => {
+    const shouldRunAllMailboxes = selection.identityProvider === 'mailbox' && runAllMailboxes
     setStarting(true)
     try {
       const cfg = config || {}
@@ -335,7 +337,10 @@ function RegisterModal({
       const res = await apiFetch('/tasks/register', {
         method: 'POST',
         body: JSON.stringify({
-          platform, count: regCount, concurrency,
+          platform,
+          count: shouldRunAllMailboxes ? 1 : regCount,
+          concurrency: shouldRunAllMailboxes ? 5 : concurrency,
+          run_all_mailboxes: shouldRunAllMailboxes,
           executor_type: selection.executorType,
           captcha_solver: 'auto',
           proxy: null,
@@ -430,18 +435,35 @@ function RegisterModal({
                   </div>
                 </div>
 
+                {selection.identityProvider === 'mailbox' && (
+                  <label className="flex items-center gap-3 text-sm text-[var(--text-primary)]">
+                    <input
+                      type="checkbox"
+                      checked={runAllMailboxes}
+                      onChange={event => {
+                        setRunAllMailboxes(event.target.checked)
+                        if (event.target.checked) setConcurrency(5)
+                      }}
+                      className="h-4 w-4 accent-[var(--accent)]"
+                    />
+                    跑完所有邮箱
+                  </label>
+                )}
+
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="text-xs text-[var(--text-muted)] block mb-1">注册数量</label>
                     <input type="number" min={1} max={99} value={regCount}
                       onChange={e => setRegCount(Number(e.target.value))}
-                      className="control-surface control-surface-compact text-center" />
+                      disabled={selection.identityProvider === 'mailbox' && runAllMailboxes}
+                      className="control-surface control-surface-compact text-center disabled:cursor-not-allowed disabled:opacity-55" />
                   </div>
                   <div>
                     <label className="text-xs text-[var(--text-muted)] block mb-1">并发数</label>
                     <input type="number" min={1} max={5} value={concurrency}
                       onChange={e => setConcurrency(Number(e.target.value))}
-                      className="control-surface control-surface-compact text-center" />
+                      disabled={selection.identityProvider === 'mailbox' && runAllMailboxes}
+                      className="control-surface control-surface-compact text-center disabled:cursor-not-allowed disabled:opacity-55" />
                   </div>
                 </div>
 

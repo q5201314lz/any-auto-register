@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 import threading
-import time
 
-from application.tasks import claim_next_runnable_task, execute_task, mark_incomplete_tasks_interrupted
+from application.tasks import (
+    claim_next_runnable_task,
+    execute_task,
+    mark_incomplete_tasks_interrupted,
+    reconcile_local_mailbox_reservations,
+)
 
 
 @dataclass(slots=True)
@@ -16,7 +21,7 @@ class TaskWorkerState:
 
 
 class TaskRuntime:
-    def __init__(self, *, max_parallel_tasks: int = 3, max_parallel_per_platform: int = 1, poll_interval: float = 0.5):
+    def __init__(self, *, max_parallel_tasks: int = 16, max_parallel_per_platform: int = 16, poll_interval: float = 0.5):
         self.max_parallel_tasks = max_parallel_tasks
         self.max_parallel_per_platform = max_parallel_per_platform
         self.poll_interval = poll_interval
@@ -24,28 +29,37 @@ class TaskRuntime:
         self._dispatcher: threading.Thread | None = None
         self._workers: dict[str, TaskWorkerState] = {}
         self._lock = threading.Lock()
+        self._wake_event = threading.Event()
 
     def start(self) -> None:
         with self._lock:
             if self._running:
                 return
             self._running = True
+            self._wake_event.clear()
             mark_incomplete_tasks_interrupted()
+            released_mailboxes = reconcile_local_mailbox_reservations()
+            if released_mailboxes:
+                print(f"[TaskRuntime] 已恢复 {len(released_mailboxes)} 个未完成邮箱占用")
             self._dispatcher = threading.Thread(target=self._loop, daemon=True, name="task-runtime")
             self._dispatcher.start()
-            print("[TaskRuntime] 已启动")
+            print(
+                "[TaskRuntime] 已启动: "
+                f"全局并发={self.max_parallel_tasks}, 单平台并发={self.max_parallel_per_platform}"
+            )
 
     def stop(self) -> None:
         with self._lock:
             self._running = False
+        self._wake_event.set()
         print("[TaskRuntime] 停止中")
 
     def wake_up(self) -> None:
-        # Polling loop wakes quickly already; this method exists as an explicit runtime hook.
-        return
+        self._wake_event.set()
 
     def _loop(self) -> None:
         while self._running:
+            self._wake_event.clear()
             self._reap_workers()
             with self._lock:
                 available_slots = self.max_parallel_tasks - len(self._workers)
@@ -81,7 +95,7 @@ class TaskRuntime:
                     busy_account_keys.update(set(task_info.get("account_keys") or []))
                 worker.start()
                 available_slots -= 1
-            time.sleep(self.poll_interval)
+            self._wake_event.wait(self.poll_interval)
         self._reap_workers()
 
     def _run_task(self, task_id: str) -> None:
@@ -90,6 +104,7 @@ class TaskRuntime:
         finally:
             with self._lock:
                 self._workers.pop(task_id, None)
+            self._wake_event.set()
 
     def _reap_workers(self) -> None:
         with self._lock:
@@ -98,4 +113,14 @@ class TaskRuntime:
                 self._workers.pop(task_id, None)
 
 
-task_runtime = TaskRuntime()
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+task_runtime = TaskRuntime(
+    max_parallel_tasks=_positive_int_env("ACCOUNT_MANAGER_MAX_PARALLEL_TASKS", 16),
+    max_parallel_per_platform=_positive_int_env("ACCOUNT_MANAGER_MAX_PARALLEL_PER_PLATFORM", 16),
+)

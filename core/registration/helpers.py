@@ -144,6 +144,7 @@ def build_phone_callbacks(ctx: RegistrationContext, *, service: str | None = Non
         service=sms_service,
         country=country,
         log_fn=ctx.log,
+        cancel_check=merged.get("_cancel_check") if callable(merged.get("_cancel_check")) else None,
     )
 
 

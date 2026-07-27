@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from platforms.chatgpt.plugin import (
     _assert_complete_oauth_callback,
     _generate_chatgpt_registration_password,
 )
+from platforms.chatgpt.register import RegistrationEngine
 
 
 def test_assert_complete_oauth_callback_accepts_complete_payload():
@@ -23,7 +25,7 @@ def test_assert_complete_oauth_callback_accepts_complete_payload():
 
 
 def test_assert_complete_oauth_callback_rejects_partial_payload():
-    with pytest.raises(RuntimeError, match="完整 OAuth callback"):
+    with pytest.raises(RuntimeError, match=r"OAuth .*refresh_token"):
         _assert_complete_oauth_callback({
             "account_id": "acct_123",
             "access_token": "at_123",
@@ -47,6 +49,197 @@ def test_chatgpt_platform_preserves_user_supplied_password():
     assert platform._prepare_registration_password("Secret123!") == "Secret123!"
 
 
+def test_codex_oauth_login_password_forces_email_otp(monkeypatch):
+    oauth_start = SimpleNamespace(
+        auth_url="https://auth.openai.com/log-in/password",
+        state="state_123",
+        code_verifier="verifier_123",
+        redirect_uri="http://localhost:1455/auth/callback",
+        client_id="client_123",
+    )
+
+    class FakePage:
+        url = "about:blank"
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+        def evaluate(self, script):
+            return "Test User Agent"
+
+    page = FakePage()
+    events = []
+
+    monkeypatch.setattr("platforms.chatgpt.oauth.generate_oauth_url", lambda **kwargs: oauth_start)
+    monkeypatch.setattr(browser_register_module, "_get_page_oauth_url", lambda page: "")
+
+    def switch_to_otp(page, log):
+        events.append("switch_to_otp")
+        page.url = "https://auth.openai.com/email-verification"
+        return True
+
+    def submit_otp(page, code, log):
+        events.append(("submit_otp", code))
+        page.url = "http://localhost:1455/auth/callback?code=code_123&state=state_123"
+        return {"ok": True, "status": 200, "text": ""}
+
+    monkeypatch.setattr(browser_register_module, "_switch_login_password_to_otp", switch_to_otp)
+    monkeypatch.setattr(browser_register_module, "_submit_otp_via_page", submit_otp)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_submit_oauth_password_direct",
+        lambda *args, **kwargs: pytest.fail("login password must not be submitted"),
+    )
+    monkeypatch.setattr(
+        browser_register_module,
+        "_submit_callback_result",
+        lambda callback_url, oauth_start, proxy: {"callback_url": callback_url},
+    )
+
+    result = browser_register_module._do_codex_oauth(
+        page,
+        {},
+        "user@example.com",
+        "Secret123!",
+        lambda: "123456",
+        None,
+        None,
+        lambda message: None,
+    )
+
+    assert events == ["switch_to_otp", ("submit_otp", "123456")]
+    assert result["callback_url"].startswith("http://localhost:1455/auth/callback?")
+
+
+def test_protocol_codex_password_challenge_sends_and_validates_email_otp():
+    engine = object.__new__(RegistrationEngine)
+    engine._otp_sent_at = None
+    engine._debug_log = lambda message: None
+    engine._log = lambda message, level="info": None
+    engine._get_verification_code = lambda: "654321"
+
+    class Response:
+        def __init__(self, status_code, data=None, text=""):
+            self.status_code = status_code
+            self._data = data or {}
+            self.text = text
+            self.headers = {"content-type": "application/json"}
+
+        def json(self):
+            return self._data
+
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append(("GET", url, kwargs))
+            return Response(200)
+
+        def post(self, url, **kwargs):
+            self.calls.append(("POST", url, kwargs))
+            return Response(200, {"page": {"type": "add_phone"}})
+
+    session = Session()
+    page_type = engine._complete_codex_email_otp(
+        session,
+        send_code=True,
+        referer="https://auth.openai.com/log-in/password",
+    )
+
+    assert page_type == "add_phone"
+    assert engine._otp_sent_at is not None
+    assert [call[0] for call in session.calls] == ["GET", "POST"]
+    assert session.calls[0][1].endswith("/api/accounts/email-otp/send")
+    assert json.loads(session.calls[1][2]["data"]) == {"code": "654321"}
+
+
+def test_protocol_otp_send_rejects_redirect_false_positive():
+    engine = object.__new__(RegistrationEngine)
+    engine._otp_sent_at = None
+    engine._debug_log = lambda message: None
+    logs = []
+    engine._log = lambda message, level="info": logs.append((level, message))
+    engine._get_verification_code = lambda: pytest.fail("must not wait after redirect")
+
+    response = SimpleNamespace(
+        status_code=302,
+        text="",
+        headers={"location": "/log-in/password", "content-type": "text/html"},
+    )
+    session = SimpleNamespace(get=lambda *args, **kwargs: response)
+
+    assert engine._complete_codex_email_otp(
+        session,
+        send_code=True,
+        referer="https://auth.openai.com/log-in/password",
+    ) is None
+    assert any("发送失败" in message for _, message in logs)
+
+
+def test_protocol_password_challenge_uses_browser_passwordless_action(monkeypatch):
+    engine = object.__new__(RegistrationEngine)
+    engine.email = "user@example.com"
+    engine.password = "Secret123!"
+    engine.proxy_url = "http://127.0.0.1:18080"
+    engine.phone_callback = None
+    engine._otp_sent_at = None
+    engine._last_codex_error = ""
+    engine._log = lambda message, level="info": None
+    engine._get_verification_code = lambda: "654321"
+    captured = {}
+
+    def retry(self, email, password):
+        captured.update(email=email, password=password, proxy=self.proxy)
+        assert self.otp_callback() == "654321"
+        return {"access_token": "at", "refresh_token": "rt"}
+
+    monkeypatch.setattr(browser_register_module.ChatGPTBrowserRegister, "_retry_oauth_fresh_browser", retry)
+
+    token_info = engine._complete_codex_login_password_in_browser()
+
+    assert token_info == {"access_token": "at", "refresh_token": "rt"}
+    assert captured == {
+        "email": "user@example.com",
+        "password": "Secret123!",
+        "proxy": "http://127.0.0.1:18080",
+    }
+    assert engine._otp_sent_at is not None
+
+
+def test_existing_login_accepts_browser_oauth_token_without_callback_exchange(monkeypatch):
+    engine = object.__new__(RegistrationEngine)
+    engine.logs = []
+    engine.email = "user@example.com"
+    engine.password = "Secret123!"
+    engine.email_info = {"email": "user@example.com"}
+    engine.email_service = SimpleNamespace(service_type=SimpleNamespace(value="local_ms_pool"))
+    engine.proxy_url = None
+    engine._last_codex_error = ""
+    engine._is_existing_account = False
+    engine._codex_direct_token_info = {
+        "email": "user@example.com",
+        "account_id": "acct",
+        "access_token": "at",
+        "refresh_token": "rt",
+        "id_token": "id",
+    }
+    engine._log = lambda message, level="info": None
+    engine._preflight_codex_auth_network = lambda: (True, "ok")
+    engine._debug_log = lambda message, level="info": None
+    engine._acquire_codex_callback = lambda: "browser-token-ready"
+    monkeypatch.setattr(
+        "platforms.chatgpt.register.submit_callback_url",
+        lambda **kwargs: pytest.fail("browser token must not be exchanged again"),
+    )
+
+    result = engine.login_existing_via_codex_auth()
+
+    assert result.success is True
+    assert result.access_token == "at"
+    assert result.refresh_token == "rt"
+
+
 def test_protocol_mailbox_mapper_rejects_partial_oauth_result():
     platform = object.__new__(ChatGPTPlatform)
     platform.mailbox = None
@@ -64,7 +257,7 @@ def test_protocol_mailbox_mapper_rejects_partial_oauth_result():
         workspace_id="",
     )
 
-    with pytest.raises(RuntimeError, match="完整 OAuth callback"):
+    with pytest.raises(RuntimeError, match=r"OAuth .*refresh_token"):
         adapter.result_mapper(ctx, result)
 
 

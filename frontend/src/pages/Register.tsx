@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { getConfig, getConfigOptions, getPlatforms } from '@/lib/app-data'
+import { getConfig, getConfigOptions, getPlatforms, invalidateConfigCache } from '@/lib/app-data'
 import type { ConfigOptionsResponse, ProviderOption, ProviderSetting } from '@/lib/config-options'
 import { getCaptchaStrategyLabel, getProviderSelectOptions, listProviderFieldKeys } from '@/lib/config-options'
 import { apiFetch } from '@/lib/utils'
@@ -8,7 +8,7 @@ import { TaskLogPanel } from '@/components/tasks/TaskLogPanel'
 import { Button } from '@/components/ui/button'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import { Play, CheckCircle, XCircle, Loader2, Orbit, Mail, ScanText, ShieldCheck, Workflow } from 'lucide-react'
+import { Play, CheckCircle, XCircle, Loader2, Orbit, Mail, ScanText, ShieldCheck, Workflow, CloudUpload, Save } from 'lucide-react'
 import { getTaskStatusText, isTerminalTaskStatus, TASK_STATUS_VARIANTS } from '@/lib/tasks'
 
 const DEFAULT_FORM: Record<string, any> = {
@@ -16,6 +16,8 @@ const DEFAULT_FORM: Record<string, any> = {
   email: '',
   password: '',
   count: 1,
+  concurrency: 5,
+  run_all_mailboxes: true,
   proxy: '',
   executor_type: '',
   captcha_solver: 'auto',
@@ -26,6 +28,14 @@ const DEFAULT_FORM: Record<string, any> = {
   chrome_cdp_url: '',
   mail_provider: '',
   sms_provider: '',
+  sub2api_enabled: false,
+  sub2api_url: '',
+  sub2api_api_key: '',
+}
+
+function configBoolean(value: unknown, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase())
 }
 
 function getProviderSetting(settings: ProviderSetting[] = [], providerKey: string) {
@@ -61,6 +71,8 @@ export default function Register() {
   const [optionsError, setOptionsError] = useState('')
   const [task, setTask] = useState<any>(null)
   const [polling, setPolling] = useState(false)
+  const [sub2apiSaveState, setSub2apiSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const [sub2apiSaveError, setSub2apiSaveError] = useState('')
   const handledTerminalTaskIdsRef = useRef<Set<string>>(new Set())
   const openedCashierTaskIdsRef = useRef<Set<string>>(new Set())
 
@@ -118,6 +130,9 @@ export default function Register() {
           chrome_cdp_url: cfg.chrome_cdp_url || f.chrome_cdp_url,
           mail_provider: getDefaultProviderKey((options?.mailbox_settings as ProviderSetting[]) || []) || f.mail_provider,
           sms_provider: getDefaultProviderKey((options?.sms_settings as ProviderSetting[]) || []) || f.sms_provider,
+          sub2api_enabled: configBoolean(cfg.sub2api_enabled, Boolean(cfg.sub2api_url && cfg.sub2api_api_key)),
+          sub2api_url: cfg.sub2api_url || '',
+          sub2api_api_key: cfg.sub2api_api_key || '',
         }
         const providerFieldKeys = listProviderFieldKeys([
           ...((options?.mailbox_providers as ProviderOption[]) || []),
@@ -241,7 +256,33 @@ export default function Register() {
     }
   }, [executorOptions, supportedExecutors, form.executor_type, form.identity_provider, form.chrome_user_data_dir, form.chrome_cdp_url])
 
+  const saveSub2ApiConfig = async () => {
+    setSub2apiSaveState('saving')
+    setSub2apiSaveError('')
+    try {
+      await apiFetch('/config', {
+        method: 'PUT',
+        body: JSON.stringify({
+          data: {
+            sub2api_enabled: form.sub2api_enabled ? 'true' : 'false',
+            sub2api_url: String(form.sub2api_url || '').trim(),
+            sub2api_api_key: String(form.sub2api_api_key || '').trim(),
+          },
+        }),
+      })
+      invalidateConfigCache()
+      setSub2apiSaveState('saved')
+      return true
+    } catch (error) {
+      setSub2apiSaveState('error')
+      setSub2apiSaveError(error instanceof Error ? error.message : String(error))
+      return false
+    }
+  }
+
   const submit = async () => {
+    if (!(await saveSub2ApiConfig())) return
+    const shouldRunAllMailboxes = form.identity_provider === 'mailbox' && Boolean(form.run_all_mailboxes)
     const extra: Record<string, any> = {
       identity_provider: form.identity_provider,
       oauth_provider: form.oauth_provider,
@@ -266,7 +307,9 @@ export default function Register() {
         platform: form.platform,
         email: form.email || null,
         password: form.password || null,
-        count: form.count,
+        count: shouldRunAllMailboxes ? 1 : form.count,
+        concurrency: shouldRunAllMailboxes ? 5 : form.concurrency,
+        run_all_mailboxes: shouldRunAllMailboxes,
         proxy: form.proxy || null,
         executor_type: form.executor_type,
         captcha_solver: 'auto',
@@ -315,15 +358,19 @@ export default function Register() {
     return () => window.clearInterval(interval)
   }, [applyTerminalTask, task?.task_id, task?.status])
 
-  const Input = ({ label, k, type = 'text', placeholder = '' }: any) => (
+  const Input = ({ label, k, type = 'text', placeholder = '', disabled = false }: any) => (
     <div>
       <label className="block text-xs text-[var(--text-muted)] mb-1">{label}</label>
       <input
         type={type}
         value={(form as any)[k]}
-        onChange={e => set(k, type === 'number' ? Number(e.target.value) : e.target.value)}
+        onChange={e => {
+          set(k, type === 'number' ? Number(e.target.value) : e.target.value)
+          if (String(k).startsWith('sub2api_')) setSub2apiSaveState('idle')
+        }}
         placeholder={placeholder}
-        className="control-surface"
+        disabled={disabled}
+        className="control-surface disabled:cursor-not-allowed disabled:opacity-55"
       />
     </div>
   )
@@ -369,8 +416,24 @@ export default function Register() {
             <CardHeader><CardTitle>基本配置</CardTitle></CardHeader>
             <CardContent className="space-y-4">
               <Select label="平台" k="platform" options={platformOptions} />
-              <div className="grid gap-4 md:grid-cols-2">
-                <Input label="批量数量" k="count" type="number" />
+              {form.identity_provider === 'mailbox' && (
+                <label className="flex items-center gap-3 text-sm text-[var(--text-primary)]">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(form.run_all_mailboxes)}
+                    onChange={event => setForm(current => ({
+                      ...current,
+                      run_all_mailboxes: event.target.checked,
+                      concurrency: event.target.checked ? 5 : current.concurrency,
+                    }))}
+                    className="h-4 w-4 accent-[var(--accent)]"
+                  />
+                  跑完所有邮箱
+                </label>
+              )}
+              <div className="grid gap-4 md:grid-cols-3">
+                <Input label="批量数量" k="count" type="number" disabled={form.identity_provider === 'mailbox' && form.run_all_mailboxes} />
+                <Input label="并发数" k="concurrency" type="number" disabled={form.identity_provider === 'mailbox' && form.run_all_mailboxes} />
                 <Input label="代理 (可选)" k="proxy" placeholder="http://user:pass@host:port" />
               </div>
             </CardContent>
@@ -491,6 +554,42 @@ export default function Register() {
               </CardContent>
             </Card>
           )}
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <CloudUpload className="h-4 w-4 text-[var(--accent)]" />
+                Sub2API 自动上传
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <label className="flex items-center gap-3 text-sm text-[var(--text-primary)]">
+                <input
+                  type="checkbox"
+                  checked={Boolean(form.sub2api_enabled)}
+                  onChange={event => {
+                    set('sub2api_enabled', event.target.checked)
+                    setSub2apiSaveState('idle')
+                  }}
+                  className="h-4 w-4 accent-[var(--accent)]"
+                />
+                注册成功后自动上传 ChatGPT 账号
+              </label>
+              <div className="grid gap-4 md:grid-cols-2">
+                <Input label="Sub2API 地址" k="sub2api_url" placeholder="https://sub.example.com" />
+                <Input label="Admin API Key" k="sub2api_api_key" type="password" placeholder="admin-..." />
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <Button type="button" variant="outline" onClick={saveSub2ApiConfig} disabled={sub2apiSaveState === 'saving'}>
+                  {sub2apiSaveState === 'saving'
+                    ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />保存中...</>
+                    : <><Save className="mr-2 h-4 w-4" />保存 Sub 配置</>}
+                </Button>
+                {sub2apiSaveState === 'saved' && <span className="text-xs text-emerald-400">配置已保存</span>}
+                {sub2apiSaveState === 'error' && <span className="text-xs text-red-400">保存失败: {sub2apiSaveError}</span>}
+              </div>
+            </CardContent>
+          </Card>
         </div>
 
         <div className="space-y-5 xl:sticky xl:top-4 xl:self-start">

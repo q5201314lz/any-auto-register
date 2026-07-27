@@ -91,6 +91,8 @@ PASSWORDLESS_LOGIN_SELECTORS = [
     'button:has-text("one time code")',
     'button:has-text("passwordless")',
     'button:has-text("一次性验证码")',
+    'button:has-text("一次性代码")',
+    'button:has-text("一次性代碼")',
     'button:has-text("驗證碼")',
     'button:has-text("验证码")',
     'button:has-text("código único")',
@@ -869,6 +871,51 @@ def _get_visible_page_text(page) -> str:
         return ""
 
 
+def _whatsapp_verification_reason(page_text: str, channel: str = "") -> str:
+    """Return a reason only when the page is actively requiring WhatsApp."""
+    normalized_channel = re.sub(r"[^a-z]", "", str(channel or "").lower())
+    if normalized_channel in {"whatsapp", "wa"}:
+        return f"channel={normalized_channel}"
+
+    text = re.sub(r"\s+", " ", str(page_text or "")).strip()
+    if not re.search(r"whats\s*app|whatsapp", text, flags=re.I):
+        return ""
+
+    required_patterns = (
+        r"\b(?:we(?:'ve| have)? sent|has been sent|was sent|sent you)\b[^.!?\n]{0,140}\bwhats\s*app\b",
+        r"\b(?:check|open)\s+(?:your\s+)?whats\s*app\b",
+        r"\benter\b[^.!?\n]{0,100}\b(?:code|otp)\b[^.!?\n]{0,100}\b(?:from|in|on|via)\s+(?:your\s+)?whats\s*app\b",
+        r"\b(?:verify|verification)\b[^.!?\n]{0,100}\b(?:using|with|through|via)\s+whats\s*app\b",
+        r"\bwhats\s*app\s+(?:verification|code)\s+(?:is\s+)?required\b",
+        r"(?:验证码|驗證碼|代码|代碼)[^。！？\n]{0,60}(?:已发送到|已發送到|通过|通過)[^。！？\n]{0,30}whats\s*app",
+        r"(?:打开|打開|查看)[^。！？\n]{0,30}whats\s*app[^。！？\n]{0,60}(?:验证码|驗證碼|代码|代碼)",
+    )
+    for pattern in required_patterns:
+        if re.search(pattern, text, flags=re.I):
+            return f"prompt={pattern}"
+    return ""
+
+
+def _detect_whatsapp_verification(page) -> str:
+    try:
+        channel = str(
+            page.evaluate(
+                """
+                () => {
+                  const checked = document.querySelector(
+                    'input[type="radio"][name*="channel" i]:checked, input[type="radio"][value="whatsapp" i]:checked'
+                  );
+                  const hidden = document.querySelector('input[type="hidden"][name*="channel" i]');
+                  return checked?.value || hidden?.value || '';
+                }
+                """
+            ) or ""
+        )
+    except Exception:
+        channel = ""
+    return _whatsapp_verification_reason(_get_visible_page_text(page), channel)
+
+
 def _has_signup_registration_choice(page) -> bool:
     if not _is_login_password_url(str(page.url or "")):
         return False
@@ -897,7 +944,7 @@ def _click_passwordless_login_if_available(page, log, *, context: str) -> bool:
                   };
                   const target = nodes.find((el) => {
                     const text = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
-                    return visible(el) && /使用一次性验证码登录|使用一次性驗證碼登入|one-time code|one time code|passwordless/i.test(text);
+                    return visible(el) && /使用一次性(?:验证码|驗證碼|代码|代碼)登录|使用一次性(?:驗證碼|代碼)登入|one-time code|one time code|passwordless/i.test(text);
                   });
                   if (!target) return false;
                   target.click();
@@ -912,6 +959,23 @@ def _click_passwordless_login_if_available(page, log, *, context: str) -> bool:
         log(f"{context} 已选择一次性验证码登录")
         time.sleep(1)
     return clicked
+
+
+def _switch_login_password_to_otp(page, log, *, timeout: float = 8) -> bool:
+    """Switch a login password challenge to the email OTP flow."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _click_passwordless_login_if_available(page, log, context="OAuth 密码验证页"):
+            transition_deadline = time.time() + 10
+            while time.time() < transition_deadline:
+                state = _derive_registration_state_from_page(page)
+                if state.get("page_type") != "login_password":
+                    return True
+                time.sleep(0.25)
+            # The click sends the OTP even if the page transition is unusually slow.
+            return True
+        time.sleep(0.25)
+    return False
 
 
 def _get_page_oauth_url(page) -> str:
@@ -2047,9 +2111,16 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                     raise RuntimeError(f"OAuth 邮箱页提交失败: {(email_resp.get('text') or '')[:300]}")
                 continue
 
-            if state["page_type"] in {"login_password", "create_account_password"}:
-                log("  OAuth 页面需要密码登录，提交密码...")
-                # OAuth 流程中直接填密码登录，不尝试恢复到注册态
+            if state["page_type"] == "login_password":
+                if not otp_callback:
+                    raise RuntimeError("OAuth 密码验证页需要一次性验证码，但没有 otp_callback")
+                log("  OAuth 遇到密码验证，强制切换一次性验证码登录...")
+                if not _switch_login_password_to_otp(page, log):
+                    raise RuntimeError("OAuth 密码验证页未找到一次性验证码登录入口")
+                continue
+
+            if state["page_type"] == "create_account_password":
+                log("  OAuth 页面需要创建账号密码，提交密码...")
                 password_resp = _submit_oauth_password_direct(page, password, log)
                 log(f"  OAuth 密码页提交状态: {password_resp.get('status', 0)}")
                 if not password_resp.get("ok"):
@@ -2648,11 +2719,11 @@ def _do_add_phone_attempt(
     if debug_add_phone:
         _log_add_phone_dom_summary(page, log, label="after-send")
 
-    # 检查发送是否成功（页面应出现 OTP 输入框或 URL 变化）。
-    # OpenAI add-phone 页面在某些地区会默认走 WhatsApp；这种情况下 HeroSMS 不会收到 SMS，
-    # 不能把它误判为“手机号提交成功”。
-    after_text = _get_visible_page_text(page)
-    if re.search(r"whats\s*app|whatsapp", after_text, flags=re.I):
+    # 只有页面明确进入 WhatsApp 验证时才换号。SMS 页面可能一直保留 WhatsApp
+    # 作为备用渠道，仅凭页面出现 WhatsApp 字样会误判已成功触发的短信。
+    whatsapp_reason = _detect_whatsapp_verification(page)
+    if whatsapp_reason:
+        _phone_debug(log, f"  检测到 WhatsApp 验证状态: {whatsapp_reason}", "warning")
         if hasattr(phone_callback, "mark_send_failed"):
             phone_callback.mark_send_failed("页面进入 WhatsApp 验证，不是 SMS 验证")
         raise RuntimeError("手机号提交后进入 WhatsApp 验证，未触发 SMS 短信发送")

@@ -35,6 +35,9 @@ from core.base_mailbox import BaseMailbox, MailboxAccount, _extract_verification
 GRAPH_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 GRAPH_MESSAGES_URL = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
 DEFAULT_GRAPH_SCOPE = "https://graph.microsoft.com/Mail.Read offline_access"
+OUTLOOK_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+OUTLOOK_IMAP_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+OUTLOOK_IMAP_HOST = "outlook.office365.com"
 DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / ".local_mailbox_pool_state.json"
 LEGACY_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / ".local_ms_mailbox_pool_state.json"
 LOCAL_MAIL_POOL_PROVIDER_NAME = "local_mail_pool"
@@ -256,6 +259,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         state_file: str = "",
         graph_scope: str = "",
         allow_reuse: bool = False,
+        avoid_repeat: bool = False,
+        failure_cooldown_seconds: int = 0,
         proxy: str = None,
     ):
         self.pool_text = str(pool_text or "")
@@ -263,7 +268,11 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         self.state_file = Path(state_file or DEFAULT_STATE_FILE)
         self.graph_scope = str(graph_scope or DEFAULT_GRAPH_SCOPE).strip()
         self.allow_reuse = bool(allow_reuse)
+        self.avoid_repeat = bool(avoid_repeat)
+        self._attempted_keys: set[str] = set()
+        self.failure_cooldown_seconds = max(int(failure_cooldown_seconds or 0), 0)
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
+        self._oauth_mail_strategy: dict[str, str] = {}
 
     @classmethod
     def from_config(cls, config: dict) -> "LocalMicrosoftMailboxPool":
@@ -273,6 +282,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             state_file=config.get("local_mail_pool_state_file") or config.get("local_ms_pool_state_file", ""),
             graph_scope=config.get("local_ms_graph_scope", ""),
             allow_reuse=_truthy(config.get("local_mail_pool_allow_reuse") if "local_mail_pool_allow_reuse" in config else config.get("local_ms_pool_allow_reuse")),
+            avoid_repeat=_truthy(config.get("local_mail_pool_avoid_repeat")),
+            failure_cooldown_seconds=config.get("local_mail_pool_failure_cooldown_seconds", 0),
             proxy=config.get("proxy") or None,
         )
 
@@ -320,15 +331,18 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             return
         state = self._state()
         used = dict(state.get("used") or {})
+        cooldowns = dict(state.get("cooldowns") or {})
+        cooldowns.pop(entry.key, None)
         used[entry.key] = {
             "email": entry.email,
             "reserved_at": datetime.now(timezone.utc).isoformat(),
             "source_id": self._source_id(),
         }
         state["used"] = used
+        state["cooldowns"] = cooldowns
         self._save_state(state)
 
-    def release_email(self, account_or_email) -> bool:
+    def release_email(self, account_or_email, *, cooldown: bool = False) -> bool:
         """Release a reservation made by get_email() for failed tasks.
 
         Successful tasks intentionally keep the reservation so the same imported
@@ -348,17 +362,65 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 return False
             used.pop(key, None)
             state["used"] = used
+            cooldowns = dict(state.get("cooldowns") or {})
+            cooldowns.pop(key, None)
+            state["cooldowns"] = cooldowns
             self._save_state(state)
             return True
+
+    def release_unsaved_reservations(self, saved_emails: set[str]) -> list[str]:
+        """Release current-pool reservations that have no saved platform account."""
+        saved_keys = {str(email or "").strip().lower() for email in saved_emails if str(email or "").strip()}
+        entries = {entry.key: entry.email for entry in self._entries()}
+        with self._lock:
+            state = self._state()
+            used = dict(state.get("used") or {})
+            orphaned_keys = [key for key in entries if key in used and key not in saved_keys]
+            if not orphaned_keys:
+                return []
+            cooldowns = dict(state.get("cooldowns") or {})
+            for key in orphaned_keys:
+                used.pop(key, None)
+                cooldowns.pop(key, None)
+            state["used"] = used
+            state["cooldowns"] = cooldowns
+            self._save_state(state)
+            return [entries[key] for key in orphaned_keys]
+
+    def clear_failure_cooldowns(self, emails: list[str] | None = None) -> int:
+        targets = {str(email or "").strip().lower() for email in (emails or []) if str(email or "").strip()}
+        with self._lock:
+            state = self._state()
+            cooldowns = dict(state.get("cooldowns") or {})
+            if targets:
+                removed = sum(1 for key in targets if key in cooldowns)
+                for key in targets:
+                    cooldowns.pop(key, None)
+            else:
+                removed = len(cooldowns)
+                cooldowns.clear()
+            if removed:
+                state["cooldowns"] = cooldowns
+                self._save_state(state)
+            return removed
 
     def _available_entry(self) -> LocalMicrosoftMailboxEntry:
         entries = self._entries()
         state = self._state()
         used = set((state.get("used") or {}).keys())
         for entry in entries:
+            if self.avoid_repeat and entry.key in self._attempted_keys:
+                continue
             if self.allow_reuse or entry.key not in used:
                 return entry
         raise RuntimeError(f"本地邮箱池已用尽: total={len(entries)}")
+
+    def available_count(self) -> int:
+        entries = self._entries()
+        if self.allow_reuse:
+            return len(entries)
+        used = set((self._state().get("used") or {}).keys())
+        return sum(1 for entry in entries if entry.key not in used)
 
     def peek_email(self) -> str:
         return self._available_entry().email
@@ -366,6 +428,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
     def get_email(self) -> MailboxAccount:
         with self._lock:
             entry = self._available_entry()
+            if self.avoid_repeat:
+                self._attempted_keys.add(entry.key)
             self._reserve(entry)
 
         credentials = entry.credentials()
@@ -498,6 +562,27 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         payload = response.json() or {}
         return list(payload.get("value") or [])
 
+    def _outlook_imap_access_token(self, entry: LocalMicrosoftMailboxEntry) -> str:
+        if not entry.graph_ready:
+            raise RuntimeError(f"微软邮箱缺少 Client Id 或刷新令牌: {entry.email}")
+        response = requests.post(
+            OUTLOOK_TOKEN_URL,
+            data={
+                "client_id": entry.client_id,
+                "grant_type": "refresh_token",
+                "refresh_token": entry.refresh_token,
+                "scope": OUTLOOK_IMAP_SCOPE,
+            },
+            proxies=self.proxy,
+            timeout=25,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Microsoft IMAP refresh_token 换 access_token 失败: HTTP {response.status_code} {response.text[:200]}")
+        token = str((response.json() or {}).get("access_token") or "").strip()
+        if not token:
+            raise RuntimeError("Microsoft IMAP refresh_token 响应缺少 access_token")
+        return token
+
     def _imap_connect(self, entry: LocalMicrosoftMailboxEntry):
         host = entry.imap_host.strip()
         port = int(entry.imap_port or 993)
@@ -509,55 +594,72 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             conn.starttls(ssl_context=ssl.create_default_context())
         return conn
 
+    def _read_imap_inbox(self, conn) -> list[dict]:
+        messages: list[dict] = []
+        conn.select("INBOX", readonly=True)
+        _, msg_nums = conn.search(None, "ALL")
+        ids = msg_nums[0].split() if msg_nums and msg_nums[0] else []
+        for mid in reversed(ids[-30:]):
+            _, data = conn.fetch(mid, "(RFC822)")
+            if not data or not data[0]:
+                continue
+            msg = email_lib.message_from_bytes(data[0][1])
+            subject = self._decode_mime(str(msg.get("Subject", "") or ""))
+            parts: list[str] = []
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() not in ("text/plain", "text/html"):
+                        continue
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        parts.append(payload.decode(part.get_content_charset() or "utf-8", errors="replace"))
+            else:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    parts.append(payload.decode(msg.get_content_charset() or "utf-8", errors="replace"))
+            received_at = ""
+            try:
+                msg_date = parsedate_to_datetime(str(msg.get("Date", "") or ""))
+                if msg_date:
+                    if msg_date.tzinfo is None:
+                        msg_date = msg_date.replace(tzinfo=timezone.utc)
+                    received_at = msg_date.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            except Exception:
+                received_at = ""
+            messages.append({
+                "id": str(msg.get("Message-ID") or mid.decode("ascii", errors="ignore")),
+                "subject": subject,
+                "bodyPreview": " ".join(parts),
+                "receivedDateTime": received_at,
+            })
+        return messages
+
     def _imap_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
         if not entry.imap_ready:
             raise RuntimeError(f"微软邮箱没有可用的 Graph token，也没有 IMAP 收件配置: {entry.email}")
         conn = self._imap_connect(entry)
-        messages: list[dict] = []
         try:
             conn.login(entry.login_account or entry.email, entry.password)
-            conn.select("INBOX", readonly=True)
-            _, msg_nums = conn.search(None, "ALL")
-            ids = msg_nums[0].split() if msg_nums and msg_nums[0] else []
-            for mid in reversed(ids[-30:]):
-                _, data = conn.fetch(mid, "(RFC822)")
-                if not data or not data[0]:
-                    continue
-                msg = email_lib.message_from_bytes(data[0][1])
-                subject = self._decode_mime(str(msg.get("Subject", "") or ""))
-                parts: list[str] = []
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_type() not in ("text/plain", "text/html"):
-                            continue
-                        payload = part.get_payload(decode=True)
-                        if payload:
-                            parts.append(payload.decode(part.get_content_charset() or "utf-8", errors="replace"))
-                else:
-                    payload = msg.get_payload(decode=True)
-                    if payload:
-                        parts.append(payload.decode(msg.get_content_charset() or "utf-8", errors="replace"))
-                received_at = ""
-                try:
-                    msg_date = parsedate_to_datetime(str(msg.get("Date", "") or ""))
-                    if msg_date:
-                        if msg_date.tzinfo is None:
-                            msg_date = msg_date.replace(tzinfo=timezone.utc)
-                        received_at = msg_date.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-                except Exception:
-                    received_at = ""
-                messages.append({
-                    "id": str(msg.get("Message-ID") or mid.decode("ascii", errors="ignore")),
-                    "subject": subject,
-                    "bodyPreview": " ".join(parts),
-                    "receivedDateTime": received_at,
-                })
+            return self._read_imap_inbox(conn)
         finally:
             try:
                 conn.logout()
             except Exception:
                 pass
-        return messages
+
+    def _outlook_oauth_imap_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
+        token = self._outlook_imap_access_token(entry)
+        conn = imaplib.IMAP4_SSL(OUTLOOK_IMAP_HOST, 993, ssl_context=ssl.create_default_context())
+        try:
+            login_account = entry.login_account or entry.email
+            auth = f"user={login_account}\x01auth=Bearer {token}\x01\x01"
+            conn.authenticate("XOAUTH2", lambda _: auth.encode("utf-8"))
+            return self._read_imap_inbox(conn)
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
 
     @staticmethod
     def _json_message_candidates(payload: Any) -> list[Any]:
@@ -665,7 +767,20 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         if entry.icloud_api_ready:
             return self._icloud_api_messages(entry)
         if entry.graph_ready:
-            return self._graph_messages(entry)
+            preferred = self._oauth_mail_strategy.get(entry.key, "graph")
+            modes = [preferred, "imap" if preferred == "graph" else "graph"]
+            errors: list[str] = []
+            for mode in modes:
+                try:
+                    if mode == "graph":
+                        messages = self._graph_messages(entry)
+                    else:
+                        messages = self._outlook_oauth_imap_messages(entry)
+                    self._oauth_mail_strategy[entry.key] = mode
+                    return messages
+                except Exception as exc:
+                    errors.append(f"{mode}: {exc}")
+            raise RuntimeError("Microsoft OAuth 收件失败；" + "；".join(errors))
         return self._imap_messages(entry)
 
     def get_current_ids(self, account: MailboxAccount) -> set:

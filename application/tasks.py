@@ -299,6 +299,32 @@ def create_task(
 
 
 def create_register_task(payload: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(payload or {})
+    if _bool_config(payload.get("run_all_mailboxes"), False):
+        extra = dict(payload.get("extra") or {})
+        from core.base_identity import normalize_identity_provider
+        from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
+        from infrastructure.provider_settings_repository import ProviderSettingsRepository
+
+        if normalize_identity_provider(extra.get("identity_provider", "mailbox")) != "mailbox":
+            raise ValueError("跑完所有邮箱仅适用于系统邮箱注册")
+        settings_repo = ProviderSettingsRepository()
+        provider_key = str(extra.get("mail_provider") or settings_repo.get_default_provider_key("mailbox") or "").strip()
+        definition = ProviderDefinitionsRepository().get_by_key("mailbox", provider_key) if provider_key else None
+        if not definition or definition.driver_type not in {"local_ms_pool", "local_mail_pool"}:
+            raise ValueError("跑完所有邮箱需要选择本地邮箱池")
+
+        from core.local_ms_mailbox import LocalMicrosoftMailboxPool
+
+        settings = settings_repo.resolve_runtime_settings("mailbox", provider_key, extra)
+        available_count = LocalMicrosoftMailboxPool.from_config(settings).available_count()
+        if available_count <= 0:
+            raise RuntimeError("本地邮箱池当前没有可用邮箱")
+        payload["count"] = available_count
+        payload["concurrency"] = 5
+        extra["local_mail_pool_avoid_repeat"] = True
+        payload["extra"] = extra
+
     count = max(int(payload.get("count", 1) or 1), 1)
     return create_task(
         task_type=TASK_TYPE_REGISTER,
@@ -416,6 +442,28 @@ def mark_incomplete_tasks_interrupted() -> None:
             event_type="state",
             level="warning",
         )
+
+
+def reconcile_local_mailbox_reservations() -> list[str]:
+    """Recover mailbox reservations left behind by stopped or crashed workers."""
+    try:
+        from core.local_ms_mailbox import LocalMicrosoftMailboxPool
+        from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
+        from infrastructure.provider_settings_repository import ProviderSettingsRepository
+
+        settings_repo = ProviderSettingsRepository()
+        provider_key = str(settings_repo.get_default_provider_key("mailbox") or "").strip()
+        definition = ProviderDefinitionsRepository().get_by_key("mailbox", provider_key) if provider_key else None
+        if not definition or definition.driver_type not in {"local_ms_pool", "local_mail_pool"}:
+            return []
+        settings = settings_repo.resolve_runtime_settings("mailbox", provider_key, {})
+        pool = LocalMicrosoftMailboxPool.from_config(settings)
+        with Session(engine) as session:
+            saved_emails = set(session.exec(select(AccountModel.email)).all())
+        return pool.release_unsaved_reservations(saved_emails)
+    except Exception as exc:
+        print(f"[TaskRuntime] 邮箱占用自动对账失败: {exc}")
+        return []
 
 
 def request_cancel(task_id: str) -> Optional[dict[str, Any]]:
@@ -588,6 +636,19 @@ def _auto_push_any2api(task_logger: TaskLogger, account) -> None:
         task_logger.log(f"  [Any2API] 自动推送异常: {exc}", level="warning")
 
 
+def _auto_push_sub2api(task_logger: TaskLogger, saved_account: Any) -> None:
+    """注册成功落库后自动推送 ChatGPT 账号到 Sub2API。"""
+    try:
+        from application.sub2api_sync import push_saved_account_to_sub2api
+
+        account_id = int(getattr(saved_account, "id", 0) or 0)
+        if not account_id:
+            raise RuntimeError("落库账号缺少 ID")
+        push_saved_account_to_sub2api(account_id, log_fn=task_logger.log)
+    except Exception as exc:
+        task_logger.log(f"  [Sub2API] 自动推送异常: {exc}", level="warning")
+
+
 def _auto_upload_cpa(task_logger: TaskLogger, account) -> None:
     if getattr(account, "platform", "") != "chatgpt":
         return
@@ -626,12 +687,6 @@ def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger
     executor_type = str(payload.get("executor_type", "protocol") or "protocol")
     captcha_solver = str(payload.get("captcha_solver", "auto") or "auto")
     extra = dict(payload.get("extra") or {})
-    config = RegisterConfig(
-        executor_type=executor_type,
-        captcha_solver=captcha_solver,
-        proxy=resolved_proxy,
-        extra=extra,
-    )
     identity_provider = normalize_identity_provider(extra.get("identity_provider", "mailbox"))
     mailbox = shared_mailbox
     if mailbox is None and identity_provider == "mailbox":
@@ -644,6 +699,17 @@ def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger
             extra=extra,
             proxy=resolved_proxy,
         )
+
+    # Runtime-only callback: downstream blocking operations use it to abort
+    # promptly after a task is force-stopped. It is added after mailbox setup
+    # so provider configuration never attempts to persist or serialize it.
+    extra["_cancel_check"] = logger.is_cancel_requested
+    config = RegisterConfig(
+        executor_type=executor_type,
+        captcha_solver=captcha_solver,
+        proxy=resolved_proxy,
+        extra=extra,
+    )
 
     platform_cls = get(platform_name)
     platform = platform_cls(config=config, mailbox=mailbox)
@@ -841,7 +907,12 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     email = payload.get("email") or None
     password = payload.get("password") or None
     proxy = payload.get("proxy") or None
+    if not proxy:
+        from core.http_client import resolve_proxy_url
+        proxy = resolve_proxy_url(None)
     extra = dict(payload.get("extra") or {})
+    if _bool_config(payload.get("run_all_mailboxes"), False):
+        logger.log(f"跑完所有邮箱: 本次共 {count} 个，并发 {concurrency}", event_type="summary")
     sms_provider_key, sms_settings = _resolve_sms_provider_for_task(extra)
     herosms_enabled = sms_provider_key == "herosms" and bool(str(sms_settings.get("herosms_api_key") or "").strip())
     hero_extra_max = max(_int_config(sms_settings.get("register_phone_extra_max"), 3), 0) if herosms_enabled else 0
@@ -908,7 +979,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 _release_failed_mailbox_reservation(platform, logger)
                 logger.log("任务已终止，跳过保存本次账号", level="warning")
                 return "__cancel_requested__"
-            save_account(account)
+            saved_account = save_account(account)
             _auto_followup_windsurf_payment(
                 platform_name=platform_name,
                 payload=payload,
@@ -922,6 +993,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             logger.log(f"✓ 注册成功: {account.email}")
             _save_task_log(platform_name, account.email, "success")
             _auto_upload_cpa(logger, account)
+            _auto_push_sub2api(logger, saved_account)
             _auto_push_any2api(logger, account)
             extra = dict(account.extra or {})
             overview = dict(extra.get("account_overview") or {})

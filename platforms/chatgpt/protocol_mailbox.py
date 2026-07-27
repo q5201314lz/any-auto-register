@@ -128,9 +128,15 @@ class ChatGPTProtocolMailboxWorker:
                 try:
                     release = getattr(self.engine.email_service._mailbox, "release_email", None)
                     if callable(release):
-                        released = release(self.engine.email_service._mailbox_account)
+                        try:
+                            released = release(
+                                self.engine.email_service._mailbox_account,
+                                cooldown=False,
+                            )
+                        except TypeError:
+                            released = release(self.engine.email_service._mailbox_account)
                         if released:
-                            self.engine._log(f"失败任务已释放邮箱占用: {self.engine.email_service._mailbox_account.email}")
+                            self.engine._log(f"失败任务已释放邮箱占用，可立即重试: {self.engine.email_service._mailbox_account.email}")
                 except Exception as exc:
                     try:
                         self.engine._log(f"释放邮箱占用失败: {exc}")

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from curl_cffi import requests as cffi_requests
-from core.http_client import resolve_proxy_url
+from core.http_client import _is_curl_tls_connect_error, resolve_proxy_url
 
 from .constants import (
     OAUTH_CLIENT_ID,
@@ -22,16 +22,6 @@ from .constants import (
     OAUTH_REDIRECT_URI,
     OAUTH_SCOPE,
 )
-
-
-def _is_curl_tls_connect_error(exc: BaseException) -> bool:
-    text = str(exc or "").lower()
-    return (
-        "curl: (35)" in text
-        or "tls connect error" in text
-        or "openssl_internal:invalid library" in text
-        or "invalid library (0)" in text
-    )
 
 
 def _b64url_no_pad(raw: bytes) -> str:
@@ -168,13 +158,13 @@ def _post_form(
     }
 
     attempts: list[tuple[Optional[dict], Optional[str], bool, str]] = [
-        (proxies, "chrome136", True, "proxy/chrome136"),
+        (proxies, "chrome131", True, "proxy/chrome131"),
         (proxies, "chrome120", True, "proxy/chrome120"),
     ]
     # 某些代理会触发 curl_cffi/OpenSSL 的 TLS connect error；token 交换阶段
     # 不强依赖同一出口，最后允许无代理兜底一次。
     if proxies:
-        attempts.append((None, "chrome136", True, "direct/chrome136"))
+        attempts.append((None, "chrome131", True, "direct/chrome131"))
 
     last_error: BaseException | None = None
     for attempt_proxies, impersonate, verify, label in attempts:

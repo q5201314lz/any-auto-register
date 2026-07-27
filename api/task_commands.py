@@ -20,6 +20,7 @@ class RegisterTaskRequest(BaseModel):
     password: Optional[str] = None
     count: int = 1
     concurrency: int = 1
+    run_all_mailboxes: bool = False
     proxy: Optional[str] = None
     executor_type: str = "protocol"
     captcha_solver: str = "auto"
@@ -28,7 +29,10 @@ class RegisterTaskRequest(BaseModel):
 
 @router.post("/register")
 def create_register_task(body: RegisterTaskRequest):
-    return command_service.create_register_task(body.model_dump())
+    try:
+        return command_service.create_register_task(body.model_dump())
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.post("/{task_id}/cancel")

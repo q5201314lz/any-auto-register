@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from curl_cffi import requests as cffi_requests
+from core.http_client import _is_curl_tls_connect_error
 
 from .oauth import OAuthManager, OAuthStart, generate_oauth_url, submit_callback_url
 from .http_client import OpenAIHTTPClient, HTTPClientError
@@ -41,16 +42,6 @@ from .constants import (
 
 
 logger = logging.getLogger(__name__)
-
-
-def _is_curl_tls_connect_error(exc: BaseException) -> bool:
-    text = str(exc or "").lower()
-    return (
-        "curl: (35)" in text
-        or "tls connect error" in text
-        or "openssl_internal:invalid library" in text
-        or "invalid library (0)" in text
-    )
 
 
 def _copy_session_cookies(src, dst) -> None:
@@ -333,6 +324,7 @@ class RegistrationEngine:
         self._otp_continue_url: Optional[str] = None
         self._otp_page_type: Optional[str] = None
         self._last_codex_error: str = ""
+        self._codex_direct_token_info: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def _debug_auth_enabled() -> bool:
@@ -1383,6 +1375,102 @@ class RegistrationEngine:
             (self._debug_log if quiet else self._log)(f"Codex consent 处理失败: {exc}", "error")
             return None
 
+    def _complete_codex_email_otp(
+        self,
+        login_session,
+        *,
+        send_code: bool,
+        referer: str,
+    ) -> Optional[str]:
+        """Send (when needed), fetch and validate a Codex login email OTP."""
+        from .constants import OPENAI_AUTH, OPENAI_API_ENDPOINTS
+
+        if send_code:
+            self._otp_sent_at = time.time()
+            send_resp = login_session.get(
+                OPENAI_API_ENDPOINTS["send_otp"],
+                headers={"referer": referer},
+                timeout=15,
+                allow_redirects=False,
+            )
+            content_type = str((getattr(send_resp, "headers", {}) or {}).get("content-type") or "").lower()
+            location = str((getattr(send_resp, "headers", {}) or {}).get("location") or "").strip()
+            self._debug_log(
+                f"Codex login OTP 发送: {send_resp.status_code} "
+                f"content_type={content_type or '-'} location={location[:120] or '-'}"
+            )
+            if send_resp.status_code not in (200, 201, 204):
+                self._log(f"Codex login OTP 发送失败: {send_resp.text[:200]}", "error")
+                return None
+            if location or (content_type and "json" not in content_type):
+                self._log(
+                    "Codex login OTP 发送未确认：接口发生跳转或返回的不是 JSON，停止等待验证码",
+                    "error",
+                )
+                return None
+            self._log("Codex login 一次性验证码已发送")
+        else:
+            self._otp_sent_at = time.time()
+
+        self._log("Codex login 等待邮箱一次性验证码...")
+        code = self._get_verification_code()
+        if not code:
+            self._log("Codex login 获取验证码失败", "error")
+            return None
+
+        otp_resp = login_session.post(
+            OPENAI_API_ENDPOINTS["validate_otp"],
+            headers={
+                "referer": f"{OPENAI_AUTH}/email-verification",
+                "accept": "application/json",
+                "content-type": "application/json",
+            },
+            data=json.dumps({"code": code}),
+        )
+        self._debug_log(f"Codex login OTP 校验: {otp_resp.status_code}")
+        if otp_resp.status_code != 200:
+            self._log(f"Codex login OTP 失败: {otp_resp.text[:200]}", "error")
+            return None
+
+        otp_page = str((otp_resp.json().get("page") or {}).get("type") or "")
+        self._debug_log(f"Codex login OTP -> page_type={otp_page}")
+        return otp_page
+
+    def _complete_codex_login_password_in_browser(self) -> Optional[Dict[str, Any]]:
+        """Use the real passwordless-login button and finish OAuth in a browser."""
+        try:
+            from platforms.chatgpt.browser_register import ChatGPTBrowserRegister
+
+            def wait_for_browser_otp() -> Optional[str]:
+                # The browser state machine only invokes this after the button click
+                # has transitioned to the email verification page.
+                self._otp_sent_at = time.time()
+                self._log("Codex login 已确认进入验证码页面，开始读取新邮件")
+                return self._get_verification_code()
+
+            browser_flow = ChatGPTBrowserRegister(
+                headless=True,
+                proxy=self.proxy_url,
+                otp_callback=wait_for_browser_otp,
+                phone_callback=self.phone_callback,
+                log_fn=self._log,
+            )
+            token_info = browser_flow._retry_oauth_fresh_browser(self.email, self.password)
+            if not isinstance(token_info, dict):
+                self._last_codex_error = "浏览器未完成一次性验证码 OAuth"
+                return None
+            access_token = str(token_info.get("access_token") or "").strip()
+            refresh_token = str(token_info.get("refresh_token") or token_info.get("rt") or "").strip()
+            if not access_token or not refresh_token:
+                self._last_codex_error = "浏览器 OAuth token 缺少 access_token 或 refresh_token(rt)"
+                return None
+            self._log("Codex login 浏览器一次性验证码 OAuth 已完成")
+            return token_info
+        except Exception as exc:
+            self._last_codex_error = f"浏览器一次性验证码 OAuth 失败: {exc}"
+            self._log(self._last_codex_error, "error")
+            return None
+
     def _acquire_codex_callback(self) -> Optional[str]:
         """
         注册完成后，通过 Codex CLI OAuth 完整登录流程获取 callback URL。
@@ -1390,6 +1478,7 @@ class RegistrationEngine:
         """
         try:
             self._last_codex_error = ""
+            self._codex_direct_token_info = None
             from .constants import (
                 CODEX_CLIENT_ID, CODEX_REDIRECT_URI, CODEX_SCOPE,
                 OPENAI_AUTH, OPENAI_API_ENDPOINTS,
@@ -1415,10 +1504,25 @@ class RegistrationEngine:
             self._codex_oauth = codex_oauth
 
             # 3. 访问 authorize URL 获取 device_id + session cookies
-            response = login_session.get(codex_oauth.auth_url, timeout=15)
-            did = login_session.cookies.get("oai-did")
+            response = None
+            did = ""
+            for bootstrap_attempt in range(3):
+                response = login_session.get(codex_oauth.auth_url, timeout=15)
+                did = str(login_session.cookies.get("oai-did") or "")
+                if did:
+                    break
+                self._log(
+                    f"Codex login 未获取 oai-did，重试 {bootstrap_attempt + 1}/3: "
+                    f"HTTP {response.status_code} url={str(response.url)[:120]}",
+                    "warning",
+                )
+                time.sleep(0.5)
             self._debug_log(f"Codex login device_id: {did}")
             if not did:
+                self._last_codex_error = (
+                    f"OAuth bootstrap 未获取 oai-did: HTTP {getattr(response, 'status_code', 0)} "
+                    f"url={str(getattr(response, 'url', '') or '')[:160]}"
+                )
                 self._log("Codex login 获取 device_id 失败", "error")
                 return None
 
@@ -1496,33 +1600,14 @@ class RegistrationEngine:
                     return self._acquire_codex_callback()
                 return None
 
-            if page_type == "email_otp_verification":
-                self._log("等待第二次验证码...")
-                self._otp_sent_at = time.time()
-                code = self._get_verification_code()
-                if not code:
-                    self._log("Codex login 获取验证码失败", "error")
-                    return None
-
-                # 验证 OTP
-                code_body = f'{{"code":"{code}"}}'
-                otp_resp = login_session.post(
-                    OPENAI_API_ENDPOINTS["validate_otp"],
-                    headers={
-                        "referer": "https://auth.openai.com/email-verification",
-                        "accept": "application/json",
-                        "content-type": "application/json",
-                    },
-                    data=code_body,
+            if page_type in ("email_otp_send", "email_otp_verification"):
+                otp_page = self._complete_codex_email_otp(
+                    login_session,
+                    send_code=page_type == "email_otp_send",
+                    referer=f"{OPENAI_AUTH}/email-verification",
                 )
-                self._debug_log(f"Codex login OTP 校验: {otp_resp.status_code}")
-                if otp_resp.status_code != 200:
-                    self._log(f"Codex login OTP 失败: {otp_resp.text[:200]}", "error")
+                if otp_page is None:
                     return None
-
-                otp_data = otp_resp.json()
-                otp_page = otp_data.get("page", {}).get("type", "")
-                self._debug_log(f"Codex login OTP -> page_type={otp_page}")
 
                 if otp_page == "add_phone":
                     self._log("Codex CLI 登录进入 add_phone，开始短信验证...")
@@ -1535,8 +1620,17 @@ class RegistrationEngine:
                         return self._acquire_codex_callback()
                     return None
 
-            # 7. 需要密码登录
-            elif page_type in ("login_password", "create_account_password"):
+            # 7. 已有账号遇到密码验证时，强制改走邮箱一次性验证码。
+            elif page_type == "login_password":
+                self._log("Codex login 遇到密码验证，切换浏览器点击一次性验证码入口...")
+                token_info = self._complete_codex_login_password_in_browser()
+                if not token_info:
+                    return None
+                self._codex_direct_token_info = token_info
+                return "browser-token-ready"
+
+            # 新账号创建密码仍走密码提交，不属于登录密码验证。
+            elif page_type == "create_account_password":
                 self._log(f"Codex login 提交密码...")
                 if not self.password:
                     self._log("无密码可用", "error")
@@ -1848,17 +1942,21 @@ class RegistrationEngine:
                     result.error_message = "Codex Auth 未获取到 callback URL"
                 return result
 
-            self._log("3. 交换 Codex OAuth token...")
-            from .constants import CODEX_CLIENT_ID, CODEX_REDIRECT_URI
-            token_json = submit_callback_url(
-                callback_url=callback_url,
-                expected_state=self._codex_oauth.state,
-                code_verifier=self._codex_oauth.code_verifier,
-                redirect_uri=CODEX_REDIRECT_URI,
-                client_id=CODEX_CLIENT_ID,
-                proxy_url=self.proxy_url,
-            )
-            token_info = json.loads(token_json)
+            token_info = self._codex_direct_token_info
+            if token_info:
+                self._log("3. 使用浏览器完成的 Codex OAuth token...")
+            else:
+                self._log("3. 交换 Codex OAuth token...")
+                from .constants import CODEX_CLIENT_ID, CODEX_REDIRECT_URI
+                token_json = submit_callback_url(
+                    callback_url=callback_url,
+                    expected_state=self._codex_oauth.state,
+                    code_verifier=self._codex_oauth.code_verifier,
+                    redirect_uri=CODEX_REDIRECT_URI,
+                    client_id=CODEX_CLIENT_ID,
+                    proxy_url=self.proxy_url,
+                )
+                token_info = json.loads(token_json)
 
             access_token = str(token_info.get("access_token") or "")
             refresh_token = str(token_info.get("refresh_token") or token_info.get("rt") or "")

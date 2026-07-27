@@ -44,7 +44,12 @@ def _is_curl_tls_connect_error(exc: BaseException) -> bool:
     text = str(exc or "").lower()
     return (
         "curl: (35)" in text
+        or "curl: (28)" in text
+        or "curl: (56)" in text
         or "tls connect error" in text
+        or "ssl connection timeout" in text
+        or "connection timed out" in text
+        or "connection closed abruptly" in text
         or "openssl_internal:invalid library" in text
         or "invalid library (0)" in text
     )

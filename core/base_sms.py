@@ -8,6 +8,7 @@ import os
 import threading
 import time
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -39,6 +40,11 @@ class BaseSmsProvider(ABC):
     """Base class for SMS verification code providers."""
 
     auto_report_success_on_code = True
+    cancel_check: Callable[[], bool] | None = None
+
+    def raise_if_cancelled(self) -> None:
+        if callable(self.cancel_check) and self.cancel_check():
+            raise RuntimeError("任务已取消")
 
     @abstractmethod
     def get_number(self, *, service: str, country: str = "") -> SmsActivation:
@@ -165,6 +171,7 @@ class SmsActivateProvider(BaseSmsProvider):
     def get_code(self, activation_id: str, *, timeout: int = 120) -> str:
         deadline = time.time() + timeout
         while time.time() < deadline:
+            self.raise_if_cancelled()
             result = self._request("getStatus", id=activation_id)
             if result.startswith("STATUS_OK:"):
                 return result.split(":")[1]
@@ -845,7 +852,8 @@ class HeroSmsProvider(BaseSmsProvider):
     def get_number(self, *, service: str, country: str = "") -> SmsActivation:
         service_code = str(self.default_service or service or HERO_SMS_DEFAULT_SERVICE).strip()
         country_id = str(country or self.default_country or HERO_SMS_DEFAULT_COUNTRY).strip()
-        with _HERO_SMS_VERIFY_LOCK:
+        verify_guard = _HERO_SMS_VERIFY_LOCK if self.reuse_phone_to_max else nullcontext()
+        with verify_guard:
             with _HERO_SMS_CACHE_LOCK:
                 cache = self._load_cache(service_code, country_id) if self.reuse_phone_to_max else None
                 if cache:
@@ -874,7 +882,8 @@ class HeroSmsProvider(BaseSmsProvider):
                     "reuse_stopped": False,
                     "stop_reason": "",
                 }
-                self._save_cache(cache)
+                if self.reuse_phone_to_max:
+                    self._save_cache(cache)
                 activation = SmsActivation(
                     activation_id=activation_id,
                     phone_number=phone,
@@ -968,9 +977,13 @@ class HeroSmsProvider(BaseSmsProvider):
         last_hero_resend = start
         openai_resent = False
         warned_v2 = False
+        openai_resend_after = min(90, max(30, int(timeout / 2)))
         while time.time() < deadline:
+            self.raise_if_cancelled()
             with _HERO_SMS_CACHE_LOCK:
                 cache = _HERO_SMS_CACHE or {}
+                if str(cache.get("activation_id") or "") != str(activation_id):
+                    cache = {}
                 used_codes = set(cache.get("used_codes") or [])
                 attempted_sms_keys = set(cache.get("attempted_sms_keys") or [])
 
@@ -1016,7 +1029,7 @@ class HeroSmsProvider(BaseSmsProvider):
                         logger.debug("HeroSMS status check failed via %s: %s", source, exc)
 
             elapsed = time.time() - start
-            if not openai_resent and elapsed >= 90 and self.openai_resend_callback:
+            if not openai_resent and elapsed >= openai_resend_after and self.openai_resend_callback:
                 try:
                     self.openai_resend_callback()
                 except Exception as exc:
@@ -1032,12 +1045,10 @@ class HeroSmsProvider(BaseSmsProvider):
         return None
 
     def get_code(self, activation_id: str, *, timeout: int = 120) -> str:
-        wait_timeout = timeout
-        with _HERO_SMS_CACHE_LOCK:
-            cache = _HERO_SMS_CACHE or {}
-            if cache and str(cache.get("activation_id")) == str(activation_id):
-                remaining = int(HERO_SMS_PHONE_LIFETIME - (time.time() - float(cache.get("acquired_at") or 0)))
-                wait_timeout = max(timeout, remaining, 60)
+        # The activation lifetime is not a request timeout. Respect the caller's
+        # bound so a missing SMS cannot hold a task (and the global reuse lock)
+        # for the remainder of the 20-minute rental window.
+        wait_timeout = max(1, int(timeout))
         candidate = self.wait_for_code(activation_id, timeout=wait_timeout)
         self.last_code_result = candidate
         return str((candidate or {}).get("code") or "")
@@ -1120,6 +1131,8 @@ class HeroSmsProvider(BaseSmsProvider):
             pass
 
     def mark_send_failed(self, activation_id: str, reason: str = "") -> None:
+        if not self.reuse_phone_to_max:
+            return
         reason_text = str(reason or "").lower()
         if any(keyword in reason_text for keyword in ("limit", "already", "too many", "exceeded", "maximum", "上限", "已达")):
             self._stop_reuse("phone limit reached")
@@ -1223,12 +1236,22 @@ def create_sms_provider(provider_key: str, config: dict) -> BaseSmsProvider:
 class PhoneCallbackController:
     """Callable phone callback with optional lifecycle hooks for advanced providers."""
 
-    def __init__(self, provider_key: str, config: dict, *, service: str, country: str = "", log_fn=None):
+    def __init__(
+        self,
+        provider_key: str,
+        config: dict,
+        *,
+        service: str,
+        country: str = "",
+        log_fn=None,
+        cancel_check: Callable[[], bool] | None = None,
+    ):
         self.provider_key = provider_key
         self.config = dict(config or {})
         self.service = service
         self.country = country
         self.log = log_fn or logger.info
+        self.cancel_check = cancel_check
         self.provider: Optional[BaseSmsProvider] = None
         self.activation: Optional[SmsActivation] = None
         self.phase = "need_number"
@@ -1239,14 +1262,40 @@ class PhoneCallbackController:
     def _provider(self) -> BaseSmsProvider:
         if self.provider is None:
             self.provider = create_sms_provider(self.provider_key, self.config)
+            self.provider.cancel_check = self.cancel_check
         return self.provider
+
+    def _raise_if_cancelled(self) -> None:
+        if callable(self.cancel_check) and self.cancel_check():
+            raise RuntimeError("任务已取消")
+
+    def _requires_verify_lock(self, provider: BaseSmsProvider) -> bool:
+        return (
+            self.provider_key in ("herosms", "herosms_api")
+            and bool(getattr(provider, "reuse_phone_to_max", False))
+        )
+
+    def _acquire_verify_lock(self) -> None:
+        max_wait = max(5, _safe_int(self.config.get("sms_lock_timeout"), 120))
+        deadline = time.monotonic() + max_wait
+        logged = False
+        while True:
+            self._raise_if_cancelled()
+            if _HERO_SMS_VERIFY_LOCK.acquire(timeout=0.5):
+                self._verify_lock_acquired = True
+                return
+            if not logged:
+                self.log("等待可复用号码验证通道...")
+                logged = True
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"短信验证通道等待超时({max_wait}秒)")
 
     def __call__(self) -> str:
         provider = self._provider()
+        self._raise_if_cancelled()
         if self.phase == "need_number":
-            if self.provider_key in ("herosms", "herosms_api", "smsbower", "smsbower_api") and not self._verify_lock_acquired:
-                _HERO_SMS_VERIFY_LOCK.acquire()
-                self._verify_lock_acquired = True
+            if self._requires_verify_lock(provider) and not self._verify_lock_acquired:
+                self._acquire_verify_lock()
 
             # 智能国家选择：如果启用了 auto_select_country，生成多个候选国家逐个租号。
             effective_country = self.country
@@ -1334,8 +1383,9 @@ class PhoneCallbackController:
             return self.activation.phone_number
 
         if self.phase == "need_code" and self.activation:
-            self.log("等待短信验证码...")
-            code = provider.get_code(self.activation.activation_id, timeout=180)
+            code_timeout = min(180, max(15, _safe_int(self.config.get("sms_code_timeout"), 90)))
+            self.log(f"等待短信验证码（最多 {code_timeout} 秒）...")
+            code = provider.get_code(self.activation.activation_id, timeout=code_timeout)
             if code:
                 self.log("收到短信验证码")
                 if getattr(provider, "auto_report_success_on_code", True):
@@ -1409,6 +1459,7 @@ def create_phone_callbacks(
     service: str,
     country: str = "",
     log_fn=None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> tuple:
     """Create (phone_callback, cleanup) tuple for browser registration."""
     controller = PhoneCallbackController(
@@ -1417,5 +1468,6 @@ def create_phone_callbacks(
         service=service,
         country=country,
         log_fn=log_fn,
+        cancel_check=cancel_check,
     )
     return controller, controller.cleanup

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import pytest
+import threading
+import time
 from core.base_sms import (
     HeroSmsProvider,
     SmsActivation,
@@ -77,6 +79,11 @@ class TestCreateSmsProvider:
 
 
 class TestCreatePhoneCallbacks:
+    @pytest.fixture(autouse=True)
+    def isolate_used_phone_registry(self, monkeypatch):
+        monkeypatch.setattr(sms_module, "is_phone_number_used", lambda _number: False)
+        monkeypatch.setattr(sms_module, "mark_phone_number_used", lambda *args, **kwargs: None)
+
     def test_returns_tuple(self):
         # This will fail on actual API call, but we can test the structure
         callback, cleanup = create_phone_callbacks(
@@ -123,8 +130,8 @@ class TestCreatePhoneCallbacks:
         cleanup()
         assert ("get_number", "chatgpt", "us") in events
         assert ("cancel", "act_1") in events
-        assert any("准备租用手机号" in item for item in logs)
-        assert any("已成功租到号码" in item for item in logs)
+        assert any("正在租用手机号" in item for item in logs)
+        assert any("租号成功" in item for item in logs)
         assert any("已释放未使用号码" in item for item in logs)
 
     def test_cleanup_does_not_cancel_after_success(self, monkeypatch):
@@ -237,10 +244,8 @@ class TestCreatePhoneCallbacks:
             country="th",
         )
 
-        with pytest.raises(RuntimeError, match="temporary failure"):
-            callback()
-
         assert callback() == "+66123456789"
+        assert provider.calls == 2
         assert callback() == "654321"
         cleanup()
         assert ("report_success", "act_retry") in events
@@ -263,6 +268,94 @@ class TestCreatePhoneCallbacks:
 
         assert callback._verify_lock_acquired is False
         cleanup()
+
+    def test_herosms_without_reuse_does_not_wait_for_verify_lock(self, monkeypatch):
+        lock_ready = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_lock():
+            with sms_module._HERO_SMS_VERIFY_LOCK:
+                lock_ready.set()
+                release_lock.wait(timeout=2)
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        assert lock_ready.wait(timeout=1)
+
+        class FakeProvider:
+            reuse_phone_to_max = False
+
+            def get_number(self, *, service: str, country: str = ""):
+                return SmsActivation(activation_id="act_parallel", phone_number="+19990000001")
+
+            def cancel(self, activation_id: str) -> bool:
+                return True
+
+        monkeypatch.setattr("core.base_sms.create_sms_provider", lambda provider_key, config: FakeProvider())
+        monkeypatch.setattr("core.base_sms.is_phone_number_used", lambda _number: False)
+        monkeypatch.setattr("core.base_sms.mark_phone_number_used", lambda *args, **kwargs: None)
+
+        callback, cleanup = create_phone_callbacks(
+            "herosms",
+            {"herosms_api_key": "test", "register_reuse_phone_to_max": "false"},
+            service="chatgpt",
+        )
+        try:
+            started = time.monotonic()
+            assert callback() == "+19990000001"
+            assert time.monotonic() - started < 0.5
+            assert callback._verify_lock_acquired is False
+        finally:
+            cleanup()
+            release_lock.set()
+            holder.join(timeout=1)
+
+    def test_reuse_lock_wait_aborts_when_task_is_cancelled(self, monkeypatch):
+        lock_ready = threading.Event()
+        release_lock = threading.Event()
+        cancelled = threading.Event()
+        result: dict[str, object] = {}
+
+        def hold_lock():
+            with sms_module._HERO_SMS_VERIFY_LOCK:
+                lock_ready.set()
+                release_lock.wait(timeout=2)
+
+        class FakeProvider:
+            reuse_phone_to_max = True
+
+            def get_number(self, *, service: str, country: str = ""):
+                raise AssertionError("cancelled waiter must not rent a number")
+
+        monkeypatch.setattr("core.base_sms.create_sms_provider", lambda provider_key, config: FakeProvider())
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        assert lock_ready.wait(timeout=1)
+
+        callback, cleanup = create_phone_callbacks(
+            "herosms",
+            {"herosms_api_key": "test", "register_reuse_phone_to_max": "true"},
+            service="chatgpt",
+            cancel_check=cancelled.is_set,
+        )
+
+        def run_callback():
+            try:
+                callback()
+            except Exception as exc:
+                result["error"] = exc
+
+        worker = threading.Thread(target=run_callback)
+        worker.start()
+        time.sleep(0.1)
+        cancelled.set()
+        worker.join(timeout=1)
+        release_lock.set()
+        holder.join(timeout=1)
+        cleanup()
+
+        assert not worker.is_alive()
+        assert "任务已取消" in str(result.get("error") or "")
 
     def test_mark_send_succeeded_delegates_to_provider(self, monkeypatch):
         events = []
@@ -312,6 +405,53 @@ class TestSmsActivateProviderCountryResolution:
 
 
 class TestHeroSmsProvider:
+    def test_non_reuse_number_request_does_not_wait_for_verify_lock(self, monkeypatch):
+        lock_ready = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_lock():
+            with sms_module._HERO_SMS_VERIFY_LOCK:
+                lock_ready.set()
+                release_lock.wait(timeout=2)
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        assert lock_ready.wait(timeout=1)
+
+        provider = HeroSmsProvider("hero123", reuse_phone_to_max=False)
+        monkeypatch.setattr(provider, "_request_number_raw", lambda service, country: {
+            "activationId": "act_parallel_real",
+            "phoneNumber": "19990000002",
+            "countryPhoneCode": "",
+        })
+        try:
+            started = time.monotonic()
+            activation = provider.get_number(service="chatgpt", country="187")
+            assert time.monotonic() - started < 0.5
+            assert activation.activation_id == "act_parallel_real"
+        finally:
+            release_lock.set()
+            holder.join(timeout=1)
+
+    def test_get_code_respects_caller_timeout_instead_of_activation_lifetime(self, monkeypatch):
+        captured = {}
+        provider = HeroSmsProvider("hero123")
+
+        def fake_wait(activation_id: str, *, timeout: int = 180, poll_interval: int = 3):
+            captured.update(activation_id=activation_id, timeout=timeout)
+            return None
+
+        monkeypatch.setattr(provider, "wait_for_code", fake_wait)
+        assert provider.get_code("act_timeout", timeout=17) == ""
+        assert captured == {"activation_id": "act_timeout", "timeout": 17}
+
+    def test_wait_for_code_checks_task_cancellation_before_polling(self):
+        provider = HeroSmsProvider("hero123")
+        provider.cancel_check = lambda: True
+
+        with pytest.raises(RuntimeError, match="任务已取消"):
+            provider.wait_for_code("act_cancelled", timeout=90)
+
     def test_get_number_uses_v2_json(self, monkeypatch, tmp_path):
         monkeypatch.setattr(sms_module, "hero_sms_cache_file", lambda: tmp_path / ".herosms_phone_cache.json")
         monkeypatch.setattr(sms_module, "_HERO_SMS_CACHE", None)
@@ -336,7 +476,7 @@ class TestHeroSmsProvider:
 
         assert activation.activation_id == "act_1"
         assert activation.phone_number == "+15551234"
-        assert calls[0]["action"] == "getNumberV2"
+        assert [call["action"] for call in calls] == ["getPrices", "getNumberV2"]
 
     def test_get_number_falls_back_to_v1_text(self, monkeypatch, tmp_path):
         monkeypatch.setattr(sms_module, "hero_sms_cache_file", lambda: tmp_path / ".herosms_phone_cache.json")
@@ -365,7 +505,7 @@ class TestHeroSmsProvider:
 
         assert activation.activation_id == "act_2"
         assert activation.phone_number == "+15557654321"
-        assert calls == ["getNumberV2", "getNumber"]
+        assert calls == ["getPrices", "getNumberV2", "getNumber"]
 
     def test_get_code_skips_attempted_sms_event(self, monkeypatch, tmp_path):
         monkeypatch.setattr(sms_module, "hero_sms_cache_file", lambda: tmp_path / ".herosms_phone_cache.json")

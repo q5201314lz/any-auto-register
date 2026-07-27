@@ -66,6 +66,8 @@ from providers.registry import load_all as load_providers
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from services.tun_proxy_bridge import tun_proxy_bridge
+    tun_proxy_bridge.start()
     init_db()
     load_all()
     load_providers()
@@ -89,6 +91,7 @@ async def lifespan(app: FastAPI):
     _task_runtime.stop()
     from services.solver_manager import stop
     stop()
+    tun_proxy_bridge.stop()
 
 
 app = FastAPI(title="Account Manager", version="2.0.0", lifespan=lifespan)
