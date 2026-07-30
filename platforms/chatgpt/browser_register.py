@@ -792,7 +792,7 @@ def _select_sms_phone_channel(page, log) -> bool:
 
 
 def _click_sms_send_button(page, log) -> str | None:
-    """Click an add-phone send button while avoiding WhatsApp-only paths."""
+    """Submit the add-phone form, preferring an explicit SMS control when present."""
     _select_sms_phone_channel(page, log)
     time.sleep(0.3)
     buttons = _visible_button_texts(page)
@@ -822,12 +822,8 @@ def _click_sms_send_button(page, log) -> str | None:
     except Exception:
         pass
 
-    # If the page exposes WhatsApp wording and no SMS button, fail loudly instead of clicking submit.
-    page_text = _get_visible_page_text(page)
-    if re.search(r"whats\s*app|whatsapp", page_text, flags=re.I) and not re.search(r"sms|text message|short message", page_text, flags=re.I):
-        raise RuntimeError("add_phone 页面只显示 WhatsApp 验证，未找到 SMS 发送入口")
-
-    # Fallback: click a submit/continue only if its own text is not WhatsApp.
+    # Fallback: submit/continue the phone form. WhatsApp wording elsewhere on
+    # the initial page is only an available channel, not proof that SMS failed.
     try:
         clicked = page.evaluate(
             """
@@ -873,10 +869,6 @@ def _get_visible_page_text(page) -> str:
 
 def _whatsapp_verification_reason(page_text: str, channel: str = "") -> str:
     """Return a reason only when the page is actively requiring WhatsApp."""
-    normalized_channel = re.sub(r"[^a-z]", "", str(channel or "").lower())
-    if normalized_channel in {"whatsapp", "wa"}:
-        return f"channel={normalized_channel}"
-
     text = re.sub(r"\s+", " ", str(page_text or "")).strip()
     if not re.search(r"whats\s*app|whatsapp", text, flags=re.I):
         return ""
