@@ -1276,6 +1276,12 @@ def _derive_registration_state_from_page(page) -> dict:
 
     otp_selector = _find_first_selector(page, OTP_INPUT_SELECTORS)
     if otp_selector and "password" not in otp_selector:
+        try:
+            page_text = _get_visible_page_text(page).lower()
+        except Exception:
+            page_text = ""
+        if re.search(r"authenticator|multi[- ]?factor|two[- ]?factor|\bmfa\b|\b2fa\b", page_text, flags=re.I):
+            return _build_manual_flow_state("mfa_challenge", current_url)
         return _build_manual_flow_state("email_otp_verification", current_url)
 
     try:
@@ -1507,6 +1513,8 @@ def _infer_page_type(data: dict | None, current_url: str = "") -> str:
         return "create_account_password"
     if "email-verification" in url or "email-otp" in url:
         return "email_otp_verification"
+    if any(token in url for token in ("/mfa", "/totp", "/authenticator", "two-factor", "two_factor")):
+        return "mfa_challenge"
     if "about-you" in url:
         return "about_you"
     if "log-in/password" in url:
@@ -2045,7 +2053,22 @@ def _submit_login_email_via_page(page, email: str, log) -> dict:
     return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "OAuth 邮箱页提交后未跳转"}
 
 
-def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_callback, phone_callback, proxy: str | None, log) -> dict | None:
+def _is_mfa_page_type(page_type: str) -> bool:
+    normalized = str(page_type or "").strip().lower().replace("-", "_").replace("/", "_")
+    return any(token in normalized for token in ("mfa", "totp", "authenticator", "two_factor"))
+
+
+def _do_codex_oauth(
+    page,
+    cookies_dict: dict,
+    email: str,
+    password: str,
+    otp_callback,
+    phone_callback,
+    proxy: str | None,
+    log,
+    mfa_callback=None,
+) -> dict | None:
     """在真实浏览器会话内完成 Codex OAuth，返回完整 token 包。"""
     from .oauth import generate_oauth_url
     from .constants import CODEX_CLIENT_ID, CODEX_REDIRECT_URI, CODEX_SCOPE
@@ -2112,11 +2135,31 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                 continue
 
             if state["page_type"] == "login_password":
-                if not otp_callback:
-                    raise RuntimeError("OAuth 密码验证页需要一次性验证码，但没有 otp_callback")
-                log("  OAuth 遇到密码验证，强制切换一次性验证码登录...")
-                if not _switch_login_password_to_otp(page, log):
-                    raise RuntimeError("OAuth 密码验证页未找到一次性验证码登录入口")
+                if mfa_callback and password:
+                    log("  OAuth 遇到密码验证，账号已配置 MFA，提交登录密码...")
+                    password_resp = _submit_oauth_password_direct(page, password, log)
+                    log(f"  OAuth 登录密码提交状态: {password_resp.get('status', 0)}")
+                    if not password_resp.get("ok"):
+                        raise RuntimeError(f"OAuth 登录密码提交失败: {(password_resp.get('text') or '')[:300]}")
+                else:
+                    if not otp_callback:
+                        raise RuntimeError("OAuth 密码验证页需要一次性验证码，但没有 otp_callback")
+                    log("  OAuth 遇到密码验证，强制切换一次性验证码登录...")
+                    if not _switch_login_password_to_otp(page, log):
+                        raise RuntimeError("OAuth 密码验证页未找到一次性验证码登录入口")
+                continue
+
+            if _is_mfa_page_type(state["page_type"]):
+                if not mfa_callback:
+                    raise RuntimeError("OAuth 需要 MFA 验证，但账号未配置 MFA 密钥")
+                mfa_code = str(mfa_callback() or "").strip()
+                if not mfa_code:
+                    raise RuntimeError("OAuth MFA 验证码生成失败")
+                log("  OAuth 提交 MFA 验证码...")
+                mfa_resp = _submit_otp_via_page(page, mfa_code, log)
+                log(f"  OAuth MFA 提交状态: {mfa_resp.get('status', 0)}")
+                if not mfa_resp.get("ok"):
+                    raise RuntimeError(f"OAuth MFA 校验失败: {(mfa_resp.get('text') or '')[:300]}")
                 continue
 
             if state["page_type"] == "create_account_password":
@@ -3303,7 +3346,7 @@ def _submit_oauth_password_direct(page, password: str, log) -> dict:
         current_url = str(page.url or "")
         state = _derive_registration_state_from_page(page)
         page_type = str(state.get("page_type") or "")
-        if page_type in {"email_otp_verification", "about_you", "consent", "workspace_selection",
+        if _is_mfa_page_type(page_type) or page_type in {"email_otp_verification", "about_you", "consent", "workspace_selection",
                          "organization_selection", "add_phone", "oauth_callback", "chatgpt_home", "external_url"}:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if "code=" in current_url:
@@ -4317,12 +4360,14 @@ class ChatGPTBrowserRegister:
         headless: bool,
         proxy: Optional[str] = None,
         otp_callback: Optional[Callable[[], str]] = None,
+        mfa_callback: Optional[Callable[[], str]] = None,
         phone_callback: Optional[Callable[[], str]] = None,
         log_fn: Callable[[str], None] = print,
     ):
         self.headless = headless
         self.proxy = proxy
         self.otp_callback = otp_callback
+        self.mfa_callback = mfa_callback
         self.phone_callback = phone_callback
         self.log = log_fn
 
@@ -4378,6 +4423,7 @@ class ChatGPTBrowserRegister:
                 result = _do_codex_oauth(
                     page, {}, email, password,
                     self.otp_callback, self.phone_callback, self.proxy, self.log,
+                    mfa_callback=self.mfa_callback,
                 )
                 return result
         except Exception as e:

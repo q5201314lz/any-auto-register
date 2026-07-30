@@ -309,6 +309,7 @@ class RegistrationEngine:
         # 状态变量
         self.email: Optional[str] = None
         self.password: Optional[str] = None  # 注册密码
+        self.totp_secret: Optional[str] = None  # 已注册账号的 MFA Base32 密钥
         self.email_info: Optional[Dict[str, Any]] = None
         self.oauth_start: Optional[OAuthStart] = None
         self.session: Optional[cffi_requests.Session] = None
@@ -1437,8 +1438,9 @@ class RegistrationEngine:
         return otp_page
 
     def _complete_codex_login_password_in_browser(self) -> Optional[Dict[str, Any]]:
-        """Use the real passwordless-login button and finish OAuth in a browser."""
+        """Finish a password challenge via MFA or the passwordless email fallback."""
         try:
+            from core.totp import generate_totp
             from platforms.chatgpt.browser_register import ChatGPTBrowserRegister
 
             def wait_for_browser_otp() -> Optional[str]:
@@ -1448,10 +1450,19 @@ class RegistrationEngine:
                 self._log("Codex login 已确认进入验证码页面，开始读取新邮件")
                 return self._get_verification_code()
 
+            def current_mfa_code() -> Optional[str]:
+                secret = str(getattr(self, "totp_secret", "") or "").strip()
+                if not secret:
+                    return None
+                code = generate_totp(secret)
+                self._log("Codex login 已生成当前 MFA 验证码")
+                return code
+
             browser_flow = ChatGPTBrowserRegister(
                 headless=True,
                 proxy=self.proxy_url,
                 otp_callback=wait_for_browser_otp,
+                mfa_callback=current_mfa_code if getattr(self, "totp_secret", None) else None,
                 phone_callback=self.phone_callback,
                 log_fn=self._log,
             )
@@ -1464,7 +1475,7 @@ class RegistrationEngine:
             if not access_token or not refresh_token:
                 self._last_codex_error = "浏览器 OAuth token 缺少 access_token 或 refresh_token(rt)"
                 return None
-            self._log("Codex login 浏览器一次性验证码 OAuth 已完成")
+            self._log("Codex login 浏览器 OAuth 已完成")
             return token_info
         except Exception as exc:
             self._last_codex_error = f"浏览器一次性验证码 OAuth 失败: {exc}"
@@ -1902,7 +1913,13 @@ class RegistrationEngine:
             self._log(f"处理 OAuth 回调失败: {e}", "error")
             return None
 
-    def login_existing_via_codex_auth(self, *, email: str = "", password: str = "") -> RegistrationResult:
+    def login_existing_via_codex_auth(
+        self,
+        *,
+        email: str = "",
+        password: str = "",
+        totp_secret: str = "",
+    ) -> RegistrationResult:
         """已注册账号入口：只走 Codex OAuth 登录，不走 create-account 注册链路。"""
         result = RegistrationResult(success=False, logs=self.logs)
         try:
@@ -1921,6 +1938,7 @@ class RegistrationEngine:
             if email:
                 self.email = email
             self.password = password or self.password or ""
+            self.totp_secret = totp_secret or getattr(self, "totp_secret", "") or ""
             if not self.email_info:
                 self._log("1. 获取邮箱池账号...")
                 if not self._create_email():

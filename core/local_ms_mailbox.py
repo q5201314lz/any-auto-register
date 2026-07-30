@@ -190,9 +190,10 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
             entries.append(entry)
             continue
 
-        # 常见导出格式有两类：
+        # 常见导出格式有三类：
         # 1) 心蓝/BH 19 列通用格式：邮箱、密码、登录账号、IMAP...、client_id、refresh_token...
         # 2) 简化 OAuth 格式：邮箱----密码----client_id----refresh_token[----totp]
+        # 3) 已注册账号格式：邮箱----OpenAI 密码----MFA Base32 密钥
         # 旧逻辑会把 4 列格式的 refresh_token 误当作 imap_host，随后 socket
         # DNS 解析抛出 "label too long"。这里优先识别简化 OAuth 格式。
         simplified_oauth = False
@@ -206,7 +207,20 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
                 and "." not in maybe_client_id.strip("{}")
             )
 
-        if simplified_oauth:
+        login_with_mfa = False
+        if len(parts) == 3:
+            maybe_totp = re.sub(r"[\s-]+", "", _safe_text(parts[2])).upper()
+            login_with_mfa = bool(re.fullmatch(r"[A-Z2-7]{16,}", maybe_totp))
+
+        if login_with_mfa:
+            entry = LocalMicrosoftMailboxEntry(
+                email=email,
+                password=_safe_text(parts[1]),
+                login_account=email,
+                totp_secret=re.sub(r"[\s-]+", "", _safe_text(parts[2])).upper(),
+                raw=line,
+            )
+        elif simplified_oauth:
             entry = LocalMicrosoftMailboxEntry(
                 email=email,
                 password=_safe_text(parts[1]),
@@ -298,7 +312,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             chunks.append(path.read_text(encoding="utf-8-sig"))
         combined = "\n".join(chunks)
         if not combined.strip():
-            raise RuntimeError("本地邮箱池为空，请粘贴心蓝通用格式、iCloud 接码地址格式或配置文件路径")
+            raise RuntimeError("本地邮箱池为空，请粘贴心蓝格式、邮箱接码地址、密码 + MFA 账号或配置文件路径")
         return combined
 
     def _entries(self) -> list[LocalMicrosoftMailboxEntry]:

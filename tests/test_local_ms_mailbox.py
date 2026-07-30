@@ -8,6 +8,7 @@ from core.local_ms_mailbox import (
     LocalMicrosoftMailboxPool,
     OUTLOOK_IMAP_SCOPE,
     OUTLOOK_TOKEN_URL,
+    parse_xinlan_common_rows,
 )
 
 
@@ -18,6 +19,22 @@ def _entry() -> LocalMicrosoftMailboxEntry:
         client_id="client-id",
         refresh_token="refresh-token",
     )
+
+
+def test_three_column_login_mfa_row_ignores_product_description():
+    entries = parse_xinlan_common_rows(
+        "account@icloud.com----LoginPassword123----JBSWY3DPEHPK3PXP\n"
+        "**商品说明**\n"
+        "MFA验证码获取地址：https://2fa.fun/index.html"
+    )
+
+    assert len(entries) == 1
+    assert entries[0].email == "account@icloud.com"
+    assert entries[0].password == "LoginPassword123"
+    assert entries[0].login_account == "account@icloud.com"
+    assert entries[0].totp_secret == "JBSWY3DPEHPK3PXP"
+    assert not entries[0].graph_ready
+    assert not entries[0].imap_ready
 
 
 def test_outlook_imap_token_uses_consumers_endpoint_and_imap_scope(monkeypatch):

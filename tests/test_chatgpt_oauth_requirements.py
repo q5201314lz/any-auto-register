@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from core.base_platform import RegisterConfig
+from core.totp import generate_totp
 from platforms.chatgpt import browser_register as browser_register_module
+from platforms.chatgpt.protocol_mailbox import ChatGPTProtocolMailboxWorker
 from platforms.chatgpt.plugin import (
     ChatGPTPlatform,
     _assert_complete_oauth_callback,
@@ -108,6 +110,80 @@ def test_codex_oauth_login_password_forces_email_otp(monkeypatch):
     )
 
     assert events == ["switch_to_otp", ("submit_otp", "123456")]
+    assert result["callback_url"].startswith("http://localhost:1455/auth/callback?")
+
+
+def test_generate_totp_matches_rfc_6238_sha1_vector():
+    assert generate_totp(
+        "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+        timestamp=59,
+        digits=8,
+    ) == "94287082"
+
+
+def test_codex_oauth_login_password_uses_configured_mfa(monkeypatch):
+    oauth_start = SimpleNamespace(
+        auth_url="https://auth.openai.com/log-in/password",
+        state="state_123",
+        code_verifier="verifier_123",
+        redirect_uri="http://localhost:1455/auth/callback",
+        client_id="client_123",
+    )
+
+    class FakePage:
+        url = "about:blank"
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+        def evaluate(self, script):
+            return "Test User Agent"
+
+    page = FakePage()
+    events = []
+
+    monkeypatch.setattr("platforms.chatgpt.oauth.generate_oauth_url", lambda **kwargs: oauth_start)
+    monkeypatch.setattr(browser_register_module, "_get_page_oauth_url", lambda page: "")
+    monkeypatch.setattr(
+        browser_register_module,
+        "_derive_oauth_state_from_page",
+        lambda page: {
+            "page_type": "mfa_challenge" if "/mfa" in page.url else "login_password",
+            "continue_url": "",
+        },
+    )
+
+    def submit_password(page, password, log):
+        events.append(("password", password))
+        page.url = "https://auth.openai.com/mfa"
+        return {"ok": True, "status": 200, "text": ""}
+
+    def submit_mfa(page, code, log):
+        events.append(("mfa", code))
+        page.url = "http://localhost:1455/auth/callback?code=code_123&state=state_123"
+        return {"ok": True, "status": 200, "text": ""}
+
+    monkeypatch.setattr(browser_register_module, "_submit_oauth_password_direct", submit_password)
+    monkeypatch.setattr(browser_register_module, "_submit_otp_via_page", submit_mfa)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_submit_callback_result",
+        lambda callback_url, oauth_start, proxy: {"callback_url": callback_url},
+    )
+
+    result = browser_register_module._do_codex_oauth(
+        page,
+        {},
+        "user@example.com",
+        "Secret123!",
+        lambda: "email-code-must-not-be-used",
+        None,
+        None,
+        lambda message: None,
+        mfa_callback=lambda: "123456",
+    )
+
+    assert events == [("password", "Secret123!"), ("mfa", "123456")]
     assert result["callback_url"].startswith("http://localhost:1455/auth/callback?")
 
 
@@ -259,6 +335,45 @@ def test_protocol_mailbox_mapper_rejects_partial_oauth_result():
 
     with pytest.raises(RuntimeError, match=r"OAuth .*refresh_token"):
         adapter.result_mapper(ctx, result)
+
+
+def test_protocol_mailbox_worker_passes_password_and_mfa_credentials():
+    account = SimpleNamespace(
+        email="user@example.com",
+        account_id="user@example.com",
+        extra={
+            "provider_account": {
+                "provider_name": "local_mail_pool",
+                "credentials": {
+                    "password": "Secret123!",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                },
+            },
+            "provider_resource": {"provider_name": "local_mail_pool"},
+        },
+    )
+    mailbox = SimpleNamespace(release_email=lambda *args, **kwargs: False)
+    worker = ChatGPTProtocolMailboxWorker(
+        mailbox=mailbox,
+        mailbox_account=account,
+        provider="local_mail_pool",
+    )
+    captured = {}
+
+    def login_existing(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(success=True)
+
+    worker.engine.login_existing_via_codex_auth = login_existing
+
+    result = worker.run(email=account.email, password="generated-password")
+
+    assert result.success is True
+    assert captured == {
+        "email": "user@example.com",
+        "password": "Secret123!",
+        "totp_secret": "JBSWY3DPEHPK3PXP",
+    }
 
 
 def test_browser_register_run_rejects_session_fallback(monkeypatch):
