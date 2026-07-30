@@ -283,6 +283,68 @@ def test_protocol_password_challenge_uses_browser_passwordless_action(monkeypatc
     assert engine._otp_sent_at is not None
 
 
+def test_mfa_browser_login_disables_email_otp_callback(monkeypatch):
+    engine = object.__new__(RegistrationEngine)
+    engine.email = "user@example.com"
+    engine.password = "Secret123!"
+    engine.totp_secret = "JBSWY3DPEHPK3PXP"
+    engine.proxy_url = None
+    engine.phone_callback = None
+    engine._last_codex_error = ""
+    engine._log = lambda message, level="info": None
+    engine._get_verification_code = lambda: pytest.fail("MFA login must not read mailbox OTP")
+
+    def retry(self, email, password):
+        assert self.otp_callback is None
+        assert callable(self.mfa_callback)
+        assert self.mfa_callback().isdigit()
+        return {"access_token": "at", "refresh_token": "rt"}
+
+    monkeypatch.setattr(browser_register_module.ChatGPTBrowserRegister, "_retry_oauth_fresh_browser", retry)
+
+    token_info = engine._complete_codex_login_password_in_browser()
+
+    assert token_info == {"access_token": "at", "refresh_token": "rt"}
+
+
+def test_existing_mfa_login_bypasses_protocol_email_otp_detection(monkeypatch):
+    engine = object.__new__(RegistrationEngine)
+    engine.logs = []
+    engine.email = "user@example.com"
+    engine.password = "Secret123!"
+    engine.totp_secret = ""
+    engine.email_info = {"email": "user@example.com"}
+    engine.email_service = SimpleNamespace(service_type=SimpleNamespace(value="local_ms_pool"))
+    engine.proxy_url = None
+    engine._last_codex_error = ""
+    engine._is_existing_account = False
+    engine._codex_direct_token_info = None
+    engine._log = lambda message, level="info": None
+    engine._preflight_codex_auth_network = lambda: (True, "ok")
+    engine._debug_log = lambda message, level="info": None
+    engine._acquire_codex_callback = lambda: pytest.fail("MFA login must bypass protocol page detection")
+    engine._complete_codex_login_password_in_browser = lambda: {
+        "email": "user@example.com",
+        "account_id": "acct",
+        "access_token": "at",
+        "refresh_token": "rt",
+        "id_token": "id",
+    }
+    monkeypatch.setattr(
+        "platforms.chatgpt.register.submit_callback_url",
+        lambda **kwargs: pytest.fail("browser token must not be exchanged again"),
+    )
+
+    result = engine.login_existing_via_codex_auth(
+        password="Secret123!",
+        totp_secret="JBSWY3DPEHPK3PXP",
+    )
+
+    assert result.success is True
+    assert result.access_token == "at"
+    assert result.refresh_token == "rt"
+
+
 def test_existing_login_accepts_browser_oauth_token_without_callback_exchange(monkeypatch):
     engine = object.__new__(RegistrationEngine)
     engine.logs = []

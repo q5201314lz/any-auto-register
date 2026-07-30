@@ -1458,17 +1458,18 @@ class RegistrationEngine:
                 self._log("Codex login 已生成当前 MFA 验证码")
                 return code
 
+            has_mfa = bool(str(getattr(self, "totp_secret", "") or "").strip())
             browser_flow = ChatGPTBrowserRegister(
                 headless=True,
                 proxy=self.proxy_url,
-                otp_callback=wait_for_browser_otp,
-                mfa_callback=current_mfa_code if getattr(self, "totp_secret", None) else None,
+                otp_callback=None if has_mfa else wait_for_browser_otp,
+                mfa_callback=current_mfa_code if has_mfa else None,
                 phone_callback=self.phone_callback,
                 log_fn=self._log,
             )
             token_info = browser_flow._retry_oauth_fresh_browser(self.email, self.password)
             if not isinstance(token_info, dict):
-                self._last_codex_error = "浏览器未完成一次性验证码 OAuth"
+                self._last_codex_error = "浏览器 OAuth 未完成"
                 return None
             access_token = str(token_info.get("access_token") or "").strip()
             refresh_token = str(token_info.get("refresh_token") or token_info.get("rt") or "").strip()
@@ -1478,7 +1479,7 @@ class RegistrationEngine:
             self._log("Codex login 浏览器 OAuth 已完成")
             return token_info
         except Exception as exc:
-            self._last_codex_error = f"浏览器一次性验证码 OAuth 失败: {exc}"
+            self._last_codex_error = f"浏览器 OAuth 失败: {exc}"
             self._log(self._last_codex_error, "error")
             return None
 
@@ -1950,9 +1951,18 @@ class RegistrationEngine:
             result.email = self.email or email
             self._is_existing_account = True
 
-            # 2. 直接走 Codex CLI OAuth。该流程会根据 OpenAI 返回的 page_type 决定是否取邮箱 OTP。
-            self._log("2. 走 Codex Auth 获取 OAuth callback...")
-            callback_url = self._acquire_codex_callback()
+            # MFA 导入账号由凭据格式决定登录方式，不能让协议页状态将其降级为邮箱 OTP。
+            if self.totp_secret:
+                self._log("2. 已识别密码 + MFA 账号，固定走密码和 MFA 登录...")
+                token_info = self._complete_codex_login_password_in_browser()
+                if token_info:
+                    self._codex_direct_token_info = token_info
+                    callback_url = "browser-token-ready"
+                else:
+                    callback_url = None
+            else:
+                self._log("2. 走 Codex Auth 获取 OAuth callback...")
+                callback_url = self._acquire_codex_callback()
             if not callback_url:
                 if self._last_codex_error:
                     result.error_message = f"Codex Auth 未获取到 callback URL: {self._last_codex_error}"

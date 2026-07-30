@@ -2002,7 +2002,13 @@ def _derive_oauth_state_from_page(page) -> dict:
     return _extract_flow_state(None, current_url)
 
 
-def _submit_login_email_via_page(page, email: str, log) -> dict:
+def _submit_login_email_via_page(
+    page,
+    email: str,
+    log,
+    *,
+    allow_passwordless: bool = True,
+) -> dict:
     input_selector = _wait_for_any_selector(page, EMAIL_INPUT_SELECTORS, timeout=15)
     if not input_selector:
         raise RuntimeError("OAuth 邮箱页未找到输入框")
@@ -2025,7 +2031,7 @@ def _submit_login_email_via_page(page, email: str, log) -> dict:
     while time.time() < deadline:
         current_url = str(page.url or "")
         last_url = current_url or last_url
-        if _click_passwordless_login_if_available(page, log, context="OAuth 邮箱页提交后"):
+        if allow_passwordless and _click_passwordless_login_if_available(page, log, context="OAuth 邮箱页提交后"):
             time.sleep(0.5)
             continue
         state = _derive_oauth_state_from_page(page)
@@ -2128,7 +2134,12 @@ def _do_codex_oauth(
 
             if state["page_type"] == "login_email":
                 log("  OAuth 页面需要邮箱登录，提交邮箱...")
-                email_resp = _submit_login_email_via_page(page, email, log)
+                email_resp = _submit_login_email_via_page(
+                    page,
+                    email,
+                    log,
+                    allow_passwordless=not bool(mfa_callback and password),
+                )
                 log(f"  OAuth 邮箱页提交状态: {email_resp.get('status', 0)}")
                 if not email_resp.get("ok"):
                     raise RuntimeError(f"OAuth 邮箱页提交失败: {(email_resp.get('text') or '')[:300]}")
