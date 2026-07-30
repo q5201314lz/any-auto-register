@@ -37,6 +37,28 @@ def test_three_column_login_mfa_row_ignores_product_description():
     assert not entries[0].imap_ready
 
 
+def test_pipe_login_mfa_row_preserves_plus_email_and_password_spaces():
+    entries = parse_xinlan_common_rows(
+        "x+y@icloud.com| password with spaces |JBSWY3DPEHPK3PXP\n"
+        "登录教程：https://example.com"
+    )
+
+    assert len(entries) == 1
+    assert entries[0].email == "x+y@icloud.com"
+    assert entries[0].password == " password with spaces "
+    assert entries[0].totp_secret == "JBSWY3DPEHPK3PXP"
+
+
+def test_pipe_login_mfa_row_uses_first_and_last_separator():
+    entries = parse_xinlan_common_rows(
+        "account@icloud.com|password|with|pipes|JBSWY3DPEHPK3PXP"
+    )
+
+    assert len(entries) == 1
+    assert entries[0].password == "password|with|pipes"
+    assert entries[0].totp_secret == "JBSWY3DPEHPK3PXP"
+
+
 def test_outlook_imap_token_uses_consumers_endpoint_and_imap_scope(monkeypatch):
     captured = {}
 

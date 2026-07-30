@@ -193,14 +193,14 @@ _BUILTIN_DEFINITIONS: list[dict] = [
                 "label": "账号池文件路径",
                 "placeholder": "/Users/you/mail-pool.txt",
                 "category": "connection",
-                "hint": "可选；每行一条账号。支持心蓝邮箱格式、邮箱----接码地址、邮箱----OpenAI密码----MFA密钥。",
+                "hint": "可选；每行一条账号。支持心蓝格式、邮箱----接码地址、邮箱----密码----MFA、邮箱|密码|2FA。",
             },
             {
                 "key": "local_ms_pool_text",
                 "label": "账号池文本",
                 "type": "textarea",
                 "category": "auth",
-                "hint": "可选；直接粘贴账号池。支持心蓝格式、邮箱----接码地址，以及已注册账号格式：邮箱----OpenAI密码----MFA密钥。说明文字会自动忽略。",
+                "hint": "可选；直接粘贴账号池。已注册账号支持 邮箱----密码----MFA 或 邮箱|密码|2FA；密码空格会保留，说明文字会自动忽略。",
             },
             {
                 "key": "local_ms_graph_scope",

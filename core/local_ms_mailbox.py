@@ -132,6 +132,10 @@ def split_xinlan_common_line(line: str) -> list[str]:
         return []
     if "----" in text:
         return [item.strip() for item in text.split("----")]
+    if text.count("|") >= 2:
+        email, _, password_and_totp = text.partition("|")
+        password, _, totp_secret = password_and_totp.rpartition("|")
+        return [email.strip(), password, totp_secret.strip()]
     if "\t" in text:
         return [item.strip() for item in text.split("\t")]
     if "，" in text:
@@ -193,7 +197,7 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
         # 常见导出格式有三类：
         # 1) 心蓝/BH 19 列通用格式：邮箱、密码、登录账号、IMAP...、client_id、refresh_token...
         # 2) 简化 OAuth 格式：邮箱----密码----client_id----refresh_token[----totp]
-        # 3) 已注册账号格式：邮箱----OpenAI 密码----MFA Base32 密钥
+        # 3) 已注册账号格式：邮箱----OpenAI 密码----MFA，或 邮箱|OpenAI 密码|MFA
         # 旧逻辑会把 4 列格式的 refresh_token 误当作 imap_host，随后 socket
         # DNS 解析抛出 "label too long"。这里优先识别简化 OAuth 格式。
         simplified_oauth = False
@@ -213,9 +217,12 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
             login_with_mfa = bool(re.fullmatch(r"[A-Z2-7]{16,}", maybe_totp))
 
         if login_with_mfa:
+            # `|` 货商格式可能包含有意义的密码空格；只清理邮箱和 MFA，
+            # 密码保留第一个与最后一个 `|` 之间的原始内容。
+            preserve_password_spaces = "----" not in line and line.count("|") >= 2
             entry = LocalMicrosoftMailboxEntry(
                 email=email,
-                password=_safe_text(parts[1]),
+                password=str(parts[1]) if preserve_password_spaces else _safe_text(parts[1]),
                 login_account=email,
                 totp_secret=re.sub(r"[\s-]+", "", _safe_text(parts[2])).upper(),
                 raw=line,
