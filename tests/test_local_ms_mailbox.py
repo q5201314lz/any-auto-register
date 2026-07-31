@@ -89,6 +89,21 @@ def test_four_hyphen_icloud_relay_format_remains_supported():
     assert entries[0].icloud_api_ready
 
 
+def test_many_hyphen_icloud_relay_row_preserves_fragment_url():
+    entries = parse_xinlan_common_rows(
+        "bottles_ballots.5j@icloud.com----------------"
+        "http://2.27.174.158:4173/check.html#mls_IYANC1AhhKaiPLpxyQgavX1TlFaJ8o4XrNl33J2GSfc"
+    )
+
+    assert len(entries) == 1
+    assert entries[0].email == "bottles_ballots.5j@icloud.com"
+    assert entries[0].icloud_api_url == (
+        "http://2.27.174.158:4173/check.html#"
+        "mls_IYANC1AhhKaiPLpxyQgavX1TlFaJ8o4XrNl33J2GSfc"
+    )
+    assert entries[0].icloud_api_ready
+
+
 def test_icloud_relay_message_id_ignores_dynamic_page_markup(monkeypatch):
     class Response:
         status_code = 200

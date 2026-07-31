@@ -6,7 +6,7 @@ The importer accepts:
   refresh token are read through Microsoft Graph; rows without OAuth material
   fall back to IMAP only when inbound server fields are present and usable.
 * iCloud relay rows in the form: email@icloud.com---https://.../email@icloud.com
-  (three or four hyphens are accepted as the separator).
+  (three or more hyphens are accepted as the separator).
 """
 
 from __future__ import annotations
@@ -131,12 +131,15 @@ def split_xinlan_common_line(line: str) -> list[str]:
     text = str(line or "").strip().strip("\ufeff")
     if not text:
         return []
+    relay_match = re.fullmatch(
+        r"(?P<email>\S+@\S+?)-{3,}(?P<url>https?://\S+)",
+        text,
+        flags=re.I,
+    )
+    if relay_match:
+        return [relay_match.group("email"), relay_match.group("url")]
     if "----" in text:
         return [item.strip() for item in text.split("----")]
-    if "---" in text:
-        email, separator, relay_url = text.partition("---")
-        if separator and relay_url.strip().lower().startswith(("http://", "https://")):
-            return [email.strip(), relay_url.strip()]
     if text.count("|") >= 2:
         email, _, password_and_totp = text.partition("|")
         password, _, totp_secret = password_and_totp.rpartition("|")
@@ -179,7 +182,7 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
 
         # iCloud 接码地址格式：
         #   cracked-xxx@icloud.com---https://icloud-api.top/show/.../cracked-xxx@icloud.com
-        # 三个或四个连字符均支持。
+        # 三个及以上连字符均支持。
         # 只有两列且第二列是 URL 时，不按心蓝 19 列格式解释，避免把 URL 当密码/IMAP 字段。
         icloud_api_row = (
             len(parts) >= 2

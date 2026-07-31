@@ -515,7 +515,7 @@ function RegisterModal({
                     <div className="flex items-center justify-between gap-3">
                       <div>
                         <div className="text-sm font-semibold text-[var(--text-primary)]">邮箱池</div>
-                        <div className="mt-1 text-xs text-[var(--text-muted)]">每行一个账号，支持心蓝格式、邮箱---/----接码地址、邮箱----密码----MFA、邮箱|密码|2FA。</div>
+                        <div className="mt-1 text-xs text-[var(--text-muted)]">每行一个账号，接码地址支持邮箱后用3个及以上连字符分隔；另支持心蓝、密码/MFA格式。</div>
                       </div>
                       <Badge variant="secondary">{mailPoolLineCount} 行</Badge>
                     </div>
