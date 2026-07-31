@@ -725,7 +725,10 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             headers={
                 "accept": "application/json,text/html,text/plain,*/*",
                 "user-agent": "Mozilla/5.0",
+                "cache-control": "no-cache, no-store",
+                "pragma": "no-cache",
             },
+            params={"_": time.time_ns()},
             proxies=self.proxy,
             timeout=25,
         )
@@ -782,8 +785,13 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             if messages:
                 return messages
 
+        # Relay pages can contain per-request nonces or dynamic scripts. Hashing
+        # the raw page would make the same old OTP look like a new message on
+        # every poll. Use the visible mail text so the ID changes only when the
+        # displayed message (including its OTP) actually changes.
+        stable_text = re.sub(r"\s+", " ", self._clean_search_text(text)).strip()
         return [{
-            "id": self._stable_message_id(entry.email, text),
+            "id": self._stable_message_id(entry.email, stable_text or text),
             "subject": "",
             "bodyPreview": text,
             "receivedDateTime": "",

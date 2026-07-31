@@ -89,6 +89,47 @@ def test_four_hyphen_icloud_relay_format_remains_supported():
     assert entries[0].icloud_api_ready
 
 
+def test_icloud_relay_message_id_ignores_dynamic_page_markup(monkeypatch):
+    class Response:
+        status_code = 200
+        headers = {"content-type": "text/html; charset=utf-8"}
+
+        def __init__(self, nonce: str, code: str):
+            self.text = (
+                f"<html><script nonce='{nonce}'>window.requestId='{nonce}'</script>"
+                "<p>Your temporary ChatGPT login code</p>"
+                f"<p>Enter this temporary verification code to continue: {code}</p></html>"
+            )
+
+    responses = iter([
+        Response("dynamic-a", "111111"),
+        Response("dynamic-b", "111111"),
+        Response("dynamic-c", "222222"),
+    ])
+    captured = []
+
+    def fake_get(url, **kwargs):
+        captured.append((url, kwargs))
+        return next(responses)
+
+    monkeypatch.setattr("core.local_ms_mailbox.requests.get", fake_get)
+    entry = LocalMicrosoftMailboxEntry(
+        email="account@icloud.com",
+        receive_provider="icloud_api",
+        icloud_api_url="https://mail.example.com/show/token/account@icloud.com",
+    )
+    mailbox = LocalMicrosoftMailboxPool()
+
+    old_first = mailbox._icloud_api_messages(entry)[0]
+    old_second = mailbox._icloud_api_messages(entry)[0]
+    new_message = mailbox._icloud_api_messages(entry)[0]
+
+    assert old_first["id"] == old_second["id"]
+    assert new_message["id"] != old_first["id"]
+    assert captured[0][1]["headers"]["cache-control"] == "no-cache, no-store"
+    assert "_" in captured[0][1]["params"]
+
+
 def test_outlook_imap_token_uses_consumers_endpoint_and_imap_scope(monkeypatch):
     captured = {}
 
