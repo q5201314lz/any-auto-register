@@ -59,6 +59,36 @@ def test_pipe_login_mfa_row_uses_first_and_last_separator():
     assert entries[0].totp_secret == "JBSWY3DPEHPK3PXP"
 
 
+def test_three_hyphen_icloud_relay_rows_preserve_email_and_code_url():
+    entries = parse_xinlan_common_rows(
+        "odds.04alibi+hfi0vu5u890a8x24@icloud.com---"
+        "https://mail.20000408.xyz/show/token/odds.04alibi%2Bhfi0vu5u890a8x24@icloud.com\n"
+        "frame-squawk4r@icloud.com---"
+        "https://mail.20000408.xyz/show/token/frame-squawk4r@icloud.com"
+    )
+
+    assert len(entries) == 2
+    assert entries[0].email == "odds.04alibi+hfi0vu5u890a8x24@icloud.com"
+    assert entries[0].receive_provider == "icloud_api"
+    assert entries[0].icloud_api_url == (
+        "https://mail.20000408.xyz/show/token/"
+        "odds.04alibi%2Bhfi0vu5u890a8x24@icloud.com"
+    )
+    assert entries[0].icloud_api_ready
+    assert entries[1].email == "frame-squawk4r@icloud.com"
+    assert entries[1].icloud_api_ready
+
+
+def test_four_hyphen_icloud_relay_format_remains_supported():
+    entries = parse_xinlan_common_rows(
+        "account@icloud.com----https://mail.example.com/show/token/account@icloud.com"
+    )
+
+    assert len(entries) == 1
+    assert entries[0].email == "account@icloud.com"
+    assert entries[0].icloud_api_ready
+
+
 def test_outlook_imap_token_uses_consumers_endpoint_and_imap_scope(monkeypatch):
     captured = {}
 
