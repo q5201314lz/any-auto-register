@@ -26,7 +26,7 @@ from email.utils import parsedate_to_datetime
 from email.header import decode_header
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 
@@ -720,21 +720,72 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         material = "\n".join(str(part or "") for part in parts)
         return hashlib.sha256(material.encode("utf-8", errors="ignore")).hexdigest()[:24]
 
+    @staticmethod
+    def _mailroom_public_endpoint(url: str) -> tuple[str, str] | None:
+        parsed = urlparse(str(url or "").strip())
+        if not parsed.fragment or not parsed.path.rstrip("/").endswith("/check.html"):
+            return None
+        fragment = unquote(parsed.fragment).strip()
+        if fragment.startswith("token="):
+            fragment = str((parse_qs(fragment).get("token") or [""])[0]).strip()
+        if not fragment or len(fragment) > 2048 or re.search(r"[\s/\\]", fragment):
+            return None
+        return f"{parsed.scheme}://{parsed.netloc}/public-api/v1/check", fragment
+
+    @staticmethod
+    def _json_code_values(payload: Any) -> list[str]:
+        if not isinstance(payload, dict):
+            return []
+        containers = [payload]
+        for key in ("data", "result"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                containers.append(value)
+        codes: list[str] = []
+        for container in containers:
+            for key in ("codes", "verificationCodes", "verification_codes", "verificationCode", "verification_code"):
+                value = container.get(key)
+                values = value if isinstance(value, list) else [value]
+                for item in values:
+                    if isinstance(item, dict):
+                        item = item.get("code") or item.get("value") or item.get("text")
+                    text = str(item or "").strip()
+                    if text and text not in codes:
+                        codes.append(text)
+        return codes
+
     def _icloud_api_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
         if not entry.icloud_api_ready:
             raise RuntimeError(f"iCloud 邮箱缺少接码地址: {entry.email}")
-        response = requests.get(
-            entry.icloud_api_url,
-            headers={
-                "accept": "application/json,text/html,text/plain,*/*",
-                "user-agent": "Mozilla/5.0",
-                "cache-control": "no-cache, no-store",
-                "pragma": "no-cache",
-            },
-            params={"_": time.time_ns()},
-            proxies=self.proxy,
-            timeout=25,
-        )
+        mailroom_endpoint = self._mailroom_public_endpoint(entry.icloud_api_url)
+        headers = {
+            "accept": "application/json,text/html,text/plain,*/*",
+            "user-agent": "Mozilla/5.0",
+            "cache-control": "no-cache, no-store",
+            "pragma": "no-cache",
+        }
+        if mailroom_endpoint:
+            api_url, share_token = mailroom_endpoint
+            response = requests.post(
+                api_url,
+                headers={
+                    "accept": "application/json",
+                    "authorization": f"Bearer {share_token}",
+                    "user-agent": headers["user-agent"],
+                    "cache-control": headers["cache-control"],
+                    "pragma": headers["pragma"],
+                },
+                proxies=self.proxy,
+                timeout=25,
+            )
+        else:
+            response = requests.get(
+                entry.icloud_api_url,
+                headers=headers,
+                params={"_": time.time_ns()},
+                proxies=self.proxy,
+                timeout=25,
+            )
         if response.status_code != 200:
             raise RuntimeError(f"iCloud 接码地址读取失败: HTTP {response.status_code} {response.text[:200]}")
 
@@ -756,9 +807,10 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                     payload = None
 
         if payload is not None:
+            explicit_code_text = " ".join(self._json_code_values(payload))
             for item in self._json_message_candidates(payload):
                 if not isinstance(item, dict):
-                    body = str(item or "")
+                    body = " ".join(value for value in (str(item or ""), explicit_code_text) if value)
                     if body:
                         messages.append({
                             "id": self._stable_message_id(entry.email, body),
@@ -774,11 +826,14 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                         subject,
                         self._first_json_text(item, ("body", "content", "html", "text", "message", "mail_text", "mail_content")),
                         self._first_json_text(item, ("from", "sender", "from_email")),
+                        explicit_code_text,
                     )
                     if value
                 )
                 received = self._first_json_text(item, ("receivedDateTime", "created_at", "createdAt", "date", "time", "timestamp"))
                 mid = self._first_json_text(item, ("id", "mail_id", "message_id", "uid"))
+                if mailroom_endpoint:
+                    mid = self._stable_message_id(entry.email, mid, subject, body, received)
                 messages.append({
                     "id": mid or self._stable_message_id(entry.email, subject, body, received),
                     "subject": subject,
@@ -876,11 +931,21 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         seen = set(before_ids or [])
         pattern = re.compile(code_pattern or r"(?<!#)(?<!\d)(\d{6})(?!\d)")
         start = time.time()
+        try:
+            entry = self._entry_for_account(account)
+            poll_interval = 10 if self._mailroom_public_endpoint(entry.icloud_api_url) else 5
+        except Exception:
+            poll_interval = 5
         # Microsoft Graph 的 receivedDateTime 与本机触发时间之间可能有 1-2 秒偏差，
         # 给少量宽限；但仍然拒绝明显早于本次 OTP 发送的旧验证码。
         min_received_ts = (float(otp_sent_at) - 15.0) if otp_sent_at else 0.0
         while time.time() - start < timeout:
-            for mail in self._messages(account):
+            try:
+                mails = self._messages(account)
+            except Exception:
+                time.sleep(poll_interval)
+                continue
+            for mail in mails:
                 mid = self._message_id(mail)
                 if mid and mid in seen:
                     continue
@@ -901,7 +966,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                     return code
                 if mid:
                     seen.add(mid)
-            time.sleep(5)
+            time.sleep(poll_interval)
         raise TimeoutError(f"等待验证码超时 ({timeout}s)")
 
     def wait_for_link(

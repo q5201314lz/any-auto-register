@@ -104,6 +104,47 @@ def test_many_hyphen_icloud_relay_row_preserves_fragment_url():
     assert entries[0].icloud_api_ready
 
 
+def test_mailroom_fragment_link_calls_public_api_and_reads_root_code(monkeypatch):
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json; charset=utf-8"}
+        text = ""
+
+        def __init__(self, code: str):
+            self.code = code
+
+        def json(self):
+            return {
+                "ok": True,
+                "codes": [self.code],
+                "messages": [{"id": "1", "body": "success"}],
+            }
+
+    responses = iter([Response("111111"), Response("222222")])
+    captured = []
+
+    def fake_post(url, **kwargs):
+        captured.append((url, kwargs))
+        return next(responses)
+
+    monkeypatch.setattr("core.local_ms_mailbox.requests.post", fake_post)
+    entry = LocalMicrosoftMailboxEntry(
+        email="account@icloud.com",
+        receive_provider="icloud_api",
+        icloud_api_url="http://mail.example.com/check.html#mls_share-token",
+    )
+    mailbox = LocalMicrosoftMailboxPool()
+
+    first = mailbox._icloud_api_messages(entry)[0]
+    second = mailbox._icloud_api_messages(entry)[0]
+
+    assert captured[0][0] == "http://mail.example.com/public-api/v1/check"
+    assert captured[0][1]["headers"]["authorization"] == "Bearer mls_share-token"
+    assert "111111" in first["bodyPreview"]
+    assert "222222" in second["bodyPreview"]
+    assert first["id"] != second["id"]
+
+
 def test_icloud_relay_message_id_ignores_dynamic_page_markup(monkeypatch):
     class Response:
         status_code = 200
