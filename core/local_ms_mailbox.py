@@ -118,6 +118,7 @@ class LocalMicrosoftMailboxEntry:
     client_id: str = ""
     refresh_token: str = ""
     totp_secret: str = ""
+    totp_url: str = ""
     login_mode: str = ""
     receive_provider: str = "microsoft"
     icloud_api_url: str = ""
@@ -145,7 +146,7 @@ class LocalMicrosoftMailboxEntry:
 
     @property
     def existing_login_ready(self) -> bool:
-        return bool(self.password and self.totp_secret)
+        return bool(self.password and (self.totp_secret or self.totp_url))
 
     @property
     def usable_ready(self) -> bool:
@@ -171,6 +172,7 @@ class LocalMicrosoftMailboxEntry:
             "recovery_email": self.recovery_email,
             "recovery_password": self.recovery_password,
             "totp_secret": self.totp_secret,
+            "totp_url": self.totp_url,
             "login_mode": self.login_mode,
             "receive_provider": self.receive_provider,
             "icloud_api_url": self.icloud_api_url,
@@ -202,6 +204,18 @@ def split_xinlan_common_line(line: str) -> list[str]:
         hyphen_parts = text.split("----")
         if all(part.strip() for part in hyphen_parts):
             return [item.strip() for item in hyphen_parts]
+    # Some account exports use exactly three hyphens for four fields:
+    # email---password---MFA secret---old access-token JWT. Preserve all four
+    # fields before the legacy variable-separator matcher collapses the middle.
+    triple_parts = text.split("---")
+    if len(triple_parts) == 4 and "@" in triple_parts[0]:
+        maybe_totp = re.sub(r"[\s-]+", "", triple_parts[2]).upper()
+        maybe_access_token = triple_parts[3].strip()
+        if (
+            re.fullmatch(r"[A-Z2-7]{16,}", maybe_totp)
+            and re.fullmatch(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", maybe_access_token)
+        ):
+            return [item.strip() for item in triple_parts]
     relay_match = re.fullmatch(
         r"(?P<email>\S+@\S+?)-{3,}(?P<url>https?://\S+)",
         text,
@@ -225,7 +239,6 @@ def split_xinlan_common_line(line: str) -> list[str]:
     # decide whether it is a password, an inbox token, or a provider-specific
     # secret.
     if text.count("---") >= 2 and "@" in text.split("---", 1)[0]:
-        triple_parts = text.split("---")
         if len(triple_parts) >= 3 and all(part.strip() for part in triple_parts):
             return [triple_parts[0].strip(), "---".join(triple_parts[1:-1]).strip(), triple_parts[-1].strip()]
     if text.count("|") >= 2:
@@ -308,6 +321,8 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
         # 2) 简化 OAuth 格式：邮箱----密码----client_id----refresh_token[----totp]
         # 3) 已注册账号格式：邮箱----OpenAI 密码----MFA，或 邮箱|OpenAI 密码|MFA
         # 4) 密码登录 + 接码地址：邮箱----OpenAI 密码----接码 URL
+        # 5) 密码登录 + 接码地址 + MFA 地址：邮箱----密码----接码 URL----2FA URL
+        # 6) 已登录导出格式：邮箱---密码---MFA---旧 access_token
         # 旧逻辑会把 4 列格式的 refresh_token 误当作 imap_host，随后 socket
         # DNS 解析抛出 "label too long"。这里优先识别简化 OAuth 格式。
         simplified_oauth = False
@@ -325,12 +340,35 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
             len(parts) == 3
             and _looks_like_http_url(_safe_text(parts[2]))
         )
+        password_with_inbox_and_totp_url = (
+            len(parts) == 4
+            and _looks_like_http_url(_safe_text(parts[2]))
+            and _looks_like_http_url(_safe_text(parts[3]))
+        )
         login_with_mfa = False
-        if len(parts) == 3:
+        login_with_mfa_and_access_token = False
+        if len(parts) in (3, 4):
             maybe_totp = re.sub(r"[\s-]+", "", _safe_text(parts[2])).upper()
             login_with_mfa = bool(re.fullmatch(r"[A-Z2-7]{16,}", maybe_totp))
+            if len(parts) == 4:
+                maybe_access_token = _safe_text(parts[3])
+                login_with_mfa_and_access_token = bool(
+                    login_with_mfa
+                    and re.fullmatch(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", maybe_access_token)
+                )
 
-        if password_with_inbox:
+        if password_with_inbox_and_totp_url:
+            entry = LocalMicrosoftMailboxEntry(
+                email=email,
+                password=_safe_text(parts[1]),
+                login_account=email,
+                totp_url=_safe_text(parts[3]),
+                login_mode="password_mfa_url",
+                receive_provider="icloud_api",
+                icloud_api_url=_safe_text(parts[2]),
+                raw=line,
+            )
+        elif password_with_inbox:
             entry = LocalMicrosoftMailboxEntry(
                 email=email,
                 password=_safe_text(parts[1]),
@@ -340,7 +378,7 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
                 icloud_api_url=_safe_text(parts[2]),
                 raw=line,
             )
-        elif login_with_mfa:
+        elif login_with_mfa and (len(parts) == 3 or login_with_mfa_and_access_token):
             # `|` 货商格式可能包含有意义的密码空格；只清理邮箱和 MFA，
             # 密码保留第一个与最后一个 `|` 之间的原始内容。
             preserve_password_spaces = "----" not in line and line.count("|") >= 2
@@ -851,6 +889,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 recovery_email=str(credentials.get("recovery_email") or ""),
                 recovery_password=str(credentials.get("recovery_password") or ""),
                 totp_secret=str(credentials.get("totp_secret") or ""),
+                totp_url=str(credentials.get("totp_url") or ""),
                 login_mode=str(credentials.get("login_mode") or ""),
                 receive_provider=str(credentials.get("receive_provider") or "microsoft"),
                 icloud_api_url=str(credentials.get("icloud_api_url") or ""),

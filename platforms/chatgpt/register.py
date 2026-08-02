@@ -310,6 +310,7 @@ class RegistrationEngine:
         self.email: Optional[str] = None
         self.password: Optional[str] = None  # 注册密码
         self.totp_secret: Optional[str] = None  # 已注册账号的 MFA Base32 密钥
+        self.totp_url: Optional[str] = None  # 已注册账号的 MFA 在线取码地址
         self.email_info: Optional[Dict[str, Any]] = None
         self.oauth_start: Optional[OAuthStart] = None
         self.session: Optional[cffi_requests.Session] = None
@@ -1593,7 +1594,7 @@ class RegistrationEngine:
     def _complete_codex_login_password_in_browser(self) -> Optional[Dict[str, Any]]:
         """Finish a password challenge via MFA or the passwordless email fallback."""
         try:
-            from core.totp import generate_totp
+            from core.totp import fetch_totp_code, generate_totp
             from platforms.chatgpt.browser_register import ChatGPTBrowserRegister
 
             def wait_for_browser_otp() -> Optional[str]:
@@ -1605,13 +1606,21 @@ class RegistrationEngine:
 
             def current_mfa_code() -> Optional[str]:
                 secret = str(getattr(self, "totp_secret", "") or "").strip()
+                totp_url = str(getattr(self, "totp_url", "") or "").strip()
+                if totp_url:
+                    code = fetch_totp_code(totp_url, proxy_url=self.proxy_url)
+                    self._log("Codex login 已从 MFA 地址获取当前验证码")
+                    return code
                 if not secret:
                     return None
                 code = generate_totp(secret)
                 self._log("Codex login 已生成当前 MFA 验证码")
                 return code
 
-            has_mfa = bool(str(getattr(self, "totp_secret", "") or "").strip())
+            has_mfa = bool(
+                str(getattr(self, "totp_secret", "") or "").strip()
+                or str(getattr(self, "totp_url", "") or "").strip()
+            )
             browser_flow = ChatGPTBrowserRegister(
                 headless=True,
                 proxy=self.proxy_url,
@@ -2055,6 +2064,7 @@ class RegistrationEngine:
         email: str = "",
         password: str = "",
         totp_secret: str = "",
+        totp_url: str = "",
     ) -> RegistrationResult:
         """已注册账号入口：只走 Codex OAuth 登录，不走 create-account 注册链路。"""
         result = RegistrationResult(success=False, logs=self.logs)
@@ -2075,6 +2085,7 @@ class RegistrationEngine:
                 self.email = email
             self.password = password or self.password or ""
             self.totp_secret = totp_secret or getattr(self, "totp_secret", "") or ""
+            self.totp_url = totp_url or getattr(self, "totp_url", "") or ""
             if not self.email_info:
                 self._log("1. 获取邮箱池账号...")
                 if not self._create_email():
@@ -2087,7 +2098,7 @@ class RegistrationEngine:
             self._is_existing_account = True
 
             # MFA 导入账号由凭据格式决定登录方式，不能让协议页状态将其降级为邮箱 OTP。
-            if self.totp_secret:
+            if self.totp_secret or self.totp_url:
                 self._log("2. 已识别密码 + MFA 账号，固定走密码和 MFA 登录...")
                 token_info = self._complete_codex_login_password_in_browser()
                 if token_info:

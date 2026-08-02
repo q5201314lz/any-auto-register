@@ -84,6 +84,30 @@ def test_pipe_login_mfa_row_ignores_trailing_account_status(tmp_path):
     assert credentials["totp_secret"] == "TZ75BLYLJZWSN2SLXM6POOEUGTL26ZOI"
 
 
+def test_hyphen_login_mfa_row_ignores_trailing_access_token(tmp_path):
+    pool_text = (
+        "user@gmail.com---Password123!---TZ75BLYLJZWSN2SLXM6POOEUGTL26ZOI---"
+        "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature"
+    )
+    entries = parse_xinlan_common_rows(pool_text)
+
+    assert len(entries) == 1
+    assert entries[0].email == "user@gmail.com"
+    assert entries[0].password == "Password123!"
+    assert entries[0].totp_secret == "TZ75BLYLJZWSN2SLXM6POOEUGTL26ZOI"
+    assert entries[0].login_mode == "password_mfa"
+    assert not entries[0].graph_ready
+    assert entries[0].existing_login_ready
+
+    account = LocalMicrosoftMailboxPool(
+        pool_text=pool_text,
+        state_file=str(tmp_path / "mailbox-state.json"),
+    ).get_email()
+    credentials = account.extra["provider_account"]["credentials"]
+    assert credentials["password"] == "Password123!"
+    assert credentials["totp_secret"] == "TZ75BLYLJZWSN2SLXM6POOEUGTL26ZOI"
+
+
 def test_password_login_row_with_inbox_url_keeps_both_capabilities(tmp_path):
     row = (
         "adults-tarpons1q@icloud.com----redacted-password@@----"
@@ -103,6 +127,31 @@ def test_password_login_row_with_inbox_url_keeps_both_capabilities(tmp_path):
     credentials = account.extra["provider_account"]["credentials"]
     assert credentials["login_mode"] == "password_or_email_otp"
     assert credentials["icloud_api_url"].endswith("/token")
+
+
+def test_password_login_row_with_inbox_and_totp_urls_keeps_all_capabilities(tmp_path):
+    row = (
+        "account@icloud.com----redacted-password----"
+        "https://mail.example/inbox?email=account%40icloud.com&token=mail-token----"
+        "https://2fa.example/view?token=totp-token&email=account%40icloud.com"
+    )
+    entries = parse_xinlan_common_rows(row)
+
+    assert len(entries) == 1
+    assert entries[0].password == "redacted-password"
+    assert entries[0].login_mode == "password_mfa_url"
+    assert entries[0].icloud_api_url.startswith("https://mail.example/inbox?")
+    assert entries[0].totp_url.startswith("https://2fa.example/view?")
+    assert entries[0].icloud_api_ready
+    assert entries[0].existing_login_ready
+
+    account = LocalMicrosoftMailboxPool(
+        pool_text=row,
+        state_file=str(tmp_path / "mailbox-state.json"),
+    ).get_email()
+    credentials = account.extra["provider_account"]["credentials"]
+    assert credentials["login_mode"] == "password_mfa_url"
+    assert credentials["totp_url"].startswith("https://2fa.example/view?")
 
 
 def test_three_hyphen_icloud_relay_rows_preserve_email_and_code_url():

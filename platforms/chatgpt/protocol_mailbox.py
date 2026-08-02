@@ -93,9 +93,10 @@ class ChatGPTProtocolMailboxWorker:
     def _uses_existing_account_login(credentials: dict) -> bool:
         password = str(credentials.get("password") or "").strip()
         totp_secret = str(credentials.get("totp_secret") or "").strip()
+        totp_url = str(credentials.get("totp_url") or "").strip()
         login_mode = str(credentials.get("login_mode") or "").strip()
         return bool(
-            (password and totp_secret)
+            (password and (totp_secret or totp_url))
             or (password and login_mode == "password_or_email_otp")
         )
 
@@ -104,8 +105,10 @@ class ChatGPTProtocolMailboxWorker:
         credentials = self._mailbox_credentials()
         credential_password = str(credentials.get("password") or "")
         credential_totp_secret = str(credentials.get("totp_secret") or "")
+        credential_totp_url = str(credentials.get("totp_url") or "")
         self.engine.password = credential_password or password
         self.engine.totp_secret = credential_totp_secret
+        self.engine.totp_url = credential_totp_url
 
         # 按每条邮箱的凭据能力选择分支：纯接码邮箱注册新号，密码/MFA 或
         # 密码+接码 URL 的已有账号走 Codex 登录，页面需要邮件码时再读取 URL。
@@ -116,6 +119,7 @@ class ChatGPTProtocolMailboxWorker:
                     email=email,
                     password=credential_password or "",
                     totp_secret=credential_totp_secret,
+                    totp_url=credential_totp_url,
                 )
             else:
                 result = self.engine.run()

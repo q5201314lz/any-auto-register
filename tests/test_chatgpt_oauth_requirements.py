@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from core.base_platform import RegisterConfig
-from core.totp import generate_totp
+from core.totp import fetch_totp_code, generate_totp
 from platforms.chatgpt import browser_register as browser_register_module
 from platforms.chatgpt.protocol_mailbox import ChatGPTProtocolMailboxWorker
 from platforms.chatgpt.plugin import (
@@ -227,6 +227,34 @@ def test_generate_totp_matches_rfc_6238_sha1_vector():
     ) == "94287082"
 
 
+def test_fetch_totp_code_uses_viewer_api_and_preserves_query(monkeypatch):
+    captured = {}
+
+    class Response:
+        status_code = 200
+        text = '{"ok":true,"code":"123456","period":30,"remaining":20}'
+
+        def json(self):
+            return json.loads(self.text)
+
+    def fake_get(url, **kwargs):
+        captured.update(url=url, kwargs=kwargs)
+        return Response()
+
+    monkeypatch.setattr("core.totp.requests.get", fake_get)
+
+    code = fetch_totp_code(
+        "https://2fa.example/view?token=redacted&email=user%40example.com",
+        proxy_url="http://127.0.0.1:18080",
+    )
+
+    assert code == "123456"
+    assert captured["url"] == (
+        "https://2fa.example/api/v1/2fa?token=redacted&email=user%40example.com"
+    )
+    assert captured["kwargs"]["proxies"]["https"] == "http://127.0.0.1:18080"
+
+
 def test_codex_oauth_login_password_uses_configured_mfa(monkeypatch):
     oauth_start = SimpleNamespace(
         auth_url="https://auth.openai.com/log-in/password",
@@ -438,6 +466,33 @@ def test_mfa_browser_login_disables_email_otp_callback(monkeypatch):
     assert token_info == {"access_token": "at", "refresh_token": "rt"}
 
 
+def test_mfa_url_browser_login_fetches_remote_code(monkeypatch):
+    engine = object.__new__(RegistrationEngine)
+    engine.email = "user@example.com"
+    engine.password = "Secret123!"
+    engine.totp_secret = ""
+    engine.totp_url = "https://2fa.example/view?token=redacted"
+    engine.proxy_url = None
+    engine.phone_callback = None
+    engine._last_codex_error = ""
+    engine._log = lambda message, level="info": None
+    engine._get_verification_code = lambda: pytest.fail("MFA URL login must not read mailbox OTP")
+
+    monkeypatch.setattr("core.totp.fetch_totp_code", lambda url, proxy_url=None: "654321")
+
+    def retry(self, email, password):
+        assert self.otp_callback is None
+        assert self.mfa_callback() == "654321"
+        return {"access_token": "at", "refresh_token": "rt"}
+
+    monkeypatch.setattr(browser_register_module.ChatGPTBrowserRegister, "_retry_oauth_fresh_browser", retry)
+
+    assert engine._complete_codex_login_password_in_browser() == {
+        "access_token": "at",
+        "refresh_token": "rt",
+    }
+
+
 def test_existing_mfa_login_bypasses_protocol_email_otp_detection(monkeypatch):
     engine = object.__new__(RegistrationEngine)
     engine.logs = []
@@ -566,6 +621,7 @@ def test_protocol_mailbox_worker_passes_password_and_mfa_credentials():
         "email": "user@example.com",
         "password": "Secret123!",
         "totp_secret": "JBSWY3DPEHPK3PXP",
+        "totp_url": "",
     }
 
 
@@ -597,6 +653,40 @@ def test_protocol_mailbox_worker_uses_password_and_inbox_url_login_branch():
         "email": "user@icloud.com",
         "password": "LoginPassword123!",
         "totp_secret": "",
+        "totp_url": "",
+    }
+
+
+def test_protocol_mailbox_worker_passes_password_inbox_and_mfa_url():
+    account = SimpleNamespace(
+        email="user@icloud.com",
+        account_id="user@icloud.com",
+        extra={
+            "provider_account": {
+                "credentials": {
+                    "password": "LoginPassword123!",
+                    "login_mode": "password_mfa_url",
+                    "icloud_api_url": "https://mail.example.com/inbox/token",
+                    "totp_url": "https://2fa.example/view?token=redacted",
+                },
+            },
+        },
+    )
+    worker = ChatGPTProtocolMailboxWorker(
+        mailbox=SimpleNamespace(release_email=lambda *args, **kwargs: False),
+        mailbox_account=account,
+        provider="local_mail_pool",
+    )
+    captured = {}
+    worker.engine.login_existing_via_codex_auth = lambda **kwargs: captured.update(kwargs) or SimpleNamespace(success=True)
+    worker.engine.run = lambda: pytest.fail("password + MFA URL must use the login branch")
+
+    assert worker.run(email=account.email, password="generated-password").success is True
+    assert captured == {
+        "email": "user@icloud.com",
+        "password": "LoginPassword123!",
+        "totp_secret": "",
+        "totp_url": "https://2fa.example/view?token=redacted",
     }
 
 
