@@ -14,6 +14,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_SUB2API_GROUP = "free"
 
 
+def _ldxp_register_account_name(account: Any) -> str:
+    extra = dict(getattr(account, "extra", {}) or {})
+    trade_no = str(extra.get("source_trade_no") or "").strip()
+    email = str(getattr(account, "email", "") or "").strip()
+    return f"注册-{trade_no}-{email}" if trade_no and email else ""
+
+
 class Sub2ApiClient:
     def __init__(self, base_url: str, api_key: str, *, timeout: int = 30):
         root = str(base_url or "").strip().rstrip("/")
@@ -225,6 +232,11 @@ def push_saved_account_to_sub2api(
         return False
 
     data = _make_sub2api_json(account)
+    ldxp_name = _ldxp_register_account_name(account)
+    if ldxp_name:
+        accounts = data.get("accounts") if isinstance(data, dict) else None
+        if accounts and isinstance(accounts, list) and isinstance(accounts[0], dict):
+            accounts[0]["name"] = ldxp_name
     credentials = ((data.get("accounts") or [{}])[0].get("credentials") or {})
     if not credentials.get("access_token") or not credentials.get("refresh_token"):
         emit("  [Sub2API] 缺少 access_token 或 refresh_token，已跳过", level="warning")

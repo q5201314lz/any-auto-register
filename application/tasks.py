@@ -1012,6 +1012,11 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         "ChatGPT/Codex 未获取到 refresh_token(rt)，不计入成功",
                     )
                     raise RuntimeError("ChatGPT/Codex 未获取到 refresh_token(rt)，不计入成功")
+                source_trade_no = str(extra.get("source_trade_no") or "").strip()
+                if source_trade_no:
+                    account_extra["source_trade_no"] = source_trade_no
+                    account_extra["source"] = str(extra.get("source") or "ldxp_public_order")
+                    account.extra = account_extra
             if logger.is_cancel_requested():
                 _release_failed_mailbox_reservation(platform, logger)
                 logger.log("任务已终止，跳过保存本次账号", level="warning")
