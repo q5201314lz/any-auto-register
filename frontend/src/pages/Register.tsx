@@ -75,6 +75,8 @@ export default function Register() {
   const [sub2apiSaveError, setSub2apiSaveError] = useState('')
   const [mailboxSaveState, setMailboxSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [mailboxSaveError, setMailboxSaveError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [submitError, setSubmitError] = useState('')
   const handledTerminalTaskIdsRef = useRef<Set<string>>(new Set())
   const openedCashierTaskIdsRef = useRef<Set<string>>(new Set())
 
@@ -335,44 +337,58 @@ export default function Register() {
   }
 
   const submit = async () => {
-    if (!(await saveMailboxProviderConfig())) return
-    if (!(await saveSub2ApiConfig())) return
-    const shouldRunAllMailboxes = form.identity_provider === 'mailbox' && Boolean(form.run_all_mailboxes)
-    const extra: Record<string, any> = {
-      identity_provider: form.identity_provider,
-      oauth_provider: form.oauth_provider,
-      oauth_email_hint: form.oauth_email_hint,
-      chrome_user_data_dir: form.chrome_user_data_dir || undefined,
-      chrome_cdp_url: form.chrome_cdp_url || undefined,
-    }
-    if (form.mail_provider) {
-      extra.mail_provider = form.mail_provider
-    }
-    if (form.sms_provider) {
-      extra.sms_provider = form.sms_provider
-    }
-    allProviderFieldKeys.forEach(fieldKey => {
-      if (form[fieldKey] !== undefined) {
-        extra[fieldKey] = form[fieldKey]
+    setSubmitError('')
+    setSubmitting(true)
+    try {
+      if (!(await saveMailboxProviderConfig())) {
+        setSubmitError('邮箱配置保存失败，请查看邮箱配置区域的错误信息。')
+        return
       }
-    })
-    const res = await apiFetch('/tasks/register', {
-      method: 'POST',
-      body: JSON.stringify({
-        platform: form.platform,
-        email: form.email || null,
-        password: form.password || null,
-        count: shouldRunAllMailboxes ? 1 : form.count,
-        concurrency: shouldRunAllMailboxes ? 5 : form.concurrency,
-        run_all_mailboxes: shouldRunAllMailboxes,
-        proxy: form.proxy || null,
-        executor_type: form.executor_type,
-        captcha_solver: 'auto',
-        extra,
-      }),
-    })
-    setTask(res)
-    setPolling(true)
+      if (!(await saveSub2ApiConfig())) {
+        setSubmitError('Sub 配置保存失败，请查看 Sub 配置区域的错误信息。')
+        return
+      }
+      const shouldRunAllMailboxes = form.identity_provider === 'mailbox' && Boolean(form.run_all_mailboxes)
+      const extra: Record<string, any> = {
+        identity_provider: form.identity_provider,
+        oauth_provider: form.oauth_provider,
+        oauth_email_hint: form.oauth_email_hint,
+        chrome_user_data_dir: form.chrome_user_data_dir || undefined,
+        chrome_cdp_url: form.chrome_cdp_url || undefined,
+      }
+      if (form.mail_provider) {
+        extra.mail_provider = form.mail_provider
+      }
+      if (form.sms_provider) {
+        extra.sms_provider = form.sms_provider
+      }
+      allProviderFieldKeys.forEach(fieldKey => {
+        if (form[fieldKey] !== undefined) {
+          extra[fieldKey] = form[fieldKey]
+        }
+      })
+      const res = await apiFetch('/tasks/register', {
+        method: 'POST',
+        body: JSON.stringify({
+          platform: form.platform,
+          email: form.email || null,
+          password: form.password || null,
+          count: shouldRunAllMailboxes ? 1 : form.count,
+          concurrency: shouldRunAllMailboxes ? 5 : form.concurrency,
+          run_all_mailboxes: shouldRunAllMailboxes,
+          proxy: form.proxy || null,
+          executor_type: form.executor_type,
+          captcha_solver: 'auto',
+          extra,
+        }),
+      })
+      setTask(res)
+      setPolling(true)
+    } catch (error) {
+      setSubmitError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   const handleTaskDone = useCallback(async (status: string) => {
@@ -754,9 +770,10 @@ export default function Register() {
                   <div className="mt-2 text-base font-medium text-[var(--text-primary)]">{summaryVerification}</div>
                 </div>
               </div>
-              <Button onClick={submit} disabled={polling} className="w-full">
-                {polling ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />注册中...</> : <><Play className="mr-2 h-4 w-4" />开始注册</>}
+              <Button onClick={submit} disabled={polling || submitting} className="w-full">
+                {polling || submitting ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />{polling ? '注册中...' : '提交中...'}</> : <><Play className="mr-2 h-4 w-4" />开始注册</>}
               </Button>
+              {submitError && <div className="text-xs leading-5 text-red-400">提交失败: {submitError}</div>}
             </CardContent>
           </Card>
 

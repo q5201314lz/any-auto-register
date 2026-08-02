@@ -7,10 +7,13 @@ The importer accepts:
   fall back to IMAP only when inbound server fields are present and usable.
 * iCloud relay rows in the form: email@icloud.com---https://.../email@icloud.com
   (three or more hyphens are accepted as the separator).
+* Tokenized iCloud inbox rows in the form:
+  email@icloud.com----https://email.example/icloud/ACCESS_TOKEN.
 """
 
 from __future__ import annotations
 
+import base64
 import csv
 import email as email_lib
 import hashlib
@@ -21,12 +24,13 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from email.header import decode_header
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import requests
 
@@ -44,6 +48,53 @@ LEGACY_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / ".local_ms
 LOCAL_MAIL_POOL_PROVIDER_NAME = "local_mail_pool"
 LEGACY_LOCAL_MS_POOL_PROVIDER_NAME = "local_ms_pool"
 ICLOUD_RELAY_DOMAINS = {"icloud.com", "me.com", "mac.com"}
+
+
+class _MailboxCardHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.messages: list[dict[str, str]] = []
+        self._current: dict[str, list[str]] | None = None
+        self._capture_field = ""
+        self._capture_tag = ""
+
+    @staticmethod
+    def _classes(attrs: list[tuple[str, str | None]]) -> set[str]:
+        value = next((value or "" for key, value in attrs if key == "class"), "")
+        return {item for item in value.split() if item}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        classes = self._classes(attrs)
+        if tag == "article" and "mail-card" in classes:
+            self._current = {"subject": [], "date": [], "body": []}
+            self._capture_field = ""
+            self._capture_tag = ""
+            return
+        if self._current is None:
+            return
+        if tag == "span" and "subject" in classes:
+            self._capture_field, self._capture_tag = "subject", tag
+        elif tag == "span" and "date" in classes:
+            self._capture_field, self._capture_tag = "date", tag
+        elif tag == "pre" and "body" in classes:
+            self._capture_field, self._capture_tag = "body", tag
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._capture_tag == tag:
+            self._capture_field = ""
+            self._capture_tag = ""
+        if tag == "article" and self._current is not None:
+            message = {
+                key: re.sub(r"\s+", " ", "".join(value)).strip()
+                for key, value in self._current.items()
+            }
+            if any(message.values()):
+                self.messages.append(message)
+            self._current = None
+
+    def handle_data(self, data: str) -> None:
+        if self._current is not None and self._capture_field:
+            self._current[self._capture_field].append(data)
 
 
 @dataclass(frozen=True)
@@ -67,6 +118,7 @@ class LocalMicrosoftMailboxEntry:
     client_id: str = ""
     refresh_token: str = ""
     totp_secret: str = ""
+    login_mode: str = ""
     receive_provider: str = "microsoft"
     icloud_api_url: str = ""
     raw: str = ""
@@ -88,6 +140,18 @@ class LocalMicrosoftMailboxEntry:
         return self.receive_provider == "icloud_api" and bool(self.icloud_api_url)
 
     @property
+    def receive_ready(self) -> bool:
+        return self.icloud_api_ready or self.graph_ready or self.imap_ready
+
+    @property
+    def existing_login_ready(self) -> bool:
+        return bool(self.password and self.totp_secret)
+
+    @property
+    def usable_ready(self) -> bool:
+        return self.receive_ready or self.existing_login_ready
+
+    @property
     def source(self) -> str:
         if self.icloud_api_ready:
             return "icloud_api"
@@ -107,6 +171,7 @@ class LocalMicrosoftMailboxEntry:
             "recovery_email": self.recovery_email,
             "recovery_password": self.recovery_password,
             "totp_secret": self.totp_secret,
+            "login_mode": self.login_mode,
             "receive_provider": self.receive_provider,
             "icloud_api_url": self.icloud_api_url,
         }
@@ -131,6 +196,12 @@ def split_xinlan_common_line(line: str) -> list[str]:
     text = str(line or "").strip().strip("\ufeff")
     if not text:
         return []
+    # Four-hyphen rows may contain a password before the inbox URL. Keep long
+    # relay separators (for example 16 hyphens) on the legacy relay branch.
+    if "----" in text:
+        hyphen_parts = text.split("----")
+        if all(part.strip() for part in hyphen_parts):
+            return [item.strip() for item in hyphen_parts]
     relay_match = re.fullmatch(
         r"(?P<email>\S+@\S+?)-{3,}(?P<url>https?://\S+)",
         text,
@@ -138,9 +209,39 @@ def split_xinlan_common_line(line: str) -> list[str]:
     )
     if relay_match:
         return [relay_match.group("email"), relay_match.group("url")]
-    if "----" in text:
-        return [item.strip() for item in text.split("----")]
+    variable_separator_match = re.fullmatch(
+        r"(?P<email>\S+?@\S+?)-{3,}(?P<middle>.+?)-{3,}(?P<last>\S+)",
+        text,
+        flags=re.I,
+    )
+    if variable_separator_match:
+        return [
+            variable_separator_match.group("email").strip(),
+            variable_separator_match.group("middle").strip(),
+            variable_separator_match.group("last").strip(),
+        ]
+    # Three-hyphen rows may be either `email---url` or `email---token---url`.
+    # Keep the middle token when it exists so downstream mailbox parsers can
+    # decide whether it is a password, an inbox token, or a provider-specific
+    # secret.
+    if text.count("---") >= 2 and "@" in text.split("---", 1)[0]:
+        triple_parts = text.split("---")
+        if len(triple_parts) >= 3 and all(part.strip() for part in triple_parts):
+            return [triple_parts[0].strip(), "---".join(triple_parts[1:-1]).strip(), triple_parts[-1].strip()]
     if text.count("|") >= 2:
+        pipe_parts = text.split("|")
+        if len(pipe_parts) >= 4:
+            status = pipe_parts[-1].strip().lower()
+            maybe_totp = re.sub(r"[\s-]+", "", pipe_parts[-2]).upper()
+            if (
+                status in {"trial", "registered", "subscribed", "expired", "invalid", "active", "free"}
+                and re.fullmatch(r"[A-Z2-7]{16,}", maybe_totp)
+            ):
+                return [
+                    pipe_parts[0].strip(),
+                    "|".join(pipe_parts[1:-2]),
+                    maybe_totp,
+                ]
         email, _, password_and_totp = text.partition("|")
         password, _, totp_secret = password_and_totp.rpartition("|")
         return [email.strip(), password, totp_secret.strip()]
@@ -183,10 +284,9 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
         # iCloud 接码地址格式：
         #   cracked-xxx@icloud.com---https://icloud-api.top/show/.../cracked-xxx@icloud.com
         # 三个及以上连字符均支持。
-        # 只有两列且第二列是 URL 时，不按心蓝 19 列格式解释，避免把 URL 当密码/IMAP 字段。
+        # 第二列是 URL 时，后续供应商元数据不参与收码，避免被误当密码/IMAP 字段。
         icloud_api_row = (
             len(parts) >= 2
-            and _email_domain(email) in ICLOUD_RELAY_DOMAINS
             and _looks_like_http_url(_safe_text(parts[1]))
         )
         if icloud_api_row:
@@ -207,6 +307,7 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
         # 1) 心蓝/BH 19 列通用格式：邮箱、密码、登录账号、IMAP...、client_id、refresh_token...
         # 2) 简化 OAuth 格式：邮箱----密码----client_id----refresh_token[----totp]
         # 3) 已注册账号格式：邮箱----OpenAI 密码----MFA，或 邮箱|OpenAI 密码|MFA
+        # 4) 密码登录 + 接码地址：邮箱----OpenAI 密码----接码 URL
         # 旧逻辑会把 4 列格式的 refresh_token 误当作 imap_host，随后 socket
         # DNS 解析抛出 "label too long"。这里优先识别简化 OAuth 格式。
         simplified_oauth = False
@@ -220,12 +321,26 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
                 and "." not in maybe_client_id.strip("{}")
             )
 
+        password_with_inbox = (
+            len(parts) == 3
+            and _looks_like_http_url(_safe_text(parts[2]))
+        )
         login_with_mfa = False
         if len(parts) == 3:
             maybe_totp = re.sub(r"[\s-]+", "", _safe_text(parts[2])).upper()
             login_with_mfa = bool(re.fullmatch(r"[A-Z2-7]{16,}", maybe_totp))
 
-        if login_with_mfa:
+        if password_with_inbox:
+            entry = LocalMicrosoftMailboxEntry(
+                email=email,
+                password=_safe_text(parts[1]),
+                login_account=email,
+                login_mode="password_or_email_otp",
+                receive_provider="icloud_api",
+                icloud_api_url=_safe_text(parts[2]),
+                raw=line,
+            )
+        elif login_with_mfa:
             # `|` 货商格式可能包含有意义的密码空格；只清理邮箱和 MFA，
             # 密码保留第一个与最后一个 `|` 之间的原始内容。
             preserve_password_spaces = "----" not in line and line.count("|") >= 2
@@ -234,6 +349,7 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
                 password=str(parts[1]) if preserve_password_spaces else _safe_text(parts[1]),
                 login_account=email,
                 totp_secret=re.sub(r"[\s-]+", "", _safe_text(parts[2])).upper(),
+                login_mode="password_mfa",
                 raw=line,
             )
         elif simplified_oauth:
@@ -319,6 +435,17 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
 
     def _load_pool_text(self) -> str:
         chunks: list[str] = []
+        state = self._state()
+        retry_rows = dict(state.get("retry_rows") or {})
+        pending_rows = dict(state.get("pending_rows") or {})
+        managed_rows = [
+            str(item.get("raw") or "").strip()
+            for rows in (retry_rows, pending_rows)
+            for item in rows.values()
+            if isinstance(item, dict) and str(item.get("raw") or "").strip()
+        ]
+        if managed_rows:
+            chunks.append("\n".join(managed_rows))
         if self.pool_text.strip():
             chunks.append(self.pool_text)
         if self.pool_file:
@@ -335,6 +462,12 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         entries = parse_xinlan_common_rows(self._load_pool_text())
         if not entries:
             raise RuntimeError("本地邮箱池未解析到有效邮箱")
+        return entries
+
+    def _usable_entries(self) -> list[LocalMicrosoftMailboxEntry]:
+        entries = [entry for entry in self._entries() if entry.usable_ready]
+        if not entries:
+            raise RuntimeError("本地邮箱池没有可用账号，请提供密码 + MFA，或接码 URL、Microsoft OAuth、IMAP 收件配置")
         return entries
 
     def _state(self) -> dict:
@@ -372,7 +505,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         state["cooldowns"] = cooldowns
         self._save_state(state)
 
-    def release_email(self, account_or_email, *, cooldown: bool = False) -> bool:
+    def release_email(self, account_or_email, *, cooldown: bool = False, error: str = "") -> bool:
         """Release a reservation made by get_email() for failed tasks.
 
         Successful tasks intentionally keep the reservation so the same imported
@@ -386,36 +519,206 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         if not key:
             return False
         with self._lock:
+            entries = {entry.key: entry for entry in self._entries()}
             state = self._state()
             used = dict(state.get("used") or {})
             if key not in used:
+                retry_rows = dict(state.get("retry_rows") or {})
+                retry_item = dict(retry_rows.get(key) or {})
+                if retry_item and str(error or "").strip():
+                    retry_item["last_error"] = str(error).strip()
+                    retry_item["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    retry_rows[key] = retry_item
+                    state["retry_rows"] = retry_rows
+                    self._save_state(state)
                 return False
             used.pop(key, None)
             state["used"] = used
             cooldowns = dict(state.get("cooldowns") or {})
             cooldowns.pop(key, None)
             state["cooldowns"] = cooldowns
+            entry = entries.get(key)
+            if entry and entry.raw:
+                retry_rows = dict(state.get("retry_rows") or {})
+                previous = dict(retry_rows.get(key) or {})
+                retry_rows[key] = {
+                    "email": entry.email,
+                    "raw": entry.raw,
+                    "failed_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "attempts": int(previous.get("attempts") or 0) + 1,
+                    "last_error": str(error or previous.get("last_error") or "").strip(),
+                }
+                state["retry_rows"] = retry_rows
+                pending_rows = dict(state.get("pending_rows") or {})
+                pending_rows.pop(key, None)
+                state["pending_rows"] = pending_rows
             self._save_state(state)
             return True
 
     def release_unsaved_reservations(self, saved_emails: set[str]) -> list[str]:
         """Release current-pool reservations that have no saved platform account."""
         saved_keys = {str(email or "").strip().lower() for email in saved_emails if str(email or "").strip()}
-        entries = {entry.key: entry.email for entry in self._entries()}
+        entries = {entry.key: entry for entry in self._usable_entries()}
         with self._lock:
             state = self._state()
             used = dict(state.get("used") or {})
+            pending_rows = dict(state.get("pending_rows") or {})
+            retry_rows = dict(state.get("retry_rows") or {})
+            completed_rows_removed = False
+            for key in saved_keys:
+                if key in pending_rows:
+                    pending_rows.pop(key, None)
+                    completed_rows_removed = True
+                if key in retry_rows:
+                    retry_rows.pop(key, None)
+                    completed_rows_removed = True
             orphaned_keys = [key for key in entries if key in used and key not in saved_keys]
             if not orphaned_keys:
+                if completed_rows_removed:
+                    state["pending_rows"] = pending_rows
+                    state["retry_rows"] = retry_rows
+                    self._save_state(state)
                 return []
             cooldowns = dict(state.get("cooldowns") or {})
             for key in orphaned_keys:
                 used.pop(key, None)
                 cooldowns.pop(key, None)
+                entry = entries.get(key)
+                if entry and entry.raw:
+                    previous = dict(retry_rows.get(key) or {})
+                    retry_rows[key] = {
+                        "email": entry.email,
+                        "raw": entry.raw,
+                        "failed_at": datetime.now(timezone.utc).isoformat(),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                        "attempts": int(previous.get("attempts") or 0) + 1,
+                        "last_error": str(previous.get("last_error") or "").strip(),
+                    }
+            for key in orphaned_keys:
+                pending_rows.pop(key, None)
             state["used"] = used
             state["cooldowns"] = cooldowns
+            state["retry_rows"] = retry_rows
+            state["pending_rows"] = pending_rows
             self._save_state(state)
-            return [entries[key] for key in orphaned_keys]
+            return [entries[key].email for key in orphaned_keys]
+
+    def import_registration_rows(self, text: str) -> dict[str, int]:
+        """Add new rows to the managed registration queue without changing provider config."""
+        source_lines = [
+            line.strip()
+            for line in str(text or "").splitlines()
+            if line.strip() and not line.strip().startswith(("#", "//", "'"))
+        ]
+        parsed = parse_xinlan_common_rows("\n".join(source_lines))
+        usable = [entry for entry in parsed if entry.usable_ready]
+        with self._lock:
+            state = self._state()
+            pending_rows = dict(state.get("pending_rows") or {})
+            retry_rows = dict(state.get("retry_rows") or {})
+            used = dict(state.get("used") or {})
+            configured_chunks = [self.pool_text] if self.pool_text.strip() else []
+            if self.pool_file:
+                path = Path(self.pool_file).expanduser()
+                if path.exists():
+                    configured_chunks.append(path.read_text(encoding="utf-8-sig"))
+            configured_entries = parse_xinlan_common_rows("\n".join(configured_chunks))
+            existing_keys = {entry.key for entry in configured_entries}
+            imported = 0
+            duplicates = 0
+            skipped_used = 0
+            now = datetime.now(timezone.utc).isoformat()
+            for entry in usable:
+                if entry.key in used:
+                    skipped_used += 1
+                    continue
+                if entry.key in pending_rows or entry.key in retry_rows or entry.key in existing_keys:
+                    duplicates += 1
+                    continue
+                pending_rows[entry.key] = {
+                    "email": entry.email,
+                    "raw": entry.raw,
+                    "imported_at": now,
+                    "updated_at": now,
+                    "attempts": 0,
+                }
+                existing_keys.add(entry.key)
+                imported += 1
+            state["pending_rows"] = pending_rows
+            self._save_state(state)
+        return {
+            "imported": imported,
+            "duplicates": duplicates,
+            "skipped_used": skipped_used,
+            "invalid": max(len(source_lines) - len(usable), 0),
+        }
+
+    def registration_pool_snapshot(self) -> dict:
+        with self._lock:
+            state = self._state()
+            used = set((state.get("used") or {}).keys())
+            pending_rows = dict(state.get("pending_rows") or {})
+            retry_rows = dict(state.get("retry_rows") or {})
+            items: list[dict] = []
+            for status, rows in (("new", pending_rows), ("failed", retry_rows)):
+                for key, value in rows.items():
+                    item = dict(value or {})
+                    in_use = key in used
+                    items.append({
+                        "email": str(item.get("email") or key),
+                        "source_row": str(item.get("raw") or ""),
+                        "status": status,
+                        "in_use": in_use,
+                        "attempts": int(item.get("attempts") or 0),
+                        "error": str(item.get("last_error") or ""),
+                        "updated_at": str(item.get("updated_at") or item.get("failed_at") or item.get("imported_at") or ""),
+                    })
+            items.sort(key=lambda item: (item["status"] != "failed", item["updated_at"], item["email"]))
+            return {
+                "new_count": len(pending_rows),
+                "failed_count": len(retry_rows),
+                "available_count": sum(1 for item in items if not item["in_use"]),
+                "running_count": sum(1 for item in items if item["in_use"]),
+                "items": items,
+            }
+
+    def delete_registration_row(self, email: str) -> bool:
+        key = str(email or "").strip().lower()
+        if not key:
+            return False
+        with self._lock:
+            state = self._state()
+            if key in dict(state.get("used") or {}):
+                raise RuntimeError("邮箱正在注册中，任务结束后再删除")
+            removed = False
+            for field in ("pending_rows", "retry_rows"):
+                rows = dict(state.get(field) or {})
+                if key in rows:
+                    rows.pop(key, None)
+                    state[field] = rows
+                    removed = True
+            if removed:
+                self._save_state(state)
+            return removed
+
+    def mark_email_succeeded(self, account_or_email) -> bool:
+        email_value = getattr(account_or_email, "email", account_or_email)
+        key = str(email_value or "").strip().lower()
+        if not key:
+            return False
+        with self._lock:
+            state = self._state()
+            removed = False
+            for field in ("pending_rows", "retry_rows"):
+                rows = dict(state.get(field) or {})
+                if key in rows:
+                    rows.pop(key, None)
+                    state[field] = rows
+                    removed = True
+            if removed:
+                self._save_state(state)
+            return removed
 
     def clear_failure_cooldowns(self, emails: list[str] | None = None) -> int:
         targets = {str(email or "").strip().lower() for email in (emails or []) if str(email or "").strip()}
@@ -435,7 +738,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             return removed
 
     def _available_entry(self) -> LocalMicrosoftMailboxEntry:
-        entries = self._entries()
+        entries = self._usable_entries()
         state = self._state()
         used = set((state.get("used") or {}).keys())
         for entry in entries:
@@ -446,7 +749,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         raise RuntimeError(f"本地邮箱池已用尽: total={len(entries)}")
 
     def available_count(self) -> int:
-        entries = self._entries()
+        entries = self._usable_entries()
         if self.allow_reuse:
             return len(entries)
         used = set((self._state().get("used") or {}).keys())
@@ -455,13 +758,16 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
     def peek_email(self) -> str:
         return self._available_entry().email
 
-    def get_email(self) -> MailboxAccount:
-        with self._lock:
-            entry = self._available_entry()
-            if self.avoid_repeat:
-                self._attempted_keys.add(entry.key)
-            self._reserve(entry)
+    def source_row_for_email(self, email: str) -> str:
+        key = str(email or "").strip().lower()
+        if not key:
+            return ""
+        for entry in self._entries():
+            if entry.key == key:
+                return entry.raw
+        return ""
 
+    def _account_from_entry(self, entry: LocalMicrosoftMailboxEntry) -> MailboxAccount:
         credentials = entry.credentials()
         credentials = {key: value for key, value in credentials.items() if value}
         return MailboxAccount(
@@ -499,6 +805,33 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             },
         )
 
+    def _reserve_entry(self, entry: LocalMicrosoftMailboxEntry) -> MailboxAccount:
+        if self.avoid_repeat:
+            self._attempted_keys.add(entry.key)
+        self._reserve(entry)
+        return self._account_from_entry(entry)
+
+    def get_email(self) -> MailboxAccount:
+        with self._lock:
+            return self._reserve_entry(self._available_entry())
+
+    def get_email_by_address(self, email: str) -> MailboxAccount:
+        """Reserve the exact local-pool row requested by a single-email task."""
+        key = str(email or "").strip().lower()
+        if not key:
+            raise ValueError("指定邮箱不能为空")
+        with self._lock:
+            entry = next((item for item in self._usable_entries() if item.key == key), None)
+            if entry is None:
+                raise RuntimeError(f"指定邮箱不在本地邮箱池中或格式不可用: {email}")
+            state = self._state()
+            used = set((state.get("used") or {}).keys())
+            if not self.allow_reuse and entry.key in used:
+                raise RuntimeError(f"指定邮箱已被占用或已注册: {entry.email}")
+            if self.avoid_repeat and entry.key in self._attempted_keys:
+                raise RuntimeError(f"指定邮箱本次任务已经尝试过: {entry.email}")
+            return self._reserve_entry(entry)
+
     def _entry_for_account(self, account: MailboxAccount) -> LocalMicrosoftMailboxEntry:
         account_email = str(getattr(account, "email", "") or "").strip().lower()
         extra = dict(getattr(account, "extra", {}) or {})
@@ -518,6 +851,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 recovery_email=str(credentials.get("recovery_email") or ""),
                 recovery_password=str(credentials.get("recovery_password") or ""),
                 totp_secret=str(credentials.get("totp_secret") or ""),
+                login_mode=str(credentials.get("login_mode") or ""),
                 receive_provider=str(credentials.get("receive_provider") or "microsoft"),
                 icloud_api_url=str(credentials.get("icloud_api_url") or ""),
             )
@@ -716,9 +1050,155 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         return ""
 
     @staticmethod
+    def _decode_data_uri(value: str) -> str:
+        text = str(value or "")
+        if not text.lower().startswith("data:"):
+            return text
+        header, separator, payload = text.partition(",")
+        if not separator or len(payload) > 8_000_000:
+            return text
+        try:
+            if ";base64" in header.lower():
+                raw = base64.b64decode(payload, validate=False)
+                charset_match = re.search(r"charset=([^;,]+)", header, flags=re.I)
+                charset = charset_match.group(1).strip() if charset_match else "utf-8"
+                return raw.decode(charset, errors="replace")
+            return unquote(payload)
+        except Exception:
+            return text
+
+    @staticmethod
     def _stable_message_id(*parts: object) -> str:
         material = "\n".join(str(part or "") for part in parts)
         return hashlib.sha256(material.encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+    @staticmethod
+    def _tokenized_latest_endpoint(url: str) -> str | None:
+        parsed = urlparse(str(url or "").strip())
+        if parsed.path.rstrip("/").lower() != "/latest" or not parsed.scheme or not parsed.netloc:
+            return None
+        query = parse_qs(parsed.query)
+        email = str((query.get("email") or query.get("mail") or [""])[0]).strip()
+        auth_code = str((query.get("auth_code") or query.get("code") or query.get("key") or [""])[0]).strip()
+        if not email or not auth_code:
+            return None
+        return (
+            f"{parsed.scheme}://{parsed.netloc}/mail-api/"
+            f"{quote(auth_code, safe='')}/{quote(email, safe='')}"
+        )
+
+    @staticmethod
+    def _yangyang_messages_endpoint(url: str) -> tuple[str, str, str, str] | None:
+        parsed = urlparse(str(url or "").strip())
+        if not parsed.scheme or not parsed.netloc:
+            return None
+        parts = [unquote(item) for item in parsed.path.split("/") if item]
+        if len(parts) != 3 or parts[0].lower() != "messages" or not parts[1] or not parts[2]:
+            return None
+        token, email = parts[1], parts[2]
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        encoded_token = quote(token, safe="")
+        encoded_email = quote(email, safe="")
+        return (
+            f"{base}/api/messages/{encoded_token}/{encoded_email}",
+            f"{base}/message",
+            token,
+            email,
+        )
+
+    def _yangyang_api_messages(
+        self,
+        entry: LocalMicrosoftMailboxEntry,
+        endpoint: tuple[str, str, str, str],
+    ) -> list[dict]:
+        list_url, detail_base, token, email = endpoint
+        headers = {
+            "accept": "application/json",
+            "user-agent": "Mozilla/5.0",
+            "cache-control": "no-cache, no-store",
+            "pragma": "no-cache",
+        }
+        response = requests.get(
+            list_url,
+            headers=headers,
+            params={"_": time.time_ns()},
+            proxies=self.proxy,
+            timeout=25,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"iCloud 邮件列表读取失败: HTTP {response.status_code} {response.text[:200]}")
+        payload = response.json() or {}
+        items = payload.get("items") or payload.get("messages") or []
+        if not isinstance(items, list):
+            return []
+
+        messages: list[dict] = []
+        for item in items[:50]:
+            if not isinstance(item, dict):
+                continue
+            message_id = str(item.get("id") or item.get("message_id") or "").strip()
+            merged = dict(item)
+            if message_id:
+                try:
+                    detail_url = (
+                        f"{detail_base}/{quote(message_id, safe='')}/"
+                        f"{quote(token, safe='')}/{quote(email, safe='')}"
+                    )
+                    detail_response = requests.get(
+                        detail_url,
+                        headers=headers,
+                        params={"_": time.time_ns()},
+                        proxies=self.proxy,
+                        timeout=25,
+                    )
+                    if detail_response.status_code == 200:
+                        detail = detail_response.json() or {}
+                        if isinstance(detail, dict):
+                            merged.update(detail)
+                except Exception:
+                    pass
+            subject = self._first_json_text(merged, ("subject", "title"))
+            body = self._decode_data_uri(
+                self._first_json_text(
+                    merged,
+                    ("body", "body_preview", "bodyPreview", "html", "text", "message", "verification_code", "code", "otp"),
+                )
+            )
+            received = self._first_json_text(
+                merged,
+                ("receivedAt", "received_at", "received_time", "date", "time", "timestamp"),
+            )
+            messages.append({
+                "id": message_id or self._stable_message_id(entry.email, subject, body, received),
+                "subject": subject,
+                "bodyPreview": " ".join(value for value in (subject, body) if value),
+                "receivedDateTime": received,
+            })
+        return messages
+
+    def _server_rendered_html_messages(
+        self,
+        entry: LocalMicrosoftMailboxEntry,
+        text: str,
+    ) -> list[dict]:
+        parser = _MailboxCardHTMLParser()
+        try:
+            parser.feed(str(text or ""))
+            parser.close()
+        except Exception:
+            return []
+        messages = []
+        for item in parser.messages:
+            subject = str(item.get("subject") or "")
+            body = str(item.get("body") or "")
+            received = str(item.get("date") or "")
+            messages.append({
+                "id": self._stable_message_id(entry.email, subject, body, received),
+                "subject": subject,
+                "bodyPreview": " ".join(value for value in (subject, body) if value),
+                "receivedDateTime": received,
+            })
+        return messages
 
     @staticmethod
     def _mailroom_public_endpoint(url: str) -> tuple[str, str] | None:
@@ -743,7 +1223,17 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 containers.append(value)
         codes: list[str] = []
         for container in containers:
-            for key in ("codes", "verificationCodes", "verification_codes", "verificationCode", "verification_code"):
+            for key in (
+                "codes",
+                "verificationCodes",
+                "verification_codes",
+                "verificationCode",
+                "verification_code",
+                "code",
+                "otp",
+                "oneTimeCode",
+                "one_time_code",
+            ):
                 value = container.get(key)
                 values = value if isinstance(value, list) else [value]
                 for item in values:
@@ -757,6 +1247,13 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
     def _icloud_api_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
         if not entry.icloud_api_ready:
             raise RuntimeError(f"iCloud 邮箱缺少接码地址: {entry.email}")
+        yangyang_endpoint = self._yangyang_messages_endpoint(entry.icloud_api_url)
+        if yangyang_endpoint:
+            try:
+                return self._yangyang_api_messages(entry, yangyang_endpoint)
+            except RuntimeError as exc:
+                if "HTTP 404" not in str(exc):
+                    raise
         mailroom_endpoint = self._mailroom_public_endpoint(entry.icloud_api_url)
         headers = {
             "accept": "application/json,text/html,text/plain,*/*",
@@ -764,6 +1261,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             "cache-control": "no-cache, no-store",
             "pragma": "no-cache",
         }
+        tokenized_latest_endpoint = self._tokenized_latest_endpoint(entry.icloud_api_url)
         if mailroom_endpoint:
             api_url, share_token = mailroom_endpoint
             response = requests.post(
@@ -774,6 +1272,19 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                     "user-agent": headers["user-agent"],
                     "cache-control": headers["cache-control"],
                     "pragma": headers["pragma"],
+                },
+                proxies=self.proxy,
+                timeout=25,
+            )
+        elif tokenized_latest_endpoint:
+            response = requests.get(
+                tokenized_latest_endpoint,
+                headers=headers,
+                params={
+                    "folder": "inbox",
+                    "refresh": "1",
+                    "async": "1",
+                    "_": time.time_ns(),
                 },
                 proxies=self.proxy,
                 timeout=25,
@@ -806,6 +1317,11 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 except Exception:
                     payload = None
 
+        if payload is None:
+            rendered_messages = self._server_rendered_html_messages(entry, text)
+            if rendered_messages:
+                return rendered_messages
+
         if payload is not None:
             explicit_code_text = " ".join(self._json_code_values(payload))
             for item in self._json_message_candidates(payload):
@@ -820,17 +1336,48 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                         })
                     continue
                 subject = self._first_json_text(item, ("subject", "title", "mail_subject", "sub"))
+                message_body = self._decode_data_uri(
+                    self._first_json_text(
+                        item,
+                        (
+                            "body",
+                            "body_preview",
+                            "bodyPreview",
+                            "content",
+                            "html",
+                            "text",
+                            "message",
+                            "mail_text",
+                            "mail_content",
+                            "verification_code",
+                            "verificationCode",
+                            "code",
+                            "otp",
+                        ),
+                    )
+                )
                 body = " ".join(
                     value
                     for value in (
                         subject,
-                        self._first_json_text(item, ("body", "content", "html", "text", "message", "mail_text", "mail_content")),
+                        message_body,
                         self._first_json_text(item, ("from", "sender", "from_email")),
                         explicit_code_text,
                     )
                     if value
                 )
-                received = self._first_json_text(item, ("receivedDateTime", "created_at", "createdAt", "date", "time", "timestamp"))
+                received = self._first_json_text(
+                    item,
+                    (
+                        "receivedDateTime",
+                        "received_time",
+                        "created_at",
+                        "createdAt",
+                        "date",
+                        "time",
+                        "timestamp",
+                    ),
+                )
                 mid = self._first_json_text(item, ("id", "mail_id", "message_id", "uid"))
                 if mailroom_endpoint:
                     mid = self._stable_message_id(entry.email, mid, subject, body, received)
@@ -896,7 +1443,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         # Prefer numbers near verification wording to avoid matching timestamps,
         # counters, URL tokens, or unrelated 6-digit values on HTML inbox pages.
         hinted = re.search(
-            r"(?:验证码|驗證碼|校验码|code|verification|verify|otp|one[- ]?time|openai|chatgpt|codex)"
+            r"(?:验证码|驗證碼|校验码|認証コード|認證碼|確認コード|ログインコード|"
+            r"code|verification|verify|otp|one[- ]?time|openai|chatgpt|codex)"
             r"[\s\S]{0,120}?(?<!#)(?<!\d)(\d{6})(?!\d)",
             text,
             flags=re.I,
@@ -915,9 +1463,15 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             return 0.0
         try:
             normalized = value.replace("Z", "+00:00")
-            return datetime.fromisoformat(normalized).timestamp()
+            parsed = datetime.fromisoformat(normalized)
         except Exception:
-            return 0.0
+            try:
+                parsed = parsedate_to_datetime(value)
+            except Exception:
+                return 0.0
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone(timedelta(hours=8)))
+        return parsed.timestamp()
 
     def wait_for_code(
         self,

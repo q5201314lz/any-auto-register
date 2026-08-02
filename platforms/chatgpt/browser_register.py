@@ -2130,7 +2130,7 @@ def _do_codex_oauth(
                     page,
                     email,
                     log,
-                    allow_passwordless=not bool(mfa_callback and password),
+                    allow_passwordless=not bool(password),
                 )
                 log(f"  OAuth 邮箱页提交状态: {email_resp.get('status', 0)}")
                 if not email_resp.get("ok"):
@@ -2138,8 +2138,8 @@ def _do_codex_oauth(
                 continue
 
             if state["page_type"] == "login_password":
-                if mfa_callback and password:
-                    log("  OAuth 遇到密码验证，账号已配置 MFA，提交登录密码...")
+                if password:
+                    log("  OAuth 遇到密码验证，提交登录密码...")
                     password_resp = _submit_oauth_password_direct(page, password, log)
                     log(f"  OAuth 登录密码提交状态: {password_resp.get('status', 0)}")
                     if not password_resp.get("ok"):
@@ -2317,7 +2317,7 @@ def _do_codex_oauth(
             time.sleep(0.5)
     except Exception as e:
         log(f"  OAuth 异常: {e}")
-        return None
+        raise
 
     cookies_dict = _get_cookies(page)
     result = _complete_oauth_with_session(cookies_dict, oauth_start, proxy, log)
@@ -4373,6 +4373,7 @@ class ChatGPTBrowserRegister:
         self.mfa_callback = mfa_callback
         self.phone_callback = phone_callback
         self.log = log_fn
+        self.last_oauth_error = ""
 
     def run(self, email: str, password: str) -> dict:
         proxy = _build_proxy_config(self.proxy)
@@ -4417,6 +4418,7 @@ class ChatGPTBrowserRegister:
 
     def _retry_oauth_fresh_browser(self, email, password):
         """在全新浏览器 context 里做 Codex OAuth（绕过 add_phone session）。"""
+        self.last_oauth_error = ""
         proxy = _build_proxy_config(self.proxy)
         launch_opts = _camoufox_launch_options(headless=self.headless, proxy=proxy)
         try:
@@ -4430,5 +4432,6 @@ class ChatGPTBrowserRegister:
                 )
                 return result
         except Exception as e:
+            self.last_oauth_error = str(e).strip() or e.__class__.__name__
             self.log(f"  全新浏览器 OAuth 异常: {e}")
             return None

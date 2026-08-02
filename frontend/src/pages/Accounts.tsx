@@ -12,6 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { getTaskStatusText, TASK_STATUS_VARIANTS } from '@/lib/tasks'
 import { RefreshCw, Copy, ExternalLink, Download, Upload, Plus, X, Mail, Trash2, Zap, Save } from 'lucide-react'
+import { MailboxRegistrationPool } from './Settings'
 
 const STATUS_VARIANT: Record<string, any> = {
   registered: 'default', trial: 'success', subscribed: 'success',
@@ -206,6 +207,7 @@ function RegisterModal({
   const [taskId, setTaskId] = useState<string | null>(null)
   const [done, setDone] = useState(false)
   const [starting, setStarting] = useState(false)
+  const [startError, setStartError] = useState('')
   const [mailPoolText, setMailPoolText] = useState('')
   const [mailPoolSaveState, setMailPoolSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [mailPoolSaveError, setMailPoolSaveError] = useState('')
@@ -376,6 +378,7 @@ function RegisterModal({
 
   const start = async () => {
     const shouldRunAllMailboxes = selection.identityProvider === 'mailbox' && runAllMailboxes
+    setStartError('')
     setStarting(true)
     try {
       const cfg = config || {}
@@ -408,6 +411,15 @@ function RegisterModal({
         }),
       })
       setTaskId(res.task_id)
+    } catch (error) {
+      let message = error instanceof Error ? error.message : String(error)
+      try {
+        const payload = JSON.parse(message)
+        message = payload?.detail || payload?.error || message
+      } catch {
+        // The backend may also return a plain-text error.
+      }
+      setStartError(message || '启动注册任务失败')
     } finally { setStarting(false) }
   }
 
@@ -515,7 +527,7 @@ function RegisterModal({
                     <div className="flex items-center justify-between gap-3">
                       <div>
                         <div className="text-sm font-semibold text-[var(--text-primary)]">邮箱池</div>
-                        <div className="mt-1 text-xs text-[var(--text-muted)]">每行一个账号，接码地址支持邮箱后用3个及以上连字符分隔；另支持心蓝、密码/MFA格式。</div>
+                        <div className="mt-1 text-xs text-[var(--text-muted)]">每行一个账号；密码 + MFA 直接登录已有账号，密码 + 接码 URL 会按页面要求提交密码或读取邮件码。纯接码 URL、Microsoft OAuth、IMAP 用于新账号注册。</div>
                       </div>
                       <Badge variant="secondary">{mailPoolLineCount} 行</Badge>
                     </div>
@@ -525,6 +537,7 @@ function RegisterModal({
                         setMailPoolText(event.target.value)
                         setMailPoolSaveState('idle')
                         setMailPoolSaveError('')
+                        setStartError('')
                       }}
                       rows={8}
                       spellCheck={false}
@@ -540,6 +553,10 @@ function RegisterModal({
                       {mailPoolSaveState === 'error' && <span className="text-xs text-red-400">保存失败: {mailPoolSaveError}</span>}
                     </div>
                   </div>
+                )}
+
+                {platform === 'chatgpt' && selection.identityProvider === 'mailbox' && isLocalMailboxPool && (
+                  <MailboxRegistrationPool />
                 )}
 
                 <div className="grid grid-cols-2 gap-3">
@@ -567,6 +584,12 @@ function RegisterModal({
                     <div className="mt-2 text-amber-400">后台浏览器自动依赖 Chrome Profile 或 Chrome CDP，未配置时只允许可视浏览器自动。</div>
                   )}
                 </div>
+
+                {startError && (
+                  <div role="alert" className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300">
+                    {startError}
+                  </div>
+                )}
 
                 <Button
                   onClick={start}

@@ -10,6 +10,7 @@ from core.local_ms_mailbox import (
     OUTLOOK_TOKEN_URL,
     parse_xinlan_common_rows,
 )
+from core.base_identity import MailboxIdentityProvider
 
 
 def _entry() -> LocalMicrosoftMailboxEntry:
@@ -59,6 +60,51 @@ def test_pipe_login_mfa_row_uses_first_and_last_separator():
     assert entries[0].totp_secret == "JBSWY3DPEHPK3PXP"
 
 
+def test_pipe_login_mfa_row_ignores_trailing_account_status(tmp_path):
+    pool_text = (
+        "user@gmail.com|password|with|pipes|"
+        "TZ75BLYLJZWSN2SLXM6POOEUGTL26ZOI|Trial"
+    )
+    entries = parse_xinlan_common_rows(pool_text)
+
+    assert len(entries) == 1
+    assert entries[0].email == "user@gmail.com"
+    assert entries[0].password == "password|with|pipes"
+    assert entries[0].totp_secret == "TZ75BLYLJZWSN2SLXM6POOEUGTL26ZOI"
+    assert entries[0].existing_login_ready
+
+    mailbox = LocalMicrosoftMailboxPool(
+        pool_text=pool_text,
+        state_file=str(tmp_path / "mailbox-state.json"),
+    )
+    account = mailbox.get_email()
+    credentials = account.extra["provider_account"]["credentials"]
+    assert account.email == "user@gmail.com"
+    assert credentials["password"] == "password|with|pipes"
+    assert credentials["totp_secret"] == "TZ75BLYLJZWSN2SLXM6POOEUGTL26ZOI"
+
+
+def test_password_login_row_with_inbox_url_keeps_both_capabilities(tmp_path):
+    row = (
+        "adults-tarpons1q@icloud.com----redacted-password@@----"
+        "https://icloud-first-mail-link.example/m/token"
+    )
+    entries = parse_xinlan_common_rows(row)
+
+    assert len(entries) == 1
+    assert entries[0].password == "redacted-password@@"
+    assert entries[0].login_mode == "password_or_email_otp"
+    assert entries[0].icloud_api_ready
+
+    account = LocalMicrosoftMailboxPool(
+        pool_text=row,
+        state_file=str(tmp_path / "mailbox-state.json"),
+    ).get_email()
+    credentials = account.extra["provider_account"]["credentials"]
+    assert credentials["login_mode"] == "password_or_email_otp"
+    assert credentials["icloud_api_url"].endswith("/token")
+
+
 def test_three_hyphen_icloud_relay_rows_preserve_email_and_code_url():
     entries = parse_xinlan_common_rows(
         "odds.04alibi+hfi0vu5u890a8x24@icloud.com---"
@@ -89,6 +135,21 @@ def test_four_hyphen_icloud_relay_format_remains_supported():
     assert entries[0].icloud_api_ready
 
 
+def test_four_hyphen_tokenized_icloud_api_format_is_supported():
+    entries = parse_xinlan_common_rows(
+        "account@icloud.com----"
+        "https://email.example.com/icloud/sample_access_token"
+    )
+
+    assert len(entries) == 1
+    assert entries[0].email == "account@icloud.com"
+    assert entries[0].receive_provider == "icloud_api"
+    assert entries[0].icloud_api_url == (
+        "https://email.example.com/icloud/sample_access_token"
+    )
+    assert entries[0].icloud_api_ready
+
+
 def test_many_hyphen_icloud_relay_row_preserves_fragment_url():
     entries = parse_xinlan_common_rows(
         "bottles_ballots.5j@icloud.com----------------"
@@ -102,6 +163,54 @@ def test_many_hyphen_icloud_relay_row_preserves_fragment_url():
         "mls_IYANC1AhhKaiPLpxyQgavX1TlFaJ8o4XrNl33J2GSfc"
     )
     assert entries[0].icloud_api_ready
+
+
+def test_tokenized_icloud_api_reads_root_code_from_json(monkeypatch):
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json; charset=utf-8"}
+
+        def __init__(self, payload: dict):
+            self.payload = payload
+            self.text = json.dumps(payload)
+
+        def json(self):
+            return self.payload
+
+    responses = iter([
+        Response({
+            "found": False,
+            "message": "No verification email found",
+            "email": "account@icloud.com",
+        }),
+        Response({
+            "found": True,
+            "message": "Verification email found",
+            "email": "account@icloud.com",
+            "code": "654321",
+        }),
+    ])
+    captured = []
+
+    def fake_get(url, **kwargs):
+        captured.append((url, kwargs))
+        return next(responses)
+
+    monkeypatch.setattr("core.local_ms_mailbox.requests.get", fake_get)
+    entry = LocalMicrosoftMailboxEntry(
+        email="account@icloud.com",
+        receive_provider="icloud_api",
+        icloud_api_url="https://email.example.com/icloud/sample_access_token",
+    )
+    mailbox = LocalMicrosoftMailboxPool()
+
+    before = mailbox._icloud_api_messages(entry)[0]
+    received = mailbox._icloud_api_messages(entry)[0]
+
+    assert captured[0][0] == entry.icloud_api_url
+    assert captured[0][1]["headers"]["cache-control"] == "no-cache, no-store"
+    assert "654321" in received["bodyPreview"]
+    assert received["id"] != before["id"]
 
 
 def test_mailroom_fragment_link_calls_public_api_and_reads_root_code(monkeypatch):
@@ -238,7 +347,10 @@ def test_graph_failure_falls_back_to_imap_and_caches_strategy(monkeypatch):
 def test_failed_mailbox_is_released_for_immediate_retry(tmp_path):
     state_file = tmp_path / "mailbox-state.json"
     mailbox = LocalMicrosoftMailboxPool(
-        pool_text="first@outlook.com----password\nsecond@outlook.com----password",
+        pool_text=(
+            "first@outlook.com----https://mail.example/inbox/first\n"
+            "second@outlook.com----https://mail.example/inbox/second"
+        ),
         state_file=str(state_file),
         failure_cooldown_seconds=1800,
     )
@@ -256,7 +368,10 @@ def test_failed_mailbox_is_released_for_immediate_retry(tmp_path):
 
 def test_exhaustive_run_attempts_each_mailbox_once(tmp_path):
     mailbox = LocalMicrosoftMailboxPool(
-        pool_text="first@outlook.com----password\nsecond@outlook.com----password",
+        pool_text=(
+            "first@outlook.com----https://mail.example/inbox/first\n"
+            "second@outlook.com----https://mail.example/inbox/second"
+        ),
         state_file=str(tmp_path / "mailbox-state.json"),
         avoid_repeat=True,
     )
@@ -271,7 +386,10 @@ def test_exhaustive_run_attempts_each_mailbox_once(tmp_path):
 
 def test_available_count_excludes_successfully_reserved_mailboxes(tmp_path):
     mailbox = LocalMicrosoftMailboxPool(
-        pool_text="first@outlook.com----password\nsecond@outlook.com----password",
+        pool_text=(
+            "first@outlook.com----https://mail.example/inbox/first\n"
+            "second@outlook.com----https://mail.example/inbox/second"
+        ),
         state_file=str(tmp_path / "mailbox-state.json"),
     )
 
@@ -292,7 +410,7 @@ def test_expired_failure_cooldown_allows_mailbox_reuse(tmp_path):
         encoding="utf-8",
     )
     mailbox = LocalMicrosoftMailboxPool(
-        pool_text="first@outlook.com----password",
+        pool_text="first@outlook.com----https://mail.example/inbox/first",
         state_file=str(state_file),
         failure_cooldown_seconds=1800,
     )
@@ -303,7 +421,7 @@ def test_expired_failure_cooldown_allows_mailbox_reuse(tmp_path):
 def test_network_failure_release_does_not_cool_down_mailbox(tmp_path):
     state_file = tmp_path / "mailbox-state.json"
     mailbox = LocalMicrosoftMailboxPool(
-        pool_text="first@outlook.com----password",
+        pool_text="first@outlook.com----https://mail.example/inbox/first",
         state_file=str(state_file),
         failure_cooldown_seconds=1800,
     )
@@ -326,7 +444,7 @@ def test_clear_failure_cooldowns(tmp_path):
         encoding="utf-8",
     )
     mailbox = LocalMicrosoftMailboxPool(
-        pool_text="first@outlook.com----password",
+        pool_text="first@outlook.com----https://mail.example/inbox/first",
         state_file=str(state_file),
         failure_cooldown_seconds=1800,
     )
@@ -337,7 +455,10 @@ def test_clear_failure_cooldowns(tmp_path):
 
 def test_release_unsaved_reservations_keeps_saved_accounts(tmp_path):
     mailbox = LocalMicrosoftMailboxPool(
-        pool_text="saved@outlook.com----password\norphan@outlook.com----password",
+        pool_text=(
+            "saved@outlook.com----https://mail.example/inbox/saved\n"
+            "orphan@outlook.com----https://mail.example/inbox/orphan"
+        ),
         state_file=str(tmp_path / "mailbox-state.json"),
     )
     mailbox.get_email()
@@ -349,3 +470,126 @@ def test_release_unsaved_reservations_keeps_saved_accounts(tmp_path):
     assert mailbox.available_count() == 1
     assert "saved@outlook.com" in mailbox._state()["used"]
     assert "orphan@outlook.com" not in mailbox._state()["used"]
+
+
+def test_release_unsaved_reservations_removes_completed_managed_rows(tmp_path):
+    mailbox = LocalMicrosoftMailboxPool(
+        state_file=str(tmp_path / "mailbox-state.json"),
+    )
+    mailbox.import_registration_rows(
+        "saved@outlook.com----https://mail.example/inbox/saved\n"
+        "orphan@outlook.com----https://mail.example/inbox/orphan"
+    )
+    mailbox.get_email()
+    mailbox.get_email()
+
+    released = mailbox.release_unsaved_reservations({"saved@outlook.com"})
+    snapshot = mailbox.registration_pool_snapshot()
+
+    assert released == ["orphan@outlook.com"]
+    assert snapshot["new_count"] == 0
+    assert snapshot["failed_count"] == 1
+    assert snapshot["items"][0]["email"] == "orphan@outlook.com"
+
+
+def test_managed_registration_pool_imports_without_provider_rows(tmp_path):
+    mailbox = LocalMicrosoftMailboxPool(
+        state_file=str(tmp_path / "mailbox-state.json"),
+    )
+
+    result = mailbox.import_registration_rows(
+        "new-one@icloud.com----https://mail.example/inbox/new-one\n"
+        "new-two@icloud.com----Password123----JBSWY3DPEHPK3PXP"
+    )
+
+    assert result == {
+        "imported": 2,
+        "duplicates": 0,
+        "skipped_used": 0,
+        "invalid": 0,
+    }
+    snapshot = mailbox.registration_pool_snapshot()
+    assert snapshot["new_count"] == 2
+    assert snapshot["failed_count"] == 0
+    assert snapshot["available_count"] == 2
+    assert {item["email"] for item in snapshot["items"]} == {
+        "new-one@icloud.com",
+        "new-two@icloud.com",
+    }
+
+
+def test_managed_registration_pool_moves_failure_and_removes_success(tmp_path):
+    mailbox = LocalMicrosoftMailboxPool(
+        state_file=str(tmp_path / "mailbox-state.json"),
+    )
+    mailbox.import_registration_rows(
+        "retry@icloud.com----https://mail.example/inbox/retry\n"
+        "success@icloud.com----https://mail.example/inbox/success"
+    )
+
+    failed = mailbox.get_email()
+    assert failed.email == "retry@icloud.com"
+    assert mailbox.release_email(failed, error="OAuth callback timeout")
+
+    retried = mailbox.get_email()
+    assert retried.email == "retry@icloud.com"
+    assert mailbox.mark_email_succeeded(retried)
+
+    snapshot = mailbox.registration_pool_snapshot()
+    assert snapshot["new_count"] == 1
+    assert snapshot["failed_count"] == 0
+    assert snapshot["items"][0]["email"] == "success@icloud.com"
+
+
+def test_managed_registration_pool_records_failure_details(tmp_path):
+    mailbox = LocalMicrosoftMailboxPool(
+        state_file=str(tmp_path / "mailbox-state.json"),
+    )
+    mailbox.import_registration_rows(
+        "retry@icloud.com----https://mail.example/inbox/retry"
+    )
+
+    account = mailbox.get_email()
+    assert mailbox.release_email(account, error="invalid_state")
+
+    snapshot = mailbox.registration_pool_snapshot()
+    assert snapshot["new_count"] == 0
+    assert snapshot["failed_count"] == 1
+    assert snapshot["available_count"] == 1
+    assert snapshot["items"][0]["status"] == "failed"
+    assert snapshot["items"][0]["attempts"] == 1
+    assert snapshot["items"][0]["error"] == "invalid_state"
+
+
+def test_get_email_by_address_reserves_the_requested_pool_row(tmp_path):
+    mailbox = LocalMicrosoftMailboxPool(
+        pool_text=(
+            "first@icloud.com----https://mail.example/inbox/first\n"
+            "target@icloud.com----https://mail.example/inbox/target"
+        ),
+        state_file=str(tmp_path / "mailbox-state.json"),
+    )
+
+    account = mailbox.get_email_by_address("TARGET@icloud.com")
+
+    assert account.email == "target@icloud.com"
+    state = mailbox._state()
+    assert "target@icloud.com" in state["used"]
+    assert "first@icloud.com" not in state["used"]
+
+
+def test_mailbox_identity_uses_exact_address_lookup_when_supported(tmp_path):
+    mailbox = LocalMicrosoftMailboxPool(
+        pool_text=(
+            "first@icloud.com----https://mail.example/inbox/first\n"
+            "target@icloud.com----https://mail.example/inbox/target"
+        ),
+        state_file=str(tmp_path / "mailbox-state.json"),
+    )
+    mailbox.get_current_ids = lambda account: {"existing-message"}
+
+    identity = MailboxIdentityProvider(mailbox=mailbox).resolve("TARGET@icloud.com")
+
+    assert identity.email == "TARGET@icloud.com"
+    assert identity.mailbox_account.email == "target@icloud.com"
+    assert identity.before_ids == {"existing-message"}
