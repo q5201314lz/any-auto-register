@@ -931,7 +931,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     from core.proxy_pool import proxy_pool
 
     count = max(int(payload.get("count", 1) or 1), 1)
-    concurrency = min(max(int(payload.get("concurrency", 1) or 1), 1), count, 5)
+    concurrency = min(max(int(payload.get("concurrency", 1) or 1), 1), count, 3)
     platform_name = str(payload.get("platform", ""))
     email = payload.get("email") or None
     password = payload.get("password") or None

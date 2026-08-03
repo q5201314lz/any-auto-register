@@ -14,7 +14,7 @@ from platforms.chatgpt.plugin import (
     _assert_complete_oauth_callback,
     _generate_chatgpt_registration_password,
 )
-from platforms.chatgpt.register import RegistrationEngine
+from platforms.chatgpt.register import RegistrationEngine, SignupFormResult
 
 
 def test_nextauth_non_json_response_has_bounded_diagnostics():
@@ -30,6 +30,42 @@ def test_nextauth_non_json_response_has_bounded_diagnostics():
         RegistrationEngine._parse_json_response(response, "NextAuth CSRF")
 
     assert len(str(exc_info.value)) < 350
+
+
+def test_invalid_state_signup_retries_with_fresh_oauth_session(monkeypatch):
+    engine = object.__new__(RegistrationEngine)
+    engine.proxy_url = "http://127.0.0.1:18080"
+    engine.session = object()
+    engine.oauth_start = object()
+    engine._uses_direct_openai_oauth = True
+    engine._is_existing_account = True
+    engine._log = lambda message, level="info": None
+    fresh_client = SimpleNamespace(session=object())
+    monkeypatch.setattr("platforms.chatgpt.register.OpenAIHTTPClient", lambda proxy_url=None: fresh_client)
+
+    calls = []
+    engine._init_session = lambda: calls.append("session") or True
+    engine._start_oauth = lambda: calls.append("oauth") or True
+    engine._get_device_id = lambda: calls.append("did") or "new-device"
+    sentinel = SimpleNamespace(p="p", c="c", flow="authorize_continue", t="")
+    engine._check_sentinel = lambda did: calls.append(("sentinel", did)) or sentinel
+    engine._submit_signup_form = lambda did, sen: calls.append(("submit", did, sen)) or SignupFormResult(success=True)
+
+    result = engine._retry_signup_with_fresh_session()
+
+    assert result.success is True
+    assert calls == ["session", "oauth", "did", ("sentinel", "new-device"), ("submit", "new-device", sentinel)]
+    assert engine._uses_direct_openai_oauth is False
+    assert engine._is_existing_account is False
+
+
+def test_invalid_state_signup_detection_is_specific():
+    assert RegistrationEngine._is_invalid_state_signup(
+        SignupFormResult(success=False, error_message='HTTP 409: {"code":"invalid_state"}')
+    )
+    assert not RegistrationEngine._is_invalid_state_signup(
+        SignupFormResult(success=False, error_message="HTTP 409: account_deactivated")
+    )
 
 
 def test_nextauth_edge_challenge_falls_back_to_direct_openai_oauth(monkeypatch):
@@ -529,6 +565,7 @@ def test_existing_mfa_login_bypasses_protocol_email_otp_detection(monkeypatch):
     assert result.success is True
     assert result.access_token == "at"
     assert result.refresh_token == "rt"
+    assert engine._has_supplied_login_password is True
 
 
 def test_existing_login_accepts_browser_oauth_token_without_callback_exchange(monkeypatch):

@@ -802,6 +802,30 @@ class RegistrationEngine:
             self._log(f"提交注册表单失败: {e}", "error")
             return SignupFormResult(success=False, error_message=str(e))
 
+    @staticmethod
+    def _is_invalid_state_signup(result: SignupFormResult) -> bool:
+        message = str(getattr(result, "error_message", "") or "").lower()
+        return "invalid_state" in message or "sign-in session is no longer valid" in message
+
+    def _retry_signup_with_fresh_session(self) -> SignupFormResult:
+        """Retry a single-use/expired signup state with a clean OAuth session."""
+        self._log("注册会话已失效，正在使用全新 OAuth 会话重试一次...", "warning")
+        self.http_client = OpenAIHTTPClient(proxy_url=self.proxy_url)
+        self.session = None
+        self.oauth_start = None
+        self._uses_direct_openai_oauth = False
+        self._is_existing_account = False
+
+        if not self._init_session():
+            return SignupFormResult(success=False, error_message="重新初始化会话失败")
+        if not self._start_oauth():
+            return SignupFormResult(success=False, error_message="重新开始 OAuth 流程失败")
+        did = self._get_device_id()
+        if not did:
+            return SignupFormResult(success=False, error_message="重新获取 Device ID 失败")
+        sen_payload = self._check_sentinel(did)
+        return self._submit_signup_form(did, sen_payload)
+
     def _register_password(self) -> Tuple[bool, Optional[str]]:
         """注册密码"""
         try:
@@ -2083,6 +2107,10 @@ class RegistrationEngine:
             # 1. 获取/绑定邮箱账号。邮箱池在 create_email() 里完成占用和元数据绑定。
             if email:
                 self.email = email
+            # Only supplier-provided credentials are valid for a password
+            # challenge. URL-only mailbox registrations use a generated
+            # password and must keep the email-OTP fallback instead.
+            self._has_supplied_login_password = bool(str(password or "").strip())
             self.password = password or self.password or ""
             self.totp_secret = totp_secret or getattr(self, "totp_secret", "") or ""
             self.totp_url = totp_url or getattr(self, "totp_url", "") or ""
@@ -2244,6 +2272,8 @@ class RegistrationEngine:
             # 7. 提交注册表单 + 解析响应判断账号状态
             self._log("7. 提交注册表单...")
             signup_result = self._submit_signup_form(did, sen_payload)
+            if not signup_result.success and self._is_invalid_state_signup(signup_result):
+                signup_result = self._retry_signup_with_fresh_session()
             if not signup_result.success:
                 result.error_message = f"提交注册表单失败: {signup_result.error_message}"
                 return result

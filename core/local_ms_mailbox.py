@@ -48,6 +48,11 @@ LEGACY_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / ".local_ms
 LOCAL_MAIL_POOL_PROVIDER_NAME = "local_mail_pool"
 LEGACY_LOCAL_MS_POOL_PROVIDER_NAME = "local_ms_pool"
 ICLOUD_RELAY_DOMAINS = {"icloud.com", "me.com", "mac.com"}
+_IGNORABLE_TRAILING_STATUSES = {
+    "trial", "plus", "paid", "success", "failed", "registered", "active",
+    "free", "expired", "invalid", "subscribed", "done", "ok",
+    "已注册", "成功", "失败", "已失败", "plus订单", "注册失败",
+}
 
 
 class _MailboxCardHTMLParser(HTMLParser):
@@ -194,20 +199,55 @@ def _csv_split(line: str, delimiter: str) -> list[str]:
         return line.split(delimiter)
 
 
+def _is_ignorable_trailing_status(value: str) -> bool:
+    """Return whether an export's final field is a status, not credentials."""
+    text = _safe_text(value)
+    normalized = re.sub(r"\s+", "", text).lower()
+    if not normalized or normalized not in _IGNORABLE_TRAILING_STATUSES:
+        return False
+    # Do not discard credential-shaped values even if a future status name
+    # overlaps with one of them.
+    if re.match(r"https?://", text, flags=re.I) or "@" in text:
+        return False
+    if re.fullmatch(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", text):
+        return False
+    if text.lower().startswith("rt.1"):
+        return False
+    return not bool(re.fullmatch(r"[A-Z2-7\s-]{16,}", text, flags=re.I))
+
+
+def _strip_trailing_statuses(parts: list[str]) -> list[str]:
+    """Remove only consecutive trailing export statuses from parsed fields."""
+    while len(parts) > 1 and _is_ignorable_trailing_status(parts[-1]):
+        parts.pop()
+    return parts
+
+
 def split_xinlan_common_line(line: str) -> list[str]:
     text = str(line or "").strip().strip("\ufeff")
     if not text:
         return []
+    labeled_email = re.search(r"chatgpt谷歌邮箱\s*[：:]\s*([^\s,，|]+@[^\s,，|]+)", text, re.I)
+    if labeled_email:
+        labeled_password = re.search(r"chatgpt密码\s*[：:]\s*(\S+)", text, re.I)
+        labeled_totp = re.search(r"一次性安全码密钥\s*[：:]\s*([A-Z2-7\s-]{16,})", text, re.I)
+        return _strip_trailing_statuses([
+            labeled_email.group(1),
+            labeled_password.group(1) if labeled_password else "",
+            labeled_totp.group(1) if labeled_totp else "",
+        ])
     # Four-hyphen rows may contain a password before the inbox URL. Keep long
     # relay separators (for example 16 hyphens) on the legacy relay branch.
     if "----" in text:
         hyphen_parts = text.split("----")
         if all(part.strip() for part in hyphen_parts):
-            return [item.strip() for item in hyphen_parts]
+            return _strip_trailing_statuses([item.strip() for item in hyphen_parts])
     # Some account exports use exactly three hyphens for four fields:
     # email---password---MFA secret---old access-token JWT. Preserve all four
     # fields before the legacy variable-separator matcher collapses the middle.
     triple_parts = text.split("---")
+    if len(triple_parts) >= 3 and "@" in triple_parts[0] and all(part.strip() for part in triple_parts):
+        return _strip_trailing_statuses([item.strip() for item in triple_parts])
     if len(triple_parts) == 4 and "@" in triple_parts[0]:
         maybe_totp = re.sub(r"[\s-]+", "", triple_parts[2]).upper()
         maybe_access_token = triple_parts[3].strip()
@@ -242,29 +282,15 @@ def split_xinlan_common_line(line: str) -> list[str]:
         if len(triple_parts) >= 3 and all(part.strip() for part in triple_parts):
             return [triple_parts[0].strip(), "---".join(triple_parts[1:-1]).strip(), triple_parts[-1].strip()]
     if text.count("|") >= 2:
-        pipe_parts = text.split("|")
-        if len(pipe_parts) >= 4:
-            status = pipe_parts[-1].strip().lower()
-            maybe_totp = re.sub(r"[\s-]+", "", pipe_parts[-2]).upper()
-            if (
-                status in {"trial", "registered", "subscribed", "expired", "invalid", "active", "free"}
-                and re.fullmatch(r"[A-Z2-7]{16,}", maybe_totp)
-            ):
-                return [
-                    pipe_parts[0].strip(),
-                    "|".join(pipe_parts[1:-2]),
-                    maybe_totp,
-                ]
-        email, _, password_and_totp = text.partition("|")
-        password, _, totp_secret = password_and_totp.rpartition("|")
-        return [email.strip(), password, totp_secret.strip()]
+        pipe_parts = _strip_trailing_statuses(text.split("|"))
+        return [pipe_parts[0].strip(), "|".join(pipe_parts[1:-1]), pipe_parts[-1].strip()]
     if "\t" in text:
-        return [item.strip() for item in text.split("\t")]
+        return _strip_trailing_statuses([item.strip() for item in text.split("\t")])
     if "，" in text:
-        return [item.strip() for item in _csv_split(text, "，")]
+        return _strip_trailing_statuses([item.strip() for item in _csv_split(text, "，")])
     if "," in text:
-        return [item.strip() for item in _csv_split(text, ",")]
-    return [item.strip() for item in re.split(r"\s+", text) if item.strip()]
+        return _strip_trailing_statuses([item.strip() for item in _csv_split(text, ",")])
+    return _strip_trailing_statuses([item.strip() for item in re.split(r"\s+", text) if item.strip()])
 
 
 def _email_domain(value: str) -> str:

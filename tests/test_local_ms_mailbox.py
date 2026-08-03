@@ -108,6 +108,45 @@ def test_hyphen_login_mfa_row_ignores_trailing_access_token(tmp_path):
     assert credentials["totp_secret"] == "TZ75BLYLJZWSN2SLXM6POOEUGTL26ZOI"
 
 
+def test_registered_account_rows_ignore_trailing_plus_status_and_keep_credentials(tmp_path):
+    rows = (
+        "pipe@example.com|Password123!|JBSWY3DPEHPK3PXP|Plus\n"
+        "triple@example.com---Password123!---JBSWY3DPEHPK3PXP---Plus\n"
+        "quad@example.com----Password123!----JBSWY3DPEHPK3PXP----Plus\n"
+        "csv@example.com,Password123!,JBSWY3DPEHPK3PXP,Plus\n"
+        "mail@example.com----Password123!----https://example.com/inbox----Plus\n"
+        "both@example.com----Password123!----https://example.com/inbox----https://example.com/totp----Plus"
+    )
+
+    entries = {entry.email: entry for entry in parse_xinlan_common_rows(rows)}
+
+    for email in ("pipe@example.com", "triple@example.com", "quad@example.com", "csv@example.com"):
+        assert entries[email].totp_secret == "JBSWY3DPEHPK3PXP"
+        assert entries[email].login_mode == "password_mfa"
+    assert entries["mail@example.com"].login_mode == "password_or_email_otp"
+    assert entries["mail@example.com"].credentials()["icloud_api_url"] == "https://example.com/inbox"
+    assert entries["both@example.com"].login_mode == "password_mfa_url"
+    assert entries["both@example.com"].totp_url == "https://example.com/totp"
+
+    account = LocalMicrosoftMailboxPool(
+        pool_text="mail@example.com----Password123!----https://example.com/inbox----Plus",
+        state_file=str(tmp_path / "mailbox-state.json"),
+    ).get_email()
+    assert account.extra["provider_account"]["credentials"]["icloud_api_url"] == "https://example.com/inbox"
+
+
+def test_space_delimited_and_chinese_labeled_mfa_rows_are_supported():
+    entries = parse_xinlan_common_rows(
+        "spaces@example.com Password123! JBSWY3DPEHPK3PXP\n"
+        "chatgpt谷歌邮箱：labeled@example.com chatgpt密码：Secret123! 一次性安全码密钥：JBSWY3DPEHPK3PXP"
+    )
+
+    assert [(entry.email, entry.password, entry.totp_secret) for entry in entries] == [
+        ("spaces@example.com", "Password123!", "JBSWY3DPEHPK3PXP"),
+        ("labeled@example.com", "Secret123!", "JBSWY3DPEHPK3PXP"),
+    ]
+
+
 def test_password_login_row_with_inbox_url_keeps_both_capabilities(tmp_path):
     row = (
         "adults-tarpons1q@icloud.com----redacted-password@@----"
