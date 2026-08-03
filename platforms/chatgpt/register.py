@@ -1580,7 +1580,11 @@ class RegistrationEngine:
                 f"content_type={content_type or '-'} location={location[:120] or '-'}"
             )
             if send_resp.status_code not in (200, 201, 204):
-                self._log(f"Codex login OTP 发送失败: {send_resp.text[:200]}", "error")
+                self._log(
+                    f"Codex login OTP 发送失败: HTTP {send_resp.status_code} "
+                    f"{send_resp.text[:200]}",
+                    "error",
+                )
                 return None
             if location or (content_type and "json" not in content_type):
                 self._log(
@@ -2473,14 +2477,13 @@ class RegistrationEngine:
                     if not codex_token_info:
                         raise RuntimeError(self._last_codex_error or "浏览器一次性验证码 OAuth 未完成")
 
-                # `email_otp_verification` does not reliably mean that this
-                # fresh Codex session has sent an email. Always explicitly
-                # request one before polling, otherwise this stage waits for a
-                # non-existent second OTP and can never exchange the callback.
+                # `email_otp_verification` means authorize/continue already
+                # triggered the email. Sending again in that state is rejected
+                # by OpenAI and aborts every existing-account login.
                 elif page_type in ("email_otp_send", "email_otp_verification"):
                     otp_page = self._complete_codex_email_otp(
                         login_session,
-                        send_code=True,
+                        send_code=page_type == "email_otp_send",
                         referer=f"{OPENAI_AUTH}/email-verification",
                     )
                     if otp_page is None:

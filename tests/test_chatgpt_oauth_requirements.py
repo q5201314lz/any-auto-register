@@ -423,6 +423,37 @@ def test_protocol_otp_send_rejects_redirect_false_positive():
     assert any("发送失败" in message for _, message in logs)
 
 
+def test_protocol_existing_account_otp_does_not_resend_email():
+    engine = object.__new__(RegistrationEngine)
+    engine._otp_sent_at = None
+    engine._debug_log = lambda message: None
+    engine._log = lambda message, level="info": None
+    engine._get_verification_code = lambda: "654321"
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"page": {"type": "add_phone"}}
+
+    class Session:
+        def get(self, *args, **kwargs):
+            pytest.fail("email_otp_verification must not send another OTP")
+
+        @staticmethod
+        def post(*args, **kwargs):
+            return Response()
+
+    assert engine._complete_codex_email_otp(
+        Session(),
+        send_code=False,
+        referer="https://auth.openai.com/email-verification",
+    ) == "add_phone"
+    assert engine._otp_sent_at is not None
+
+
 def test_protocol_password_challenge_uses_browser_passwordless_action(monkeypatch):
     engine = object.__new__(RegistrationEngine)
     engine.email = "user@example.com"
