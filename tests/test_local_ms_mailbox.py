@@ -236,6 +236,39 @@ def test_url_only_linlinflow_mailbox_forces_email_otp_login_mode():
     assert entries[0].icloud_api_ready
 
 
+def test_rangertalking_pickup_token_is_not_treated_as_login_password(monkeypatch):
+    entry = parse_xinlan_common_rows(
+        "mail@icloud.com----access-key-value----https://icloud.rangertalking.com/pickup"
+    )[0]
+
+    assert entry.password == ""
+    assert entry.login_mode == "email_otp_only"
+    assert entry.icloud_api_token == "access-key-value"
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = '{"status":"received","code":"123456"}'
+
+        @staticmethod
+        def json():
+            return {"status": "received", "code": "123456", "received_at": "2026-08-03T12:00:00"}
+
+    captured = {}
+
+    def fake_get(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        return Response()
+
+    monkeypatch.setattr("core.local_ms_mailbox.requests.get", fake_get)
+    mailbox = LocalMicrosoftMailboxPool()
+    messages = mailbox._icloud_api_messages(entry)
+
+    assert captured["url"] == "https://icloud.rangertalking.com/api/v1/verification-code"
+    assert captured["headers"]["X-Access-Key"] == "access-key-value"
+    assert "123456" in messages[0]["bodyPreview"]
+
+
 def test_four_hyphen_tokenized_icloud_api_format_is_supported():
     entries = parse_xinlan_common_rows(
         "account@icloud.com----"

@@ -127,6 +127,7 @@ class LocalMicrosoftMailboxEntry:
     login_mode: str = ""
     receive_provider: str = "microsoft"
     icloud_api_url: str = ""
+    icloud_api_token: str = ""
     raw: str = ""
 
     @property
@@ -181,6 +182,7 @@ class LocalMicrosoftMailboxEntry:
             "login_mode": self.login_mode,
             "receive_provider": self.receive_provider,
             "icloud_api_url": self.icloud_api_url,
+            "icloud_api_token": self.icloud_api_token,
         }
 
 
@@ -305,6 +307,15 @@ def _looks_like_http_url(value: str) -> bool:
         return False
 
 
+def _is_rangertalking_pickup_url(value: str) -> bool:
+    parsed = urlparse(str(value or "").strip())
+    return (
+        parsed.scheme in {"http", "https"}
+        and parsed.netloc.lower().endswith("rangertalking.com")
+        and parsed.path.rstrip("/").lower() == "/pickup"
+    )
+
+
 def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
     entries: list[LocalMicrosoftMailboxEntry] = []
     seen: set[str] = set()
@@ -367,6 +378,11 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
             len(parts) == 3
             and _looks_like_http_url(_safe_text(parts[2]))
         )
+        rangertalking_pickup = (
+            password_with_inbox
+            and _is_rangertalking_pickup_url(_safe_text(parts[2]))
+            and bool(_safe_text(parts[1]))
+        )
         password_with_inbox_and_totp_url = (
             len(parts) == 4
             and _looks_like_http_url(_safe_text(parts[2]))
@@ -384,7 +400,17 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
                     and re.fullmatch(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", maybe_access_token)
                 )
 
-        if password_with_inbox_and_totp_url:
+        if rangertalking_pickup:
+            entry = LocalMicrosoftMailboxEntry(
+                email=email,
+                login_account=email,
+                login_mode="email_otp_only",
+                receive_provider="icloud_api",
+                icloud_api_url=_safe_text(parts[2]),
+                icloud_api_token=_safe_text(parts[1]),
+                raw=line,
+            )
+        elif password_with_inbox_and_totp_url:
             entry = LocalMicrosoftMailboxEntry(
                 email=email,
                 password=_safe_text(parts[1]),
@@ -933,6 +959,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 login_mode=str(credentials.get("login_mode") or ""),
                 receive_provider=str(credentials.get("receive_provider") or "microsoft"),
                 icloud_api_url=str(credentials.get("icloud_api_url") or ""),
+                icloud_api_token=str(credentials.get("icloud_api_token") or ""),
             )
 
         for entry in self._entries():
@@ -1292,6 +1319,13 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         return f"{parsed.scheme}://{parsed.netloc}/public-api/v1/check", fragment
 
     @staticmethod
+    def _rangertalking_verification_endpoint(entry: LocalMicrosoftMailboxEntry) -> str | None:
+        if not entry.icloud_api_token or not _is_rangertalking_pickup_url(entry.icloud_api_url):
+            return None
+        parsed = urlparse(entry.icloud_api_url)
+        return f"{parsed.scheme}://{parsed.netloc}/api/v1/verification-code"
+
+    @staticmethod
     def _json_code_values(payload: Any) -> list[str]:
         if not isinstance(payload, dict):
             return []
@@ -1341,6 +1375,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             "pragma": "no-cache",
         }
         tokenized_latest_endpoint = self._tokenized_latest_endpoint(entry.icloud_api_url)
+        rangertalking_endpoint = self._rangertalking_verification_endpoint(entry)
         if mailroom_endpoint:
             api_url, share_token = mailroom_endpoint
             response = requests.post(
@@ -1352,6 +1387,13 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                     "cache-control": headers["cache-control"],
                     "pragma": headers["pragma"],
                 },
+                proxies=self.proxy,
+                timeout=25,
+            )
+        elif rangertalking_endpoint:
+            response = requests.get(
+                rangertalking_endpoint,
+                headers={**headers, "X-Access-Key": entry.icloud_api_token},
                 proxies=self.proxy,
                 timeout=25,
             )
