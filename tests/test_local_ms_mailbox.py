@@ -255,6 +255,76 @@ def test_many_hyphen_icloud_relay_row_preserves_fragment_url():
     assert entries[0].icloud_api_ready
 
 
+def test_flysms_pickup_rows_support_six_hyphens_and_fragment_key():
+    row = (
+        "tooling-tragic7c@icloud.com------"
+        "https://flysms.xyz/icloud/pickup#email=tooling-tragic7c%40icloud.com"
+        "&key=tok_example"
+    )
+    entry = parse_xinlan_common_rows(row)[0]
+
+    assert entry.login_mode == "email_otp_only"
+    assert entry.receive_provider == "icloud_api"
+    assert entry.icloud_api_url.startswith("https://flysms.xyz/icloud/pickup#")
+    assert entry.icloud_api_token == ""
+
+
+def test_flysms_pickup_rows_with_explicit_token_are_not_password_rows():
+    row = (
+        "males_dollop3z@icloud.com---tok_example---"
+        "https://flysms.xyz/icloud/pickup#email=males_dollop3z%40icloud.com"
+        "&key=tok_example"
+    )
+    entry = parse_xinlan_common_rows(row)[0]
+
+    assert entry.login_mode == "email_otp_only"
+    assert entry.password == ""
+    assert entry.icloud_api_token == "tok_example"
+
+
+def test_flysms_pickup_api_reads_message_detail(monkeypatch):
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = ""
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    responses = iter([
+        Response({"messages": [{"uid": "u-1", "mailbox": "INBOX", "preview": "new mail"}]}),
+        Response({"message": {"uid": "u-1", "subject": "Codex", "text": "Your verification code is 654321"}}),
+    ])
+    captured = []
+
+    def fake_get(url, **kwargs):
+        captured.append((url, kwargs))
+        return next(responses)
+
+    monkeypatch.setattr("core.local_ms_mailbox.requests.get", fake_get)
+    entry = LocalMicrosoftMailboxEntry(
+        email="tooling-tragic7c@icloud.com",
+        receive_provider="icloud_api",
+        icloud_api_url=(
+            "https://flysms.xyz/icloud/pickup#email=tooling-tragic7c%40icloud.com"
+            "&key=tok_example"
+        ),
+    )
+    mailbox = LocalMicrosoftMailboxPool()
+
+    messages = mailbox._icloud_api_messages(entry)
+
+    assert len(messages) == 1
+    assert "654321" in messages[0]["bodyPreview"]
+    assert captured[0][0].endswith("/icloud/api/pickup/messages")
+    assert captured[0][1]["headers"]["authorization"] == "Bearer tok_example"
+    assert captured[0][1]["headers"]["x-mailbox-email"] == "tooling-tragic7c@icloud.com"
+    assert captured[1][0].endswith("/u-1")
+
+
 def test_tokenized_icloud_api_reads_root_code_from_json(monkeypatch):
     class Response:
         status_code = 200

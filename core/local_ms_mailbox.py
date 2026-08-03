@@ -238,8 +238,19 @@ def split_xinlan_common_line(line: str) -> list[str]:
             labeled_password.group(1) if labeled_password else "",
             labeled_totp.group(1) if labeled_totp else "",
         ])
-    # Four-hyphen rows may contain a password before the inbox URL. Keep long
-    # relay separators (for example 16 hyphens) on the legacy relay branch.
+    # URL-only relay rows may use any separator length from three hyphens up.
+    # Match them before the four-hyphen field parser so six hyphens do not
+    # leave a broken `--https://...` value.
+    relay_match = re.fullmatch(
+        r"(?P<email>[^\s@]+@(?:(?!-{3,})[^\s])+)-{3,}"
+        r"(?P<url>https?://\S+)",
+        text,
+        flags=re.I,
+    )
+    if relay_match:
+        return [relay_match.group("email"), relay_match.group("url")]
+
+    # Four-hyphen rows may contain a password before the inbox URL.
     if "----" in text:
         hyphen_parts = text.split("----")
         if all(part.strip() for part in hyphen_parts):
@@ -258,13 +269,6 @@ def split_xinlan_common_line(line: str) -> list[str]:
             and re.fullmatch(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", maybe_access_token)
         ):
             return [item.strip() for item in triple_parts]
-    relay_match = re.fullmatch(
-        r"(?P<email>\S+@\S+?)-{3,}(?P<url>https?://\S+)",
-        text,
-        flags=re.I,
-    )
-    if relay_match:
-        return [relay_match.group("email"), relay_match.group("url")]
     variable_separator_match = re.fullmatch(
         r"(?P<email>\S+?@\S+?)-{3,}(?P<middle>.+?)-{3,}(?P<last>\S+)",
         text,
@@ -322,6 +326,16 @@ def _is_rangertalking_pickup_url(value: str) -> bool:
         parsed.scheme in {"http", "https"}
         and parsed.netloc.lower().endswith("rangertalking.com")
         and parsed.path.rstrip("/").lower() == "/pickup"
+    )
+
+
+def _is_flysms_pickup_url(value: str) -> bool:
+    parsed = urlparse(str(value or "").strip())
+    host = parsed.netloc.lower().split(":", 1)[0]
+    return (
+        parsed.scheme in {"http", "https"}
+        and (host == "flysms.xyz" or host.endswith(".flysms.xyz"))
+        and parsed.path.rstrip("/").lower() == "/icloud/pickup"
     )
 
 
@@ -392,6 +406,11 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
             and _is_rangertalking_pickup_url(_safe_text(parts[2]))
             and bool(_safe_text(parts[1]))
         )
+        flysms_pickup = (
+            password_with_inbox
+            and _is_flysms_pickup_url(_safe_text(parts[2]))
+            and _safe_text(parts[1]).startswith("tok_")
+        )
         password_with_inbox_and_totp_url = (
             len(parts) == 4
             and _looks_like_http_url(_safe_text(parts[2]))
@@ -409,7 +428,17 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
                     and re.fullmatch(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", maybe_access_token)
                 )
 
-        if rangertalking_pickup:
+        if flysms_pickup:
+            entry = LocalMicrosoftMailboxEntry(
+                email=email,
+                login_account=email,
+                login_mode="email_otp_only",
+                receive_provider="icloud_api",
+                icloud_api_url=_safe_text(parts[2]),
+                icloud_api_token=_safe_text(parts[1]),
+                raw=line,
+            )
+        elif rangertalking_pickup:
             entry = LocalMicrosoftMailboxEntry(
                 email=email,
                 login_account=email,
@@ -1344,6 +1373,94 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         return f"{parsed.scheme}://{parsed.netloc}/api/v1/verification-code"
 
     @staticmethod
+    def _flysms_pickup_endpoint(
+        entry: LocalMicrosoftMailboxEntry,
+    ) -> tuple[str, str, str] | None:
+        if not _is_flysms_pickup_url(entry.icloud_api_url):
+            return None
+        parsed = urlparse(entry.icloud_api_url)
+        fragment = parse_qs(parsed.fragment or "")
+        email = str((fragment.get("email") or [entry.email])[0]).strip()
+        token = str(
+            entry.icloud_api_token
+            or (fragment.get("key") or fragment.get("token") or [""])[0]
+        ).strip()
+        if not email or not token or email.lower() != entry.email.strip().lower():
+            return None
+        endpoint = f"{parsed.scheme}://{parsed.netloc}/icloud/api/pickup/messages"
+        return endpoint, email, token
+
+    def _flysms_api_messages(
+        self,
+        entry: LocalMicrosoftMailboxEntry,
+        endpoint: tuple[str, str, str],
+    ) -> list[dict]:
+        api_url, email, token = endpoint
+        headers = {
+            "accept": "application/json",
+            "authorization": f"Bearer {token}",
+            "x-mailbox-email": email,
+            "user-agent": "Mozilla/5.0",
+            "cache-control": "no-cache, no-store",
+        }
+        response = requests.get(
+            api_url,
+            headers=headers,
+            params={"limit": "30", "_": time.time_ns()},
+            proxies=self.proxy,
+            timeout=25,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"flysms 邮件列表读取失败: HTTP {response.status_code} {response.text[:200]}"
+            )
+        payload = response.json() or {}
+        items = payload.get("messages") or payload.get("items") or []
+        if not isinstance(items, list):
+            return []
+
+        messages: list[dict] = []
+        for item in items[:30]:
+            if not isinstance(item, dict):
+                continue
+            merged = dict(item)
+            uid = str(item.get("uid") or item.get("id") or "").strip()
+            mailbox = str(item.get("mailbox") or "INBOX").strip()
+            if uid:
+                try:
+                    detail_response = requests.get(
+                        f"{api_url}/{quote(uid, safe='')}",
+                        headers=headers,
+                        params={"mailbox": mailbox},
+                        proxies=self.proxy,
+                        timeout=15,
+                    )
+                    if detail_response.status_code == 200:
+                        detail_payload = detail_response.json() or {}
+                        detail = detail_payload.get("message") or detail_payload
+                        if isinstance(detail, dict):
+                            merged.update(detail)
+                except Exception:
+                    pass
+            subject = self._first_json_text(merged, ("subject", "title"))
+            body = self._first_json_text(
+                merged,
+                ("text", "html", "body", "preview", "bodyPreview", "content"),
+            )
+            sender = self._first_json_text(merged, ("from", "sender"))
+            received = self._first_json_text(
+                merged,
+                ("mailboxReceivedAt", "ingestedAt", "date", "sentAt", "receivedDateTime"),
+            )
+            messages.append({
+                "id": uid or self._stable_message_id(email, subject, body, received),
+                "subject": subject,
+                "bodyPreview": " ".join(value for value in (subject, body, sender) if value),
+                "receivedDateTime": received,
+            })
+        return messages
+
+    @staticmethod
     def _json_code_values(payload: Any) -> list[str]:
         if not isinstance(payload, dict):
             return []
@@ -1385,6 +1502,9 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             except RuntimeError as exc:
                 if "HTTP 404" not in str(exc):
                     raise
+        flysms_endpoint = self._flysms_pickup_endpoint(entry)
+        if flysms_endpoint:
+            return self._flysms_api_messages(entry, flysms_endpoint)
         mailroom_endpoint = self._mailroom_public_endpoint(entry.icloud_api_url)
         headers = {
             "accept": "application/json,text/html,text/plain,*/*",
