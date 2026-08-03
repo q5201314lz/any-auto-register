@@ -106,9 +106,18 @@ class ChatGPTProtocolMailboxWorker:
         credential_password = str(credentials.get("password") or "")
         credential_totp_secret = str(credentials.get("totp_secret") or "")
         credential_totp_url = str(credentials.get("totp_url") or "")
+        credential_login_mode = str(credentials.get("login_mode") or "").strip()
         self.engine.password = credential_password or password
         self.engine.totp_secret = credential_totp_secret
         self.engine.totp_url = credential_totp_url
+        # A row that supplies only a mailbox callback URL has no valid OpenAI
+        # password. If the OAuth journey lands on a password screen, it must
+        # choose the email OTP action instead of submitting the generated
+        # registration password.
+        self.engine.force_email_otp_login = bool(
+            not credential_password
+            and credential_login_mode == "email_otp_only"
+        )
 
         # 按每条邮箱的凭据能力选择分支：纯接码邮箱注册新号，密码/MFA 或
         # 密码+接码 URL 的已有账号走 Codex 登录，页面需要邮件码时再读取 URL。

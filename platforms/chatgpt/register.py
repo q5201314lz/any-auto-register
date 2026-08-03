@@ -328,6 +328,7 @@ class RegistrationEngine:
         self._last_codex_error: str = ""
         self._codex_direct_token_info: Optional[Dict[str, Any]] = None
         self._has_supplied_login_password = False
+        self.force_email_otp_login = False
         # chatgpt.com NextAuth is occasionally challenged at the network edge
         # while auth.openai.com remains usable.  Keep this explicit so the
         # later session lookup can follow the same transport branch.
@@ -1654,10 +1655,15 @@ class RegistrationEngine:
                 log_fn=self._log,
             )
             browser_password = self.password
-            if getattr(self, "_is_existing_account", False) and not getattr(self, "_has_supplied_login_password", False):
+            if getattr(self, "force_email_otp_login", False) or (
+                getattr(self, "_is_existing_account", False)
+                and not getattr(self, "_has_supplied_login_password", False)
+            ):
                 # URL-only mailbox entries receive a generated registration
                 # password from the worker. It is not a valid existing-account
                 # credential, so choose the browser's email-OTP login action.
+                if getattr(self, "force_email_otp_login", False):
+                    self._log("Codex login 该邮箱仅提供收码地址，强制使用一次性验证码登录")
                 browser_password = ""
             token_info = browser_flow._retry_oauth_fresh_browser(self.email, browser_password)
             if not isinstance(token_info, dict):

@@ -452,12 +452,13 @@ def test_protocol_password_challenge_uses_browser_passwordless_action(monkeypatc
     }
 
 
-def test_url_only_existing_account_uses_browser_email_otp_not_generated_password(monkeypatch):
+def test_url_only_mailbox_forces_browser_email_otp_not_generated_password(monkeypatch):
     engine = object.__new__(RegistrationEngine)
     engine.email = "user@icloud.com"
     engine.password = "GeneratedRegistrationPassword123!"
-    engine._is_existing_account = True
+    engine._is_existing_account = False
     engine._has_supplied_login_password = False
+    engine.force_email_otp_login = True
     engine.totp_secret = ""
     engine.proxy_url = None
     engine.phone_callback = None

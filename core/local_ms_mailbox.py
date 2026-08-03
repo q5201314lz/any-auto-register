@@ -332,6 +332,7 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
             entry = LocalMicrosoftMailboxEntry(
                 email=email,
                 login_account=email,
+                login_mode="email_otp_only",
                 receive_provider="icloud_api",
                 icloud_api_url=_safe_text(parts[1]),
                 raw=line,

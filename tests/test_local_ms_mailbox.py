@@ -221,6 +221,19 @@ def test_four_hyphen_icloud_relay_format_remains_supported():
     assert len(entries) == 1
     assert entries[0].email == "account@icloud.com"
     assert entries[0].icloud_api_ready
+    assert entries[0].login_mode == "email_otp_only"
+
+
+def test_url_only_linlinflow_mailbox_forces_email_otp_login_mode():
+    entries = parse_xinlan_common_rows(
+        "93.lava.county@icloud.com----"
+        "https://sms.example.com/latest?email=93.lava.county%40icloud.com&auth_code=opaque"
+    )
+
+    assert len(entries) == 1
+    assert entries[0].password == ""
+    assert entries[0].login_mode == "email_otp_only"
+    assert entries[0].icloud_api_ready
 
 
 def test_four_hyphen_tokenized_icloud_api_format_is_supported():
