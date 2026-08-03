@@ -285,6 +285,15 @@ def split_xinlan_common_line(line: str) -> list[str]:
             return [triple_parts[0].strip(), "---".join(triple_parts[1:-1]).strip(), triple_parts[-1].strip()]
     if text.count("|") >= 2:
         pipe_parts = _strip_trailing_statuses(text.split("|"))
+        # Some registered-account exports append an order/account reference:
+        #   email|OpenAI password|MFA secret|reference
+        # The reference is not a credential. Detect the MFA in column three
+        # before applying the legacy first/last separator rule, which is kept
+        # for passwords that legitimately contain pipe characters.
+        if len(pipe_parts) == 4:
+            third_field_totp = re.sub(r"[\s-]+", "", _safe_text(pipe_parts[2])).upper()
+            if re.fullmatch(r"[A-Z2-7]{16,}", third_field_totp):
+                return [pipe_parts[0].strip(), pipe_parts[1], third_field_totp]
         return [pipe_parts[0].strip(), "|".join(pipe_parts[1:-1]), pipe_parts[-1].strip()]
     if "\t" in text:
         return _strip_trailing_statuses([item.strip() for item in text.split("\t")])

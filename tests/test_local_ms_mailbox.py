@@ -60,6 +60,18 @@ def test_pipe_login_mfa_row_uses_first_and_last_separator():
     assert entries[0].totp_secret == "JBSWY3DPEHPK3PXP"
 
 
+def test_pipe_login_mfa_row_ignores_trailing_reference():
+    entries = parse_xinlan_common_rows(
+        "account@gmail.com|ChatPassword123|JBSWY3DPEHPK3PXP|ORDER8REFERENCE"
+    )
+
+    assert len(entries) == 1
+    assert entries[0].email == "account@gmail.com"
+    assert entries[0].password == "ChatPassword123"
+    assert entries[0].totp_secret == "JBSWY3DPEHPK3PXP"
+    assert entries[0].login_mode == "password_mfa"
+
+
 def test_pipe_login_mfa_row_ignores_trailing_account_status(tmp_path):
     pool_text = (
         "user@gmail.com|password|with|pipes|"
