@@ -1038,9 +1038,9 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             _auto_upload_cpa(logger, account)
             _auto_push_sub2api(logger, saved_account)
             _auto_push_any2api(logger, account)
-            extra = dict(account.extra or {})
-            overview = dict(extra.get("account_overview") or {})
-            cashier_url = str(extra.get("cashier_url") or overview.get("cashier_url") or "")
+            account_result_extra = dict(account.extra or {})
+            overview = dict(account_result_extra.get("account_overview") or {})
+            cashier_url = str(account_result_extra.get("cashier_url") or overview.get("cashier_url") or "")
             if cashier_url:
                 logger.log(f"  [升级链接] {cashier_url}")
                 logger.add_cashier_url(cashier_url)
