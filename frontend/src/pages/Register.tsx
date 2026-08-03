@@ -141,7 +141,7 @@ export default function Register() {
           sub2api_enabled: configBoolean(cfg.sub2api_enabled, Boolean(cfg.sub2api_url && cfg.sub2api_api_key)),
           sub2api_url: cfg.sub2api_url || '',
           sub2api_api_key: cfg.sub2api_api_key || '',
-          sub2api_free_group: cfg.sub2api_free_group || 'free',
+          sub2api_free_group: cfg.sub2api_free_group === undefined ? 'free' : cfg.sub2api_free_group,
           sub2api_pro_group: cfg.sub2api_pro_group || '',
           sub2api_integration_group: cfg.sub2api_integration_group || '',
           sub2api_mixed_group: cfg.sub2api_mixed_group || '',
@@ -744,10 +744,10 @@ export default function Register() {
               <div className="grid gap-4 md:grid-cols-2">
                 <Input label="Sub2API 地址" k="sub2api_url" placeholder="https://sub.example.com" />
                 <Input label="Admin API Key" k="sub2api_api_key" type="password" placeholder="admin-..." />
-                <Input label="Free 分组" k="sub2api_free_group" placeholder="free" />
-                <Input label="Pro 分组" k="sub2api_pro_group" placeholder="pro" />
-                <Input label="对接分组" k="sub2api_integration_group" placeholder="对接分组" />
-                <Input label="混合号池" k="sub2api_mixed_group" placeholder="混合号池" />
+                <Input label="默认上传：Free" k="sub2api_free_group" placeholder="free" />
+                <Input label="默认上传：Pro" k="sub2api_pro_group" placeholder="pro" />
+                <Input label="默认上传：对接" k="sub2api_integration_group" placeholder="对接分组" />
+                <Input label="默认上传：混合" k="sub2api_mixed_group" placeholder="混合号池" />
               </div>
               <div className="flex flex-wrap items-center gap-3">
                 <Button type="button" variant="outline" onClick={saveSub2ApiConfig} disabled={sub2apiSaveState === 'saving'}>

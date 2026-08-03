@@ -12,7 +12,6 @@ from infrastructure.accounts_repository import AccountsRepository
 
 logger = logging.getLogger(__name__)
 DEFAULT_SUB2API_GROUP = "free"
-PAID_PLAN_STATES = {"subscribed", "pro", "plus", "paid", "team", "business", "enterprise"}
 
 
 def _ldxp_register_account_name(account: Any) -> str:
@@ -224,42 +223,30 @@ def _get_sub2api_group_config() -> dict[str, str]:
     try:
         from core.config_store import config_store
 
+        configured = config_store.get_all()
         return {
-            "free": config_store.get("sub2api_free_group", "").strip() or DEFAULT_SUB2API_GROUP,
-            "pro": config_store.get("sub2api_pro_group", "").strip(),
-            "integration": config_store.get("sub2api_integration_group", "").strip(),
-            "mixed": config_store.get("sub2api_mixed_group", "").strip(),
+            # Preserve the historical free-only route until the user saves the
+            # new fields. Once a field exists, an empty value intentionally
+            # disables that target group.
+            "free": str(configured.get("sub2api_free_group", DEFAULT_SUB2API_GROUP) or "").strip(),
+            "pro": str(configured.get("sub2api_pro_group", "") or "").strip(),
+            "integration": str(configured.get("sub2api_integration_group", "") or "").strip(),
+            "mixed": str(configured.get("sub2api_mixed_group", "") or "").strip(),
         }
     except Exception:
         return {"free": DEFAULT_SUB2API_GROUP, "pro": "", "integration": "", "mixed": ""}
 
 
-def _is_paid_account(account: Any) -> bool:
-    plan_state = str(getattr(account, "plan_state", "") or "").strip().lower()
-    plan_name = str(getattr(account, "plan_name", "") or "").strip().lower()
-    return plan_state in PAID_PLAN_STATES or any(
-        hint in plan_name
-        for hint in ("pro", "plus", "paid", "team", "business", "enterprise")
-    )
-
-
-def _is_integration_account(account: Any) -> bool:
-    overview = dict(getattr(account, "overview", {}) or {})
-    legacy_extra = dict(overview.get("legacy_extra") or {})
-    source = str(legacy_extra.get("source") or overview.get("source") or "").strip().lower()
-    trade_no = str(legacy_extra.get("source_trade_no") or overview.get("source_trade_no") or "").strip()
-    return bool(trade_no or source in {"ldxp_public_order", "integration", "api"})
-
-
-def _target_group_names(account: Any) -> list[str]:
+def _target_group_names(_account: Any) -> list[str]:
     config = _get_sub2api_group_config()
-    primary = config.get("pro") if _is_paid_account(account) else config.get("free")
-    if not primary:
-        primary = config.get("free") or DEFAULT_SUB2API_GROUP
-    candidates = [primary]
-    if _is_integration_account(account):
-        candidates.append(config.get("integration", ""))
-    candidates.append(config.get("mixed", ""))
+    # Every successful registration goes to every configured target. These are
+    # distribution groups, not account-plan classifications.
+    candidates = [
+        config.get("free", ""),
+        config.get("pro", ""),
+        config.get("integration", ""),
+        config.get("mixed", ""),
+    ]
     result: list[str] = []
     for candidate in candidates:
         normalized = str(candidate or "").strip()
@@ -310,6 +297,9 @@ def push_saved_account_to_sub2api(
         return False
 
     target_groups = _target_group_names(account)
+    if not target_groups:
+        emit("  [Sub2API] 未配置上传目标分组，已跳过", level="warning")
+        return False
     emit(
         f"  [Sub2API] 开始上传: {account.email} -> {base_url.rstrip('/')}，"
         f"目标分组: {', '.join(target_groups)}"

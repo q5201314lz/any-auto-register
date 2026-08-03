@@ -122,7 +122,7 @@ def test_client_imports_once_and_binds_multiple_groups():
     assert put.call_args.kwargs["json"] == {"group_ids": [5, 8]}
 
 
-def test_paid_integration_account_routes_to_pro_integration_and_mixed_groups():
+def test_every_registered_account_routes_to_all_configured_groups():
     account = _account()
     account.plan_state = "subscribed"
     account.overview = {"legacy_extra": {"source_trade_no": "ORDER-1"}}
@@ -133,7 +133,7 @@ def test_paid_integration_account_routes_to_pro_integration_and_mixed_groups():
         "integration": "对接分组",
         "mixed": "混合号池",
     }):
-        assert _target_group_names(account) == ["pro", "对接分组", "混合号池"]
+        assert _target_group_names(account) == ["free", "pro", "对接分组", "混合号池"]
 
 
 def test_unconfigured_extra_groups_preserve_legacy_free_route():
