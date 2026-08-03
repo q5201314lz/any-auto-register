@@ -619,13 +619,19 @@ def test_managed_registration_pool_moves_failure_and_removes_success(tmp_path):
     assert failed.email == "retry@icloud.com"
     assert mailbox.release_email(failed, error="OAuth callback timeout")
 
-    retried = mailbox.get_email()
+    # Automatic allocation proceeds with new imports and does not recycle a
+    # failed row. A manually typed address can still deliberately retry it.
+    next_new = mailbox.get_email()
+    assert next_new.email == "success@icloud.com"
+    assert mailbox.release_email(next_new, error="temporary failure")
+
+    retried = mailbox.get_email_by_address("retry@icloud.com")
     assert retried.email == "retry@icloud.com"
     assert mailbox.mark_email_succeeded(retried)
 
     snapshot = mailbox.registration_pool_snapshot()
-    assert snapshot["new_count"] == 1
-    assert snapshot["failed_count"] == 0
+    assert snapshot["new_count"] == 0
+    assert snapshot["failed_count"] == 1
     assert snapshot["items"][0]["email"] == "success@icloud.com"
 
 
@@ -643,7 +649,7 @@ def test_managed_registration_pool_records_failure_details(tmp_path):
     snapshot = mailbox.registration_pool_snapshot()
     assert snapshot["new_count"] == 0
     assert snapshot["failed_count"] == 1
-    assert snapshot["available_count"] == 1
+    assert snapshot["available_count"] == 0
     assert snapshot["items"][0]["status"] == "failed"
     assert snapshot["items"][0]["attempts"] == 1
     assert snapshot["items"][0]["error"] == "invalid_state"

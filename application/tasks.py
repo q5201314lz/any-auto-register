@@ -300,8 +300,12 @@ def create_task(
 
 def create_register_task(payload: dict[str, Any]) -> dict[str, Any]:
     payload = dict(payload or {})
+    extra = dict(payload.get("extra") or {})
+    # Failed mailbox rows are retained for a deliberate, address-specific retry.
+    # New registration tasks must only consume freshly imported mailbox rows.
+    extra["local_mail_pool_include_retry_rows"] = False
+    payload["extra"] = extra
     if _bool_config(payload.get("run_all_mailboxes"), False):
-        extra = dict(payload.get("extra") or {})
         from core.base_identity import normalize_identity_provider
         from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
         from infrastructure.provider_settings_repository import ProviderSettingsRepository
@@ -456,7 +460,9 @@ def reconcile_local_mailbox_reservations() -> list[str]:
         definition = ProviderDefinitionsRepository().get_by_key("mailbox", provider_key) if provider_key else None
         if not definition or definition.driver_type not in {"local_ms_pool", "local_mail_pool"}:
             return []
-        settings = settings_repo.resolve_runtime_settings("mailbox", provider_key, {})
+        settings = settings_repo.resolve_runtime_settings(
+            "mailbox", provider_key, {"local_mail_pool_include_retry_rows": True}
+        )
         pool = LocalMicrosoftMailboxPool.from_config(settings)
         with Session(engine) as session:
             saved_emails = set(session.exec(select(AccountModel.email)).all())
@@ -1162,7 +1168,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     logger.set_result_data(result_data)
     if failed_items:
         logger.log(
-            f"失败邮箱统计: 去重后 {len(failed_items)} 个，已释放占用，将在下一批继续尝试",
+            f"失败邮箱统计: 去重后 {len(failed_items)} 个，已释放占用，已保留至累计邮箱池等待手动重试",
             event_type="summary",
         )
     summary = f"完成: 成功 {success} 个, 失败 {len(errors)} 个"

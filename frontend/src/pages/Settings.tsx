@@ -604,7 +604,7 @@ export function MailboxRegistrationPool() {
           </div>
           <div>
             <h3 className="text-sm font-semibold text-[var(--text-primary)]">待注册邮箱池</h3>
-            <p className="mt-0.5 text-xs text-[var(--text-muted)]">成功自动移出，失败保留到下一批。</p>
+            <p className="mt-0.5 text-xs text-[var(--text-muted)]">新入库自动注册；失败邮箱保留在累计池，需手动指定后重试。</p>
           </div>
         </div>
         <Button size="sm" variant="outline" onClick={load} disabled={loading} title="刷新邮箱池">
@@ -617,7 +617,7 @@ export function MailboxRegistrationPool() {
         {[
           ['新入库', pool.new_count],
           ['失败待重试', pool.failed_count],
-          ['可注册', pool.available_count],
+          ['新池可注册', pool.available_count],
           ['注册中', pool.running_count],
         ].map(([label, value]) => (
           <div key={String(label)} className="bg-[var(--bg-card)] px-4 py-3">

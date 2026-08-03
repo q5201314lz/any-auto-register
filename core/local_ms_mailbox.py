@@ -470,6 +470,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         graph_scope: str = "",
         allow_reuse: bool = False,
         avoid_repeat: bool = False,
+        include_retry_rows: bool = False,
         failure_cooldown_seconds: int = 0,
         proxy: str = None,
     ):
@@ -479,6 +480,9 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         self.graph_scope = str(graph_scope or DEFAULT_GRAPH_SCOPE).strip()
         self.allow_reuse = bool(allow_reuse)
         self.avoid_repeat = bool(avoid_repeat)
+        # Failed rows are a separate, user-controlled pool. Regular runs must
+        # never consume them merely because they are available in the state file.
+        self.include_retry_rows = bool(include_retry_rows)
         self._attempted_keys: set[str] = set()
         self.failure_cooldown_seconds = max(int(failure_cooldown_seconds or 0), 0)
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
@@ -493,18 +497,20 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             graph_scope=config.get("local_ms_graph_scope", ""),
             allow_reuse=_truthy(config.get("local_mail_pool_allow_reuse") if "local_mail_pool_allow_reuse" in config else config.get("local_ms_pool_allow_reuse")),
             avoid_repeat=_truthy(config.get("local_mail_pool_avoid_repeat")),
+            include_retry_rows=_truthy(config.get("local_mail_pool_include_retry_rows")),
             failure_cooldown_seconds=config.get("local_mail_pool_failure_cooldown_seconds", 0),
             proxy=config.get("proxy") or None,
         )
 
-    def _load_pool_text(self) -> str:
+    def _load_pool_text(self, *, include_retry_rows: bool | None = None) -> str:
         chunks: list[str] = []
         state = self._state()
         retry_rows = dict(state.get("retry_rows") or {})
         pending_rows = dict(state.get("pending_rows") or {})
+        include_retry_rows = self.include_retry_rows if include_retry_rows is None else include_retry_rows
         managed_rows = [
             str(item.get("raw") or "").strip()
-            for rows in (retry_rows, pending_rows)
+            for rows in ((retry_rows,) if include_retry_rows else ()) + (pending_rows,)
             for item in rows.values()
             if isinstance(item, dict) and str(item.get("raw") or "").strip()
         ]
@@ -522,14 +528,14 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             raise RuntimeError("本地邮箱池为空，请粘贴心蓝格式、邮箱接码地址、密码 + MFA 账号或配置文件路径")
         return combined
 
-    def _entries(self) -> list[LocalMicrosoftMailboxEntry]:
-        entries = parse_xinlan_common_rows(self._load_pool_text())
+    def _entries(self, *, include_retry_rows: bool | None = None) -> list[LocalMicrosoftMailboxEntry]:
+        entries = parse_xinlan_common_rows(self._load_pool_text(include_retry_rows=include_retry_rows))
         if not entries:
             raise RuntimeError("本地邮箱池未解析到有效邮箱")
         return entries
 
-    def _usable_entries(self) -> list[LocalMicrosoftMailboxEntry]:
-        entries = [entry for entry in self._entries() if entry.usable_ready]
+    def _usable_entries(self, *, include_retry_rows: bool | None = None) -> list[LocalMicrosoftMailboxEntry]:
+        entries = [entry for entry in self._entries(include_retry_rows=include_retry_rows) if entry.usable_ready]
         if not entries:
             raise RuntimeError("本地邮箱池没有可用账号，请提供密码 + MFA，或接码 URL、Microsoft OAuth、IMAP 收件配置")
         return entries
@@ -583,7 +589,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         if not key:
             return False
         with self._lock:
-            entries = {entry.key: entry for entry in self._entries()}
+            entries = {entry.key: entry for entry in self._entries(include_retry_rows=True)}
             state = self._state()
             used = dict(state.get("used") or {})
             if key not in used:
@@ -742,7 +748,11 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             return {
                 "new_count": len(pending_rows),
                 "failed_count": len(retry_rows),
-                "available_count": sum(1 for item in items if not item["in_use"]),
+                # This is the automatic-registration capacity: only new rows.
+                # Failed rows remain visible but are deliberately manual-only.
+                "available_count": sum(
+                    1 for item in items if item["status"] == "new" and not item["in_use"]
+                ),
                 "running_count": sum(1 for item in items if item["in_use"]),
                 "items": items,
             }
@@ -826,7 +836,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         key = str(email or "").strip().lower()
         if not key:
             return ""
-        for entry in self._entries():
+        for entry in self._entries(include_retry_rows=True):
             if entry.key == key:
                 return entry.raw
         return ""
@@ -885,7 +895,10 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         if not key:
             raise ValueError("指定邮箱不能为空")
         with self._lock:
-            entry = next((item for item in self._usable_entries() if item.key == key), None)
+            # A typed address is an explicit manual retry request. It may target
+            # the accumulated-failure pool, while automatic allocation remains
+            # restricted to newly imported rows.
+            entry = next((item for item in self._usable_entries(include_retry_rows=True) if item.key == key), None)
             if entry is None:
                 raise RuntimeError(f"指定邮箱不在本地邮箱池中或格式不可用: {email}")
             state = self._state()
