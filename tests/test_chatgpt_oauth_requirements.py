@@ -454,6 +454,56 @@ def test_protocol_existing_account_otp_does_not_resend_email():
     assert engine._otp_sent_at is not None
 
 
+def test_codex_consent_browser_fallback_reuses_current_oauth_session(monkeypatch):
+    added_cookies = []
+    visited_urls = []
+
+    class FakePage:
+        context = SimpleNamespace(add_cookies=lambda cookies: added_cookies.extend(cookies))
+
+        @staticmethod
+        def goto(url, **kwargs):
+            visited_urls.append(url)
+
+    class FakeBrowser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        @staticmethod
+        def new_page():
+            return FakePage()
+
+    monkeypatch.setattr("camoufox.sync_api.Camoufox", lambda **kwargs: FakeBrowser())
+    monkeypatch.setattr(browser_register_module, "_build_proxy_config", lambda proxy: None)
+    monkeypatch.setattr(browser_register_module, "_camoufox_launch_options", lambda **kwargs: {})
+    monkeypatch.setattr(
+        browser_register_module,
+        "_complete_oauth_in_browser",
+        lambda page, oauth, proxy, log: {"access_token": "at", "refresh_token": "rt"},
+    )
+
+    engine = object.__new__(RegistrationEngine)
+    engine.proxy_url = None
+    engine._codex_otp_continue_url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+    engine._log = lambda message, level="info": None
+    engine._session_cookies_for_browser = lambda session: [
+        {"name": "session", "value": "value", "domain": "auth.openai.com", "path": "/"}
+    ]
+    oauth = SimpleNamespace(
+        state="state",
+        code_verifier="verifier",
+        redirect_uri="http://localhost:1455/auth/callback",
+        client_id="client",
+    )
+
+    assert engine._complete_codex_consent_in_browser(object(), oauth)["refresh_token"] == "rt"
+    assert visited_urls == [engine._codex_otp_continue_url]
+    assert added_cookies[0]["name"] == "session"
+
+
 def test_protocol_password_challenge_uses_browser_passwordless_action(monkeypatch):
     engine = object.__new__(RegistrationEngine)
     engine.email = "user@example.com"

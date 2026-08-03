@@ -327,6 +327,7 @@ class RegistrationEngine:
         self._otp_page_type: Optional[str] = None
         self._last_codex_error: str = ""
         self._codex_direct_token_info: Optional[Dict[str, Any]] = None
+        self._codex_otp_continue_url: str = ""
         self._has_supplied_login_password = False
         self.force_email_otp_login = False
         # chatgpt.com NextAuth is occasionally challenged at the network edge
@@ -1555,6 +1556,63 @@ class RegistrationEngine:
             (self._debug_log if quiet else self._log)(f"Codex consent 处理失败: {exc}", "error")
             return None
 
+    def _complete_codex_consent_in_browser(self, login_session, codex_oauth) -> Optional[Dict[str, Any]]:
+        """Finish only consent/workspace in a browser while preserving OAuth state."""
+        try:
+            from camoufox.sync_api import Camoufox
+            from platforms.chatgpt.browser_register import (
+                _build_proxy_config,
+                _camoufox_launch_options,
+                _complete_oauth_in_browser,
+                _extract_callback_url_from_exception,
+            )
+            from .constants import OPENAI_AUTH
+
+            proxy = _build_proxy_config(self.proxy_url)
+            launch_opts = _camoufox_launch_options(headless=True, proxy=proxy)
+            target_url = str(getattr(self, "_codex_otp_continue_url", "") or "").strip()
+            if not target_url:
+                target_url = f"{OPENAI_AUTH}/sign-in-with-chatgpt/codex/consent"
+            elif target_url.startswith("/"):
+                target_url = f"{OPENAI_AUTH}{target_url}"
+
+            self._log("Codex 协议会话未返回 callback，使用同一 OAuth 会话完成 consent...")
+            with Camoufox(**launch_opts) as browser:
+                page = browser.new_page()
+                cookies = self._session_cookies_for_browser(login_session)
+                if cookies:
+                    page.context.add_cookies(cookies)
+                try:
+                    page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                except Exception as exc:
+                    callback_url = _extract_callback_url_from_exception(exc)
+                    if not callback_url:
+                        raise
+                    from platforms.chatgpt.oauth import submit_callback_url
+                    return json.loads(submit_callback_url(
+                        callback_url=callback_url,
+                        expected_state=codex_oauth.state,
+                        code_verifier=codex_oauth.code_verifier,
+                        redirect_uri=codex_oauth.redirect_uri,
+                        client_id=codex_oauth.client_id,
+                        proxy_url=self.proxy_url,
+                    ))
+
+                token_info = _complete_oauth_in_browser(
+                    page,
+                    codex_oauth,
+                    self.proxy_url,
+                    self._log,
+                )
+                if token_info and token_info.get("refresh_token"):
+                    self._log("Codex consent 完成，已获取 refresh_token(rt)")
+                    return token_info
+                self._log("Codex consent 浏览器补全未获取到 refresh_token(rt)", "warning")
+                return None
+        except Exception as exc:
+            self._log(f"Codex consent 浏览器补全失败: {exc}", "warning")
+            return None
+
     def _complete_codex_email_otp(
         self,
         login_session,
@@ -1616,7 +1674,9 @@ class RegistrationEngine:
             self._log(f"Codex login OTP 失败: {otp_resp.text[:200]}", "error")
             return None
 
-        otp_page = str((otp_resp.json().get("page") or {}).get("type") or "")
+        otp_data = otp_resp.json() or {}
+        self._codex_otp_continue_url = str(otp_data.get("continue_url") or "").strip()
+        otp_page = str((otp_data.get("page") or {}).get("type") or "")
         self._debug_log(f"Codex login OTP -> page_type={otp_page}")
         return otp_page
 
@@ -2516,6 +2576,11 @@ class RegistrationEngine:
                             login_session,
                             codex_oauth,
                         )
+                        if not codex_callback:
+                            codex_token_info = self._complete_codex_consent_in_browser(
+                                login_session,
+                                codex_oauth,
+                            )
 
                     if codex_callback:
                         self._log("Codex CLI callback 获取成功")
@@ -2530,10 +2595,12 @@ class RegistrationEngine:
                         codex_token_info = json.loads(token_json)
                         self._log(f"Codex token 成功: keys={list(codex_token_info.keys())}")
                     elif not codex_token_info:
+                        self._last_codex_error = "Codex callback 未获取，当前会话未完成 consent/workspace"
                         self._log("Codex callback 未获取，当前会话未完成 consent/workspace", "warning")
                 else:
                     self._log(f"Codex 非 OTP 流程 ({page_type})，跳过", "warning")
             except Exception as e:
+                self._last_codex_error = str(e)
                 self._log(f"Codex CLI 登录失败: {e}", "warning")
 
             # 提取账户信息：必须使用 Codex CLI token，且必须带 refresh_token(rt)。
@@ -2544,7 +2611,10 @@ class RegistrationEngine:
                 result.refresh_token = codex_token_info.get("refresh_token", "") or codex_token_info.get("rt", "")
                 result.id_token = codex_token_info.get("id_token", "")
             else:
+                detail = str(self._last_codex_error or "").strip()
                 result.error_message = "未获取到 Codex CLI token/refresh_token(rt)，不计入成功"
+                if detail:
+                    result.error_message += f": {detail}"
                 self._log(result.error_message, "error")
                 return result
 

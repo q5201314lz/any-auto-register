@@ -827,6 +827,20 @@ def _int_config(value: Any, default: int) -> int:
         return default
 
 
+def _register_attempt_budget(
+    *,
+    count: int,
+    exhaustive_mailbox_run: bool,
+    herosms_enabled: bool,
+    max_success: int,
+    sms_settings: dict[str, Any],
+) -> int:
+    if exhaustive_mailbox_run or not herosms_enabled:
+        return max(count, 1)
+    multiplier = max(_int_config(sms_settings.get("register_account_max_attempts"), 1), 1)
+    return max(max_success * multiplier, 1)
+
+
 def _auto_followup_windsurf_payment(
     *,
     platform_name: str,
@@ -951,6 +965,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     sms_provider_key, sms_settings = _resolve_sms_provider_for_task(extra)
     herosms_enabled = sms_provider_key in {"herosms", "herosms_api"} and bool(str(sms_settings.get("herosms_api_key") or "").strip())
     hero_extra_max = max(_int_config(sms_settings.get("register_phone_extra_max"), 3), 0) if herosms_enabled else 0
+    hero_attempt_multiplier = max(_int_config(sms_settings.get("register_account_max_attempts"), 1), 1) if herosms_enabled else 1
     hero_reuse_to_max = False
     target_success = count
     max_success = count + hero_extra_max if herosms_enabled and hero_reuse_to_max else count
@@ -959,7 +974,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     logger.set_progress(0, progress_total)
     if herosms_enabled:
         logger.log(
-            f"HeroSMS 模式: 成功目标 {target_success}，失败自动补尝试；手机号不复用"
+            f"HeroSMS 模式: 成功目标 {target_success}，每个目标最多尝试 {hero_attempt_multiplier} 次；手机号不复用"
         )
 
     try:
@@ -1078,7 +1093,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         completed = 0
         futures: dict[Any, int] = {}
         exhaustive_mailbox_run = _bool_config(payload.get("run_all_mailboxes"), False)
-        max_attempts = max(count if exhaustive_mailbox_run or not herosms_enabled else max_success * 3, 1)
+        max_attempts = _register_attempt_budget(
+            count=count,
+            exhaustive_mailbox_run=exhaustive_mailbox_run,
+            herosms_enabled=herosms_enabled,
+            max_success=max_success,
+            sms_settings=sms_settings,
+        )
 
         def _hero_phone_alive() -> bool:
             if not (herosms_enabled and hero_reuse_to_max):
