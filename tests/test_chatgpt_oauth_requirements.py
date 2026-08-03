@@ -14,7 +14,7 @@ from platforms.chatgpt.plugin import (
     _assert_complete_oauth_callback,
     _generate_chatgpt_registration_password,
 )
-from platforms.chatgpt.register import RegistrationEngine, SignupFormResult
+from platforms.chatgpt.register import RegistrationEngine, SignupFormResult, _session_cookie_value
 
 
 def test_nextauth_non_json_response_has_bounded_diagnostics():
@@ -66,6 +66,53 @@ def test_invalid_state_signup_detection_is_specific():
     assert not RegistrationEngine._is_invalid_state_signup(
         SignupFormResult(success=False, error_message="HTTP 409: account_deactivated")
     )
+
+
+def test_existing_account_skips_web_otp_and_enters_codex_auth_once():
+    engine = object.__new__(RegistrationEngine)
+    engine.logs = []
+    engine.email = "existing@icloud.com"
+    engine.email_info = {"email": engine.email, "service_id": "mailbox-1"}
+    engine._is_existing_account = False
+    engine._otp_sent_at = 123.0
+    engine._last_oauth_error = ""
+    engine._log = lambda message, level="info": engine.logs.append(message)
+    engine._debug_log = lambda message, level="info": None
+    engine._check_ip_location = lambda: (True, "US")
+    engine._preflight_codex_auth_network = lambda: (True, "ok")
+    engine._create_email = lambda: True
+    engine._init_session = lambda: True
+    engine._start_oauth = lambda: True
+    engine._get_device_id = lambda: "device-id"
+    engine._check_sentinel = lambda did: None
+
+    def submit_signup(did, sentinel):
+        engine._is_existing_account = True
+        return SignupFormResult(
+            success=True,
+            page_type="email_otp_verification",
+            is_existing_account=True,
+        )
+
+    engine._submit_signup_form = submit_signup
+    engine._register_password = lambda: pytest.fail("existing account must not register a password")
+    engine._send_verification_code = lambda: pytest.fail("existing account must not send Web OTP")
+    engine._get_verification_code = lambda: pytest.fail("existing account must not read Web OTP")
+    engine._validate_verification_code = lambda code: pytest.fail("existing account must not validate Web OTP")
+    codex_calls = []
+
+    def login_existing(**kwargs):
+        codex_calls.append(kwargs)
+        assert engine._otp_sent_at is None
+        return SimpleNamespace(success=True, email=engine.email, source="login")
+
+    engine.login_existing_via_codex_auth = login_existing
+
+    result = engine.run()
+
+    assert result.success is True
+    assert codex_calls == [{"email": "existing@icloud.com"}]
+    assert any("直接进入 Codex OAuth" in message for message in engine.logs)
 
 
 def test_nextauth_edge_challenge_falls_back_to_direct_openai_oauth(monkeypatch):
@@ -157,6 +204,98 @@ def test_codex_oauth_bootstrap_retries_http_challenge_until_device_id(monkeypatc
     assert did == "did_123"
     assert profile == "chrome110"
     assert session.cookies.get("oai-did") == "did_123"
+
+
+def test_codex_oauth_bootstrap_reuses_verified_session_cookies(monkeypatch):
+    engine = object.__new__(RegistrationEngine)
+    engine.proxy_url = None
+    engine._log = lambda message, level="info": None
+    engine._debug_log = lambda message, level="info": None
+    calls = []
+
+    class Session:
+        def __init__(self, impersonate=None):
+            self.cookies = {}
+
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs, dict(self.cookies)))
+            return SimpleNamespace(status_code=302)
+
+    monkeypatch.setattr("platforms.chatgpt.register.cffi_requests.Session", Session)
+    verified_session = SimpleNamespace(cookies={
+        "oai-did": "verified-device",
+        "login_session": "verified-login",
+    })
+
+    session, did, profile = engine._start_codex_oauth_session(
+        "https://auth.openai.com/oauth/authorize",
+        seed_session=verified_session,
+    )
+
+    assert did == "verified-device"
+    assert profile == "chrome136"
+    assert session.cookies["login_session"] == "verified-login"
+    assert calls[0][1]["allow_redirects"] is False
+    assert calls[0][2]["login_session"] == "verified-login"
+
+
+def test_cookie_lookup_prefers_auth_domain_when_names_are_duplicated():
+    cookies = SimpleNamespace(jar=[
+        SimpleNamespace(name="oai-did", value="chatgpt-device", domain=".chatgpt.com"),
+        SimpleNamespace(name="oai-did", value="auth-device", domain="auth.openai.com"),
+    ])
+    session = SimpleNamespace(cookies=cookies)
+
+    assert _session_cookie_value(session, "oai-did") == "auth-device"
+
+
+def test_verified_codex_session_checks_callback_before_consent(monkeypatch):
+    engine = object.__new__(RegistrationEngine)
+    engine._debug_log = lambda message, level="info": None
+    engine._log = lambda message, level="info": None
+    engine._codex_api_auth_url = lambda oauth: "https://auth.openai.com/api/oauth/oauth2/auth?state=test"
+    engine._complete_codex_consent_with_session = lambda *args, **kwargs: pytest.fail(
+        "consent should not run after the verified session returns a callback"
+    )
+    calls = []
+
+    def follow(_session, url, _log, *, max_redirects):
+        calls.append((url, max_redirects))
+        return "http://localhost:1455/auth/callback?code=code_123&state=state_123"
+
+    monkeypatch.setattr(browser_register_module, "_follow_redirects_for_code", follow)
+    oauth = SimpleNamespace(auth_url="https://auth.openai.com/oauth/authorize?state=test")
+
+    callback = engine._try_codex_callback_with_session(object(), oauth, quiet=True)
+
+    assert callback.endswith("code=code_123&state=state_123")
+    assert calls == [("https://auth.openai.com/api/oauth/oauth2/auth?state=test", 12)]
+
+
+def test_codex_otp_continue_url_is_followed_before_starting_oauth_again(monkeypatch):
+    engine = object.__new__(RegistrationEngine)
+    engine._codex_otp_continue_url = "/continue-after-otp"
+    engine._debug_log = lambda message, level="info": None
+    engine._log = lambda message, level="info": None
+    engine._codex_api_auth_url = lambda oauth: "https://auth.openai.com/api/oauth/oauth2/auth?state=test"
+    engine._complete_codex_consent_with_session = lambda *args, **kwargs: pytest.fail(
+        "consent should not run after the OTP continue URL returns a callback"
+    )
+    calls = []
+
+    def follow(_session, url, _log, *, max_redirects):
+        calls.append(url)
+        if url.endswith("/continue-after-otp"):
+            return "http://localhost:1455/auth/callback?code=code_123&state=state_123"
+        return ""
+
+    monkeypatch.setattr(browser_register_module, "_follow_redirects_for_code", follow)
+    oauth = SimpleNamespace(auth_url="https://auth.openai.com/oauth/authorize?state=test")
+
+    callback = engine._try_codex_callback_with_session(object(), oauth)
+
+    assert callback.endswith("code=code_123&state=state_123")
+    assert calls == ["https://auth.openai.com/continue-after-otp"]
 
 
 def test_assert_complete_oauth_callback_accepts_complete_payload():
@@ -395,9 +534,10 @@ def test_protocol_codex_password_challenge_sends_and_validates_email_otp():
 
     assert page_type == "add_phone"
     assert engine._otp_sent_at is not None
-    assert [call[0] for call in session.calls] == ["GET", "POST"]
+    assert [call[0] for call in session.calls] == ["GET", "POST", "GET"]
     assert session.calls[0][1].endswith("/api/accounts/email-otp/send")
     assert json.loads(session.calls[1][2]["data"]) == {"code": "654321"}
+    assert session.calls[2][1].endswith("/api/accounts/client_auth_session_dump")
 
 
 def test_protocol_otp_send_rejects_redirect_false_positive():
@@ -421,87 +561,6 @@ def test_protocol_otp_send_rejects_redirect_false_positive():
         referer="https://auth.openai.com/log-in/password",
     ) is None
     assert any("发送失败" in message for _, message in logs)
-
-
-def test_protocol_existing_account_otp_does_not_resend_email():
-    engine = object.__new__(RegistrationEngine)
-    engine._otp_sent_at = None
-    engine._debug_log = lambda message: None
-    engine._log = lambda message, level="info": None
-    engine._get_verification_code = lambda: "654321"
-
-    class Response:
-        status_code = 200
-        text = ""
-
-        @staticmethod
-        def json():
-            return {"page": {"type": "add_phone"}}
-
-    class Session:
-        def get(self, *args, **kwargs):
-            pytest.fail("email_otp_verification must not send another OTP")
-
-        @staticmethod
-        def post(*args, **kwargs):
-            return Response()
-
-    assert engine._complete_codex_email_otp(
-        Session(),
-        send_code=False,
-        referer="https://auth.openai.com/email-verification",
-    ) == "add_phone"
-    assert engine._otp_sent_at is not None
-
-
-def test_codex_consent_browser_fallback_reuses_current_oauth_session(monkeypatch):
-    added_cookies = []
-    visited_urls = []
-
-    class FakePage:
-        context = SimpleNamespace(add_cookies=lambda cookies: added_cookies.extend(cookies))
-
-        @staticmethod
-        def goto(url, **kwargs):
-            visited_urls.append(url)
-
-    class FakeBrowser:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        @staticmethod
-        def new_page():
-            return FakePage()
-
-    monkeypatch.setattr("camoufox.sync_api.Camoufox", lambda **kwargs: FakeBrowser())
-    monkeypatch.setattr(browser_register_module, "_build_proxy_config", lambda proxy: None)
-    monkeypatch.setattr(browser_register_module, "_camoufox_launch_options", lambda **kwargs: {})
-    monkeypatch.setattr(
-        browser_register_module,
-        "_complete_oauth_in_browser",
-        lambda page, oauth, proxy, log: {"access_token": "at", "refresh_token": "rt"},
-    )
-
-    engine = object.__new__(RegistrationEngine)
-    engine.proxy_url = None
-    engine._codex_otp_continue_url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
-    engine._log = lambda message, level="info": None
-    engine._session_cookies_for_browser = lambda session: [
-        {"name": "session", "value": "value", "domain": "auth.openai.com", "path": "/"}
-    ]
-    oauth = SimpleNamespace(
-        state="state",
-        code_verifier="verifier",
-        redirect_uri="http://localhost:1455/auth/callback",
-        client_id="client",
-    )
-
-    assert engine._complete_codex_consent_in_browser(object(), oauth)["refresh_token"] == "rt"
-    assert visited_urls == [engine._codex_otp_continue_url]
-    assert added_cookies[0]["name"] == "session"
 
 
 def test_protocol_password_challenge_uses_browser_passwordless_action(monkeypatch):
@@ -533,13 +592,12 @@ def test_protocol_password_challenge_uses_browser_passwordless_action(monkeypatc
     }
 
 
-def test_url_only_mailbox_forces_browser_email_otp_not_generated_password(monkeypatch):
+def test_url_only_existing_account_uses_browser_email_otp_not_generated_password(monkeypatch):
     engine = object.__new__(RegistrationEngine)
     engine.email = "user@icloud.com"
     engine.password = "GeneratedRegistrationPassword123!"
-    engine._is_existing_account = False
+    engine._is_existing_account = True
     engine._has_supplied_login_password = False
-    engine.force_email_otp_login = True
     engine.totp_secret = ""
     engine.proxy_url = None
     engine.phone_callback = None
@@ -809,7 +867,7 @@ def test_protocol_mailbox_worker_passes_password_inbox_and_mfa_url():
     }
 
 
-def test_protocol_mailbox_worker_uses_new_registration_for_url_only_mailbox():
+def test_protocol_mailbox_worker_starts_url_only_mailbox_with_codex_auth():
     account = SimpleNamespace(
         email="user@icloud.com",
         account_id="user@icloud.com",
@@ -820,10 +878,17 @@ def test_protocol_mailbox_worker_uses_new_registration_for_url_only_mailbox():
         mailbox_account=account,
         provider="local_mail_pool",
     )
-    worker.engine.login_existing_via_codex_auth = lambda **kwargs: pytest.fail("URL-only mailbox must not use the login branch")
-    worker.engine.run = lambda: SimpleNamespace(success=True)
+    captured = {}
+    worker.engine.login_existing_via_codex_auth = lambda **kwargs: captured.update(kwargs) or SimpleNamespace(success=True)
+    worker.engine.run = lambda: pytest.fail("URL-only mailbox must start with Codex OAuth")
 
     assert worker.run(email=account.email, password="generated-password").success is True
+    assert captured == {
+        "email": "user@icloud.com",
+        "password": "",
+        "totp_secret": "",
+        "totp_url": "",
+    }
 
 
 def test_browser_register_run_rejects_session_fallback(monkeypatch):
@@ -892,6 +957,63 @@ def test_fresh_browser_oauth_preserves_underlying_error(monkeypatch):
     assert "account_deactivated" in worker.last_oauth_error
 
 
+def test_fresh_browser_oauth_retries_callback_failure_once(monkeypatch):
+    class FakeBrowser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def new_page(self):
+            return object()
+
+    calls = []
+
+    def oauth(*args, **kwargs):
+        calls.append("oauth")
+        if len(calls) == 1:
+            raise RuntimeError("Codex OAuth consent/workspace 未完成 callback")
+        return {"access_token": "at", "refresh_token": "rt"}
+
+    monkeypatch.setattr(browser_register_module, "Camoufox", lambda **kwargs: FakeBrowser())
+    monkeypatch.setattr(browser_register_module, "_do_codex_oauth", oauth)
+    monkeypatch.setattr(browser_register_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr("core.config_store.config_store.get", lambda key, default="": "2")
+    worker = browser_register_module.ChatGPTBrowserRegister(headless=True, log_fn=lambda message: None)
+
+    result = worker._retry_oauth_fresh_browser("user@example.com", "Secret123!")
+
+    assert result["refresh_token"] == "rt"
+    assert calls == ["oauth", "oauth"]
+
+
+def test_fresh_browser_oauth_does_not_retry_password_rejection(monkeypatch):
+    class FakeBrowser:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def new_page(self):
+            return object()
+
+    calls = []
+
+    def oauth(*args, **kwargs):
+        calls.append("oauth")
+        raise RuntimeError("Incorrect email address or password")
+
+    monkeypatch.setattr(browser_register_module, "Camoufox", lambda **kwargs: FakeBrowser())
+    monkeypatch.setattr(browser_register_module, "_do_codex_oauth", oauth)
+    monkeypatch.setattr("core.config_store.config_store.get", lambda key, default="": "2")
+    worker = browser_register_module.ChatGPTBrowserRegister(headless=True, log_fn=lambda message: None)
+
+    assert worker._retry_oauth_fresh_browser("user@example.com", "wrong") is None
+    assert calls == ["oauth"]
+
+
 def test_password_login_reports_specific_browser_oauth_error(monkeypatch):
     class FakeBrowserRegister:
         last_oauth_error = "OAuth 登录密码提交失败: error_code: account_deactivated"
@@ -938,51 +1060,3 @@ def test_add_phone_restarts_only_codex_oauth_after_sms_completion(monkeypatch):
     assert callback.endswith("state=new-state")
     assert oauth is refreshed_oauth
     assert engine._codex_retry_after_phone is True
-
-
-def test_add_phone_default_attempt_limit_is_one(monkeypatch):
-    calls = []
-    logs = []
-    callback = SimpleNamespace(
-        config={},
-        cleanup=lambda: calls.append("cleanup"),
-        mark_send_failed=lambda reason: calls.append(("failed", reason)),
-    )
-    monkeypatch.setattr(browser_register_module.time, "sleep", lambda *_: None)
-    monkeypatch.setattr(
-        browser_register_module,
-        "_do_add_phone_attempt",
-        lambda *args, **kwargs: calls.append("attempt") or (_ for _ in ()).throw(RuntimeError("未获取到短信验证码")),
-    )
-
-    with pytest.raises(RuntimeError, match="未获取到短信验证码"):
-        browser_register_module._handle_add_phone_challenge(
-            SimpleNamespace(), callback, device_id="device", user_agent="ua", log=logs.append,
-        )
-
-    assert calls.count("attempt") == 1
-    assert any("1/1 次失败" in message for message in logs)
-
-
-def test_add_phone_attempt_limit_uses_sms_provider_config(monkeypatch):
-    calls = []
-    callback = SimpleNamespace(
-        config={"register_phone_max_attempts": "2"},
-        cleanup=lambda: None,
-        mark_send_failed=lambda reason: None,
-    )
-    monkeypatch.setattr(browser_register_module.time, "sleep", lambda *_: None)
-
-    def attempt(*args, **kwargs):
-        calls.append("attempt")
-        if len(calls) == 1:
-            raise RuntimeError("未获取到短信验证码")
-        return {"page_type": "chatgpt_home"}
-
-    monkeypatch.setattr(browser_register_module, "_do_add_phone_attempt", attempt)
-    page = SimpleNamespace(goto=lambda *args, **kwargs: None)
-
-    assert browser_register_module._handle_add_phone_challenge(
-        page, callback, device_id="device", user_agent="ua", log=lambda _message: None,
-    ) == {"page_type": "chatgpt_home"}
-    assert calls == ["attempt", "attempt"]

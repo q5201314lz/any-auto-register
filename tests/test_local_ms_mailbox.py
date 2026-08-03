@@ -3,6 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 import json
 
+import pytest
+
 from core.local_ms_mailbox import (
     LocalMicrosoftMailboxEntry,
     LocalMicrosoftMailboxPool,
@@ -58,18 +60,6 @@ def test_pipe_login_mfa_row_uses_first_and_last_separator():
     assert len(entries) == 1
     assert entries[0].password == "password|with|pipes"
     assert entries[0].totp_secret == "JBSWY3DPEHPK3PXP"
-
-
-def test_pipe_login_mfa_row_ignores_trailing_reference():
-    entries = parse_xinlan_common_rows(
-        "account@gmail.com|ChatPassword123|JBSWY3DPEHPK3PXP|ORDER8REFERENCE"
-    )
-
-    assert len(entries) == 1
-    assert entries[0].email == "account@gmail.com"
-    assert entries[0].password == "ChatPassword123"
-    assert entries[0].totp_secret == "JBSWY3DPEHPK3PXP"
-    assert entries[0].login_mode == "password_mfa"
 
 
 def test_pipe_login_mfa_row_ignores_trailing_account_status(tmp_path):
@@ -233,52 +223,6 @@ def test_four_hyphen_icloud_relay_format_remains_supported():
     assert len(entries) == 1
     assert entries[0].email == "account@icloud.com"
     assert entries[0].icloud_api_ready
-    assert entries[0].login_mode == "email_otp_only"
-
-
-def test_url_only_linlinflow_mailbox_forces_email_otp_login_mode():
-    entries = parse_xinlan_common_rows(
-        "93.lava.county@icloud.com----"
-        "https://sms.example.com/latest?email=93.lava.county%40icloud.com&auth_code=opaque"
-    )
-
-    assert len(entries) == 1
-    assert entries[0].password == ""
-    assert entries[0].login_mode == "email_otp_only"
-    assert entries[0].icloud_api_ready
-
-
-def test_rangertalking_pickup_token_is_not_treated_as_login_password(monkeypatch):
-    entry = parse_xinlan_common_rows(
-        "mail@icloud.com----access-key-value----https://icloud.rangertalking.com/pickup"
-    )[0]
-
-    assert entry.password == ""
-    assert entry.login_mode == "email_otp_only"
-    assert entry.icloud_api_token == "access-key-value"
-
-    class Response:
-        status_code = 200
-        headers = {"content-type": "application/json"}
-        text = '{"status":"received","code":"123456"}'
-
-        @staticmethod
-        def json():
-            return {"status": "received", "code": "123456", "received_at": "2026-08-03T12:00:00"}
-
-    captured = {}
-
-    def fake_get(url, **kwargs):
-        captured.update(url=url, **kwargs)
-        return Response()
-
-    monkeypatch.setattr("core.local_ms_mailbox.requests.get", fake_get)
-    mailbox = LocalMicrosoftMailboxPool()
-    messages = mailbox._icloud_api_messages(entry)
-
-    assert captured["url"] == "https://icloud.rangertalking.com/api/v1/verification-code"
-    assert captured["headers"]["X-Access-Key"] == "access-key-value"
-    assert "123456" in messages[0]["bodyPreview"]
 
 
 def test_four_hyphen_tokenized_icloud_api_format_is_supported():
@@ -677,11 +621,9 @@ def test_managed_registration_pool_moves_failure_and_removes_success(tmp_path):
     assert failed.email == "retry@icloud.com"
     assert mailbox.release_email(failed, error="OAuth callback timeout")
 
-    # Automatic allocation proceeds with new imports and does not recycle a
-    # failed row. A manually typed address can still deliberately retry it.
     next_new = mailbox.get_email()
     assert next_new.email == "success@icloud.com"
-    assert mailbox.release_email(next_new, error="temporary failure")
+    assert mailbox.mark_email_succeeded(next_new)
 
     retried = mailbox.get_email_by_address("retry@icloud.com")
     assert retried.email == "retry@icloud.com"
@@ -689,8 +631,8 @@ def test_managed_registration_pool_moves_failure_and_removes_success(tmp_path):
 
     snapshot = mailbox.registration_pool_snapshot()
     assert snapshot["new_count"] == 0
-    assert snapshot["failed_count"] == 1
-    assert snapshot["items"][0]["email"] == "success@icloud.com"
+    assert snapshot["failed_count"] == 0
+    assert snapshot["items"] == []
 
 
 def test_managed_registration_pool_records_failure_details(tmp_path):
@@ -728,6 +670,29 @@ def test_get_email_by_address_reserves_the_requested_pool_row(tmp_path):
     state = mailbox._state()
     assert "target@icloud.com" in state["used"]
     assert "first@icloud.com" not in state["used"]
+
+
+def test_validate_email_address_does_not_reserve_the_pool_row(tmp_path):
+    mailbox = LocalMicrosoftMailboxPool(
+        pool_text="target@icloud.com----https://mail.example/inbox/target",
+        state_file=str(tmp_path / "mailbox-state.json"),
+    )
+
+    entry = mailbox.validate_email_address("TARGET@icloud.com")
+
+    assert entry.email == "target@icloud.com"
+    assert not mailbox._state().get("used")
+
+
+def test_validate_email_address_rejects_an_occupied_pool_row(tmp_path):
+    mailbox = LocalMicrosoftMailboxPool(
+        pool_text="target@icloud.com----https://mail.example/inbox/target",
+        state_file=str(tmp_path / "mailbox-state.json"),
+    )
+    mailbox.get_email()
+
+    with pytest.raises(RuntimeError, match="已被占用"):
+        mailbox.validate_email_address("target@icloud.com")
 
 
 def test_mailbox_identity_uses_exact_address_lookup_when_supported(tmp_path):

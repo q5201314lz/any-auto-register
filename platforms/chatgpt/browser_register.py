@@ -2056,6 +2056,18 @@ def _is_mfa_page_type(page_type: str) -> bool:
     return any(token in normalized for token in ("mfa", "totp", "authenticator", "two_factor"))
 
 
+def _is_retryable_fresh_oauth_error(error: str) -> bool:
+    text = str(error or "").lower()
+    if any(marker in text for marker in (
+        "429", "rate_limit", "too many requests", "incorrect email address or password",
+        "otp", "验证码", "短信验证", "手机验证", "add_phone", "mfa",
+    )):
+        return False
+    return any(marker in text for marker in (
+        "callback", "consent", "workspace", "session_token", "未完成", "未跳转",
+    ))
+
+
 def _do_codex_oauth(
     page,
     cookies_dict: dict,
@@ -2175,13 +2187,11 @@ def _do_codex_oauth(
 
             if state["page_type"] == "email_otp_verification":
                 if not otp_callback:
-                    log("  ⚠️ OAuth 需要邮箱 OTP 但没有 otp_callback")
-                    return None
+                    raise RuntimeError("Codex OAuth 需要邮箱 OTP，但没有可用的 otp_callback")
                 log("  OAuth 等待邮箱验证码...")
                 code = otp_callback()
                 if not code:
-                    log("  ⚠️ OAuth OTP 获取失败")
-                    return None
+                    raise RuntimeError("Codex OAuth 邮箱 OTP 获取失败")
                 otp_resp = _submit_otp_via_page(page, code, log)
                 log(f"  OAuth 验证码页提交状态: {otp_resp.get('status', 0)}")
                 if not otp_resp.get("ok"):
@@ -2204,8 +2214,7 @@ def _do_codex_oauth(
                 session_result = _complete_oauth_with_session(cookies_dict, oauth_start, proxy, log)
                 if session_result:
                     return session_result
-                log("  ⚠️ 页面已到 consent/workspace，但会话补全失败")
-                return None
+                raise RuntimeError("Codex OAuth consent/workspace 未完成 callback")
 
             if state["page_type"] == "add_phone":
                 if phone_callback:
@@ -2218,8 +2227,7 @@ def _do_codex_oauth(
                         )
                         continue
                     except Exception as exc:
-                        log(f"  短信验证失败，停止 OAuth 流程: {exc}")
-                        return None
+                        raise RuntimeError(f"Codex OAuth 短信验证失败: {exc}") from exc
 
                 # 先尝试跳过 add_phone，直接重新访问 OAuth 授权 URL
                 # 用户已登录，重新访问 auth URL 应该能直接跳到 callback
@@ -2273,8 +2281,7 @@ def _do_codex_oauth(
                         return _submit_callback_result(callback_url, oauth_start, proxy)
                     log(f"  跳过 add_phone 异常: {exc}")
 
-                log("  ⚠️ add_phone 无法跳过且无可用接码服务")
-                return None
+                raise RuntimeError("Codex OAuth add_phone 无法跳过且无可用接码服务")
 
             # chatgpt_home: 页面可能正在 JS 重定向（如跳转到 add-phone）
             # 等待更长时间让重定向完成
@@ -2326,8 +2333,7 @@ def _do_codex_oauth(
 
     session_token = cookies_dict.get("__Secure-next-auth.session-token", "")
     if not session_token:
-        log("  ⚠️ 无 session_token，OAuth 失败")
-        return None
+        raise RuntimeError("Codex OAuth 未获取 callback，且无 session_token")
     log("  ⚠️ 完整 OAuth 失败，回退 session access_token")
     return None
 
@@ -4436,21 +4442,36 @@ class ChatGPTBrowserRegister:
         raise RuntimeError("ChatGPT 注册未完成完整 OAuth callback，已拒绝回退到 session/access_token 半成品结果")
 
     def _retry_oauth_fresh_browser(self, email, password):
-        """在全新浏览器 context 里做 Codex OAuth（绕过 add_phone session）。"""
+        """Run Codex OAuth in a fresh context, retrying callback-only failures once."""
         self.last_oauth_error = ""
         proxy = _build_proxy_config(self.proxy)
         launch_opts = _camoufox_launch_options(headless=self.headless, proxy=proxy)
         try:
-            with Camoufox(**launch_opts) as browser:
-                page = browser.new_page()
-                self.log("  全新浏览器 OAuth 开始...")
-                result = _do_codex_oauth(
-                    page, {}, email, password,
-                    self.otp_callback, self.phone_callback, self.proxy, self.log,
-                    mfa_callback=self.mfa_callback,
-                )
-                return result
-        except Exception as e:
-            self.last_oauth_error = str(e).strip() or e.__class__.__name__
-            self.log(f"  全新浏览器 OAuth 异常: {e}")
-            return None
+            from core.config_store import config_store
+
+            attempt_limit = min(2, max(1, int(config_store.get("chatgpt_codex_oauth_attempts", "2") or 2)))
+        except Exception:
+            attempt_limit = 2
+
+        for attempt in range(attempt_limit):
+            try:
+                with Camoufox(**launch_opts) as browser:
+                    page = browser.new_page()
+                    self.log(f"  全新浏览器 OAuth 开始 ({attempt + 1}/{attempt_limit})...")
+                    result = _do_codex_oauth(
+                        page, {}, email, password,
+                        self.otp_callback, self.phone_callback, self.proxy, self.log,
+                        mfa_callback=self.mfa_callback,
+                    )
+                    if result:
+                        return result
+                    self.last_oauth_error = "Codex OAuth 浏览器流程未完成 callback"
+            except Exception as exc:
+                self.last_oauth_error = str(exc).strip() or exc.__class__.__name__
+                self.log(f"  全新浏览器 OAuth 异常: {self.last_oauth_error}")
+
+            if attempt >= attempt_limit - 1 or not _is_retryable_fresh_oauth_error(self.last_oauth_error):
+                break
+            self.log("  callback/consent 未完成，2 秒后使用新的浏览器上下文重试一次...")
+            time.sleep(2)
+        return None

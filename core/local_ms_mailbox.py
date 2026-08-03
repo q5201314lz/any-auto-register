@@ -925,24 +925,33 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         with self._lock:
             return self._reserve_entry(self._available_entry())
 
-    def get_email_by_address(self, email: str) -> MailboxAccount:
-        """Reserve the exact local-pool row requested by a single-email task."""
+    def _validate_email_address_unlocked(self, email: str) -> LocalMicrosoftMailboxEntry:
         key = str(email or "").strip().lower()
         if not key:
             raise ValueError("指定邮箱不能为空")
+        entry = next((item for item in self._usable_entries(include_retry_rows=True) if item.key == key), None)
+        if entry is None:
+            raise RuntimeError(f"指定邮箱不在本地邮箱池中或格式不可用: {email}")
+        state = self._state()
+        used = set((state.get("used") or {}).keys())
+        if not self.allow_reuse and entry.key in used:
+            raise RuntimeError(f"指定邮箱已被占用或已注册: {entry.email}")
+        if self.avoid_repeat and entry.key in self._attempted_keys:
+            raise RuntimeError(f"指定邮箱本次任务已经尝试过: {entry.email}")
+        return entry
+
+    def validate_email_address(self, email: str) -> LocalMicrosoftMailboxEntry:
+        """Validate an explicit manual-retry address without reserving it."""
+        with self._lock:
+            return self._validate_email_address_unlocked(email)
+
+    def get_email_by_address(self, email: str) -> MailboxAccount:
+        """Reserve the exact local-pool row requested by a single-email task."""
         with self._lock:
             # A typed address is an explicit manual retry request. It may target
             # the accumulated-failure pool, while automatic allocation remains
             # restricted to newly imported rows.
-            entry = next((item for item in self._usable_entries(include_retry_rows=True) if item.key == key), None)
-            if entry is None:
-                raise RuntimeError(f"指定邮箱不在本地邮箱池中或格式不可用: {email}")
-            state = self._state()
-            used = set((state.get("used") or {}).keys())
-            if not self.allow_reuse and entry.key in used:
-                raise RuntimeError(f"指定邮箱已被占用或已注册: {entry.email}")
-            if self.avoid_repeat and entry.key in self._attempted_keys:
-                raise RuntimeError(f"指定邮箱本次任务已经尝试过: {entry.email}")
+            entry = self._validate_email_address_unlocked(email)
             return self._reserve_entry(entry)
 
     def _entry_for_account(self, account: MailboxAccount) -> LocalMicrosoftMailboxEntry:

@@ -275,6 +275,15 @@ const TABS: { id: string; label: string; icon: any; sections?: any[] }[] = [
   {
     id: 'chatgpt', label: 'ChatGPT', icon: Shield,
     sections: [{
+      section: '注册稳定性',
+      desc: '配置批量注册并发、账号启动间隔和可选的限流冷却。',
+      items: [
+        { key: 'chatgpt_register_max_concurrency', label: '最大注册并发', placeholder: '5' },
+        { key: 'chatgpt_register_interval_seconds', label: '账号间隔（秒）', placeholder: '0' },
+        { key: 'chatgpt_rate_limit_cooldown_seconds', label: '429 冷却（秒，0 为关闭）', placeholder: '0' },
+        { key: 'chatgpt_codex_oauth_attempts', label: 'Callback 尝试次数', placeholder: '2' },
+      ],
+    }, {
       section: 'CPA 面板',
       desc: '注册完成后自动上传到 CPA 管理平台',
       items: [
@@ -301,10 +310,6 @@ const TABS: { id: string; label: string; icon: any; sections?: any[] }[] = [
       items: [
         { key: 'sub2api_url', label: 'API URL', placeholder: 'https://your-sub2api.example.com' },
         { key: 'sub2api_api_key', label: 'Admin API Key', secret: true },
-        { key: 'sub2api_free_group', label: '默认上传：Free', placeholder: 'free' },
-        { key: 'sub2api_pro_group', label: '默认上传：Pro', placeholder: 'pro' },
-        { key: 'sub2api_integration_group', label: '默认上传：对接', placeholder: '对接分组' },
-        { key: 'sub2api_mixed_group', label: '默认上传：混合', placeholder: '混合号池' },
       ],
     }],
   },
@@ -608,7 +613,7 @@ export function MailboxRegistrationPool() {
           </div>
           <div>
             <h3 className="text-sm font-semibold text-[var(--text-primary)]">待注册邮箱池</h3>
-            <p className="mt-0.5 text-xs text-[var(--text-muted)]">新入库自动注册；失败邮箱保留在累计池，需手动指定后重试。</p>
+            <p className="mt-0.5 text-xs text-[var(--text-muted)]">成功自动移出，失败保留到下一批。</p>
           </div>
         </div>
         <Button size="sm" variant="outline" onClick={load} disabled={loading} title="刷新邮箱池">
@@ -621,7 +626,7 @@ export function MailboxRegistrationPool() {
         {[
           ['新入库', pool.new_count],
           ['失败待重试', pool.failed_count],
-          ['新池可注册', pool.available_count],
+          ['可注册', pool.available_count],
           ['注册中', pool.running_count],
         ].map(([label, value]) => (
           <div key={String(label)} className="bg-[var(--bg-card)] px-4 py-3">
