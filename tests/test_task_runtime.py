@@ -105,6 +105,9 @@ def test_chatgpt_rate_limit_cooldown_is_disabled_by_default(monkeypatch):
 def test_registration_failure_classification_keeps_actionable_reason():
     assert _classify_registration_failure("HTTP 429 rate_limit_exceeded") == "openai_rate_limited"
     assert _classify_registration_failure("Incorrect email address or password") == "login_password_rejected"
+    password_required = "Codex callback 未获取：该 OpenAI 账号不支持邮箱一次性验证码登录，必须提供正确的 OpenAI 登录密码"
+    assert _classify_registration_failure(password_required) == "login_password_required"
+    assert _registration_failure_reason(password_required, "login_password_required") == password_required
     assert _classify_registration_failure("Codex OAuth consent 未完成 callback") == "oauth_callback_incomplete"
     assert _classify_registration_failure("add_phone required") == "phone_verification_failed"
     detail = "Codex consent 页面未生成有效授权表单: page=Try again"

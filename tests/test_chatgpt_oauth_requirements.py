@@ -592,6 +592,71 @@ def test_protocol_password_challenge_uses_browser_passwordless_action(monkeypatc
     }
 
 
+def test_url_only_password_page_uses_protocol_email_otp_before_browser():
+    engine = object.__new__(RegistrationEngine)
+    engine._has_supplied_login_password = False
+    engine._last_codex_error = ""
+    logs = []
+    engine._log = lambda message, level="info": logs.append((level, message))
+    calls = []
+    engine._complete_codex_email_otp = lambda session, **kwargs: calls.append((session, kwargs)) or "sign_in_with_chatgpt_codex_consent"
+    engine._complete_codex_login_password_in_browser = lambda: pytest.fail("browser fallback must not run")
+    session = object()
+
+    page_type, token_info = engine._complete_codex_login_password_page(session)
+
+    assert page_type == "sign_in_with_chatgpt_codex_consent"
+    assert token_info is None
+    assert calls == [
+        (
+            session,
+            {
+                "send_code": True,
+                "referer": "https://auth.openai.com/log-in/password",
+            },
+        )
+    ]
+
+
+def test_url_only_password_page_reports_protocol_and_browser_failures():
+    engine = object.__new__(RegistrationEngine)
+    engine._has_supplied_login_password = False
+    engine._last_codex_error = ""
+    engine._log = lambda message, level="info": None
+
+    def fail_protocol(session, **kwargs):
+        engine._last_codex_error = "OTP send status=403"
+        return None
+
+    def fail_browser():
+        engine._last_codex_error = "未找到一次性验证码登录入口"
+        return None
+
+    engine._complete_codex_email_otp = fail_protocol
+    engine._complete_codex_login_password_in_browser = fail_browser
+
+    page_type, token_info = engine._complete_codex_login_password_page(object())
+
+    assert page_type is None
+    assert token_info is None
+    assert "不支持邮箱一次性验证码登录" in engine._last_codex_error
+    assert "协议分支=OTP send status=403" in engine._last_codex_error
+    assert "浏览器分支=未找到一次性验证码登录入口" in engine._last_codex_error
+
+
+def test_password_mfa_page_does_not_use_email_otp_protocol():
+    engine = object.__new__(RegistrationEngine)
+    engine._has_supplied_login_password = True
+    engine._log = lambda message, level="info": None
+    engine._complete_codex_email_otp = lambda *args, **kwargs: pytest.fail("password/MFA must not use email OTP")
+    engine._complete_codex_login_password_in_browser = lambda: {"access_token": "at", "refresh_token": "rt"}
+
+    page_type, token_info = engine._complete_codex_login_password_page(object())
+
+    assert page_type == ""
+    assert token_info == {"access_token": "at", "refresh_token": "rt"}
+
+
 def test_url_only_existing_account_uses_browser_email_otp_not_generated_password(monkeypatch):
     engine = object.__new__(RegistrationEngine)
     engine.email = "user@icloud.com"

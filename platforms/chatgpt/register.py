@@ -1878,6 +1878,36 @@ class RegistrationEngine:
             self._log(self._last_codex_error, "error")
             return None
 
+    def _complete_codex_login_password_page(
+        self,
+        login_session,
+    ) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """Resolve a Codex password page according to the imported credentials."""
+        if self._has_supplied_login_password:
+            self._log("Codex login 遇到密码验证，使用导入的密码/MFA 凭据...")
+            return "", self._complete_codex_login_password_in_browser()
+
+        self._log("Codex login 仅提供收码地址，直接请求一次性验证码...")
+        otp_page = self._complete_codex_email_otp(
+            login_session,
+            send_code=True,
+            referer="https://auth.openai.com/log-in/password",
+        )
+        if otp_page is not None:
+            return otp_page, None
+
+        protocol_error = str(self._last_codex_error or "协议 OTP 接口不可用").strip()
+        self._log("Codex 协议 OTP 未完成，回退浏览器一次性验证码入口...", "warning")
+        token_info = self._complete_codex_login_password_in_browser()
+        if token_info:
+            return "", token_info
+        browser_error = str(self._last_codex_error or "浏览器一次性验证码入口不可用").strip()
+        self._last_codex_error = (
+            "该 OpenAI 账号不支持邮箱一次性验证码登录，必须提供正确的 OpenAI 登录密码："
+            f"协议分支={protocol_error}；浏览器分支={browser_error}"
+        )
+        return None, None
+
     def _acquire_codex_callback(self) -> Optional[str]:
         """
         注册完成后，通过 Codex CLI OAuth 完整登录流程获取 callback URL。
@@ -2011,12 +2041,22 @@ class RegistrationEngine:
 
             # 7. 已有账号遇到密码验证时，强制改走邮箱一次性验证码。
             elif page_type == "login_password":
-                self._log("Codex login 遇到密码验证，切换浏览器点击一次性验证码入口...")
-                token_info = self._complete_codex_login_password_in_browser()
-                if not token_info:
+                otp_page, token_info = self._complete_codex_login_password_page(login_session)
+                if token_info:
+                    self._codex_direct_token_info = token_info
+                    return "browser-token-ready"
+                if otp_page is None:
                     return None
-                self._codex_direct_token_info = token_info
-                return "browser-token-ready"
+                if otp_page == "add_phone":
+                    self._log("Codex CLI 登录进入 add_phone，开始短信验证...")
+                    callback = self._complete_add_phone_in_browser(login_session, codex_oauth, did, login_client)
+                    if callback:
+                        return callback
+                    if getattr(self.phone_callback, "completed", False) and not getattr(self, "_codex_retry_after_phone", False):
+                        self._codex_retry_after_phone = True
+                        self._log("手机验证已完成，旧 OAuth 会话未返回 callback，立即重跑 Codex Auth...")
+                        return self._acquire_codex_callback()
+                    return None
 
             # 新账号创建密码仍走密码提交，不属于登录密码验证。
             elif page_type == "create_account_password":

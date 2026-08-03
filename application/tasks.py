@@ -880,6 +880,8 @@ def _classify_registration_failure(error: str) -> str:
         return "oauth_invalid_state"
     if "incorrect email address or password" in lowered:
         return "login_password_rejected"
+    if "不支持邮箱一次性验证码登录" in text or "必须提供正确的 openai 登录密码" in lowered:
+        return "login_password_required"
     if "add_phone" in lowered or "手机验证" in text or "短信验证" in text:
         return "phone_verification_failed"
     if "callback" in lowered or "consent" in lowered or "workspace" in lowered:
@@ -901,6 +903,8 @@ def _registration_failure_reason(error: str, failure_kind: str) -> str:
         return text or "OpenAI 返回 429 Too many requests"
     if failure_kind == "email_otp_failed":
         return text or "邮箱验证码发送、读取或校验失败"
+    if failure_kind == "login_password_required":
+        return text or "该 OpenAI 账号不支持邮箱一次性验证码登录，必须提供正确密码"
     if failure_kind == "phone_verification_failed":
         return text or "手机号租用、短信读取或校验失败"
     return text or "注册流程发生未分类错误"
