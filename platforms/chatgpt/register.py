@@ -2473,38 +2473,18 @@ class RegistrationEngine:
                     if not codex_token_info:
                         raise RuntimeError(self._last_codex_error or "浏览器一次性验证码 OAuth 未完成")
 
-                # 如果返回 email_otp_send 或 email_otp_verification，走 OTP 流程
+                # `email_otp_verification` does not reliably mean that this
+                # fresh Codex session has sent an email. Always explicitly
+                # request one before polling, otherwise this stage waits for a
+                # non-existent second OTP and can never exchange the callback.
                 elif page_type in ("email_otp_send", "email_otp_verification"):
-                    # 发送 OTP
-                    if page_type == "email_otp_send":
-                        login_session.get(OPENAI_API_ENDPOINTS["send_otp"], headers={
-                            "referer": f"{OPENAI_AUTH}/email-verification",
-                        }, timeout=15)
-                        self._log("Codex OTP 已发送")
-
-                    # 等待 OTP
-                    self._otp_sent_at = time.time()
-                    code = self._get_verification_code()
-                    if not code:
-                        raise RuntimeError("Codex OTP 获取失败")
-                    self._log(f"Codex OTP: {code}")
-
-                    # 验证 OTP
-                    otp_resp = login_session.post(
-                        OPENAI_API_ENDPOINTS["validate_otp"],
-                        headers={
-                            "referer": f"{OPENAI_AUTH}/email-verification",
-                            "accept": "application/json",
-                            "content-type": "application/json",
-                        },
-                        data=json.dumps({"code": code}),
+                    otp_page = self._complete_codex_email_otp(
+                        login_session,
+                        send_code=True,
+                        referer=f"{OPENAI_AUTH}/email-verification",
                     )
-                    self._log(f"Codex OTP validate: {otp_resp.status_code}")
-                    if otp_resp.status_code != 200:
-                        raise RuntimeError(f"Codex OTP 验证失败: {otp_resp.text[:200]}")
-
-                    otp_data = otp_resp.json()
-                    otp_page = otp_data.get("page", {}).get("type", "")
+                    if otp_page is None:
+                        raise RuntimeError("Codex OTP 获取失败")
                     self._log(f"Codex OTP -> page_type={otp_page}")
 
                     codex_callback = None
