@@ -888,3 +888,51 @@ def test_add_phone_restarts_only_codex_oauth_after_sms_completion(monkeypatch):
     assert callback.endswith("state=new-state")
     assert oauth is refreshed_oauth
     assert engine._codex_retry_after_phone is True
+
+
+def test_add_phone_default_attempt_limit_is_one(monkeypatch):
+    calls = []
+    logs = []
+    callback = SimpleNamespace(
+        config={},
+        cleanup=lambda: calls.append("cleanup"),
+        mark_send_failed=lambda reason: calls.append(("failed", reason)),
+    )
+    monkeypatch.setattr(browser_register_module.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_do_add_phone_attempt",
+        lambda *args, **kwargs: calls.append("attempt") or (_ for _ in ()).throw(RuntimeError("未获取到短信验证码")),
+    )
+
+    with pytest.raises(RuntimeError, match="未获取到短信验证码"):
+        browser_register_module._handle_add_phone_challenge(
+            SimpleNamespace(), callback, device_id="device", user_agent="ua", log=logs.append,
+        )
+
+    assert calls.count("attempt") == 1
+    assert any("1/1 次失败" in message for message in logs)
+
+
+def test_add_phone_attempt_limit_uses_sms_provider_config(monkeypatch):
+    calls = []
+    callback = SimpleNamespace(
+        config={"register_phone_max_attempts": "2"},
+        cleanup=lambda: None,
+        mark_send_failed=lambda reason: None,
+    )
+    monkeypatch.setattr(browser_register_module.time, "sleep", lambda *_: None)
+
+    def attempt(*args, **kwargs):
+        calls.append("attempt")
+        if len(calls) == 1:
+            raise RuntimeError("未获取到短信验证码")
+        return {"page_type": "chatgpt_home"}
+
+    monkeypatch.setattr(browser_register_module, "_do_add_phone_attempt", attempt)
+    page = SimpleNamespace(goto=lambda *args, **kwargs: None)
+
+    assert browser_register_module._handle_add_phone_challenge(
+        page, callback, device_id="device", user_agent="ua", log=lambda _message: None,
+    ) == {"page_type": "chatgpt_home"}
+    assert calls == ["attempt", "attempt"]

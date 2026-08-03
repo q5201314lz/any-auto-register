@@ -2537,6 +2537,24 @@ def _is_retryable_add_phone_error(message: str) -> bool:
     return any(hint.lower() in text for hint in retry_hints)
 
 
+def _resolve_add_phone_attempt_limit(phone_callback, configured_limit: int | None = None) -> int:
+    """Resolve the per-account phone verification attempt limit.
+
+    One attempt is deliberately the default: a rejected number, missing SMS,
+    or invalid code ends the current mailbox task and lets the task runner move
+    to the next mailbox. Operators that want automatic number changes can
+    raise ``register_phone_max_attempts`` in the SMS provider settings.
+    """
+    raw_limit = configured_limit
+    if raw_limit is None:
+        config = getattr(phone_callback, "config", {}) or {}
+        raw_limit = config.get("register_phone_max_attempts", 1)
+    try:
+        return min(10, max(1, int(raw_limit)))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _handle_add_phone_challenge(
     page,
     phone_callback,
@@ -2545,13 +2563,13 @@ def _handle_add_phone_challenge(
     user_agent: str,
     log,
     resume_url: str = "",
-    max_phone_attempts: int = 5,
+    max_phone_attempts: int | None = None,
 ) -> dict:
     """在 add-phone 页面通过 UI 交互完成手机号验证。
 
     流程: 选择国家 -> 输入本地号码 -> 点击发送 -> 填写 OTP -> 点击验证。
-    如果手机号被使用、页面拒绝、验证码错误/超时等，自动换号重试
-    （最多 max_phone_attempts 次）。
+    如果手机号被使用、页面拒绝、验证码错误/超时等，会按接码配置换号重试。
+    默认只尝试一次，失败后由任务调度器继续下一个邮箱。
     """
     if not phone_callback:
         raise RuntimeError(
@@ -2559,10 +2577,11 @@ def _handle_add_phone_challenge(
             "请在 RegisterConfig.extra 中配置接码服务，或手动完成手机验证。"
         )
 
+    attempt_limit = _resolve_add_phone_attempt_limit(phone_callback, max_phone_attempts)
     last_error = None
-    for phone_attempt in range(max_phone_attempts):
+    for phone_attempt in range(attempt_limit):
         if phone_attempt > 0:
-            log(f"换号重试第 {phone_attempt + 1}/{max_phone_attempts} 次...")
+            log(f"换号重试第 {phone_attempt + 1}/{attempt_limit} 次...")
             # 回到 add-phone 页面
             try:
                 page.goto(f"{OPENAI_AUTH}/add-phone", wait_until="domcontentloaded", timeout=15000)
@@ -2581,12 +2600,12 @@ def _handle_add_phone_challenge(
             last_error = exc
             error_msg = str(exc)
             should_retry = _is_retryable_add_phone_error(error_msg)
-            if not should_retry or phone_attempt >= max_phone_attempts - 1:
+            if not should_retry or phone_attempt >= attempt_limit - 1:
                 if should_retry:
-                    log(f"⚠️ 手机验证第 {phone_attempt + 1}/{max_phone_attempts} 次失败，已达到最大换号次数: {error_msg[:180]}")
+                    log(f"⚠️ 手机验证第 {phone_attempt + 1}/{attempt_limit} 次失败，已达到最大换号次数: {error_msg[:180]}")
                     _reset_phone_callback_for_retry(phone_callback, error_msg)
                 raise
-            log(f"⚠️ 手机验证第 {phone_attempt + 1}/{max_phone_attempts} 次失败: {error_msg[:180]}，准备换号重试...")
+            log(f"⚠️ 手机验证第 {phone_attempt + 1}/{attempt_limit} 次失败: {error_msg[:180]}，准备换号重试...")
             _reset_phone_callback_for_retry(phone_callback, error_msg)
 
     raise last_error or RuntimeError("短信验证失败: 多次换号均未收到验证码")
