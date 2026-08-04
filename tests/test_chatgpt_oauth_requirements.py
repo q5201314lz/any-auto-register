@@ -496,6 +496,117 @@ def test_codex_oauth_login_password_uses_configured_mfa(monkeypatch):
     assert result["callback_url"].startswith("http://localhost:1455/auth/callback?")
 
 
+def test_codex_oauth_skips_mfa_submit_when_page_advances_during_code_fetch(monkeypatch):
+    oauth_start = SimpleNamespace(
+        auth_url="https://auth.openai.com/log-in/password",
+        state="state_123",
+        code_verifier="verifier_123",
+        redirect_uri="http://localhost:1455/auth/callback",
+        client_id="client_123",
+    )
+
+    class FakePage:
+        url = "about:blank"
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+        def evaluate(self, script):
+            return "Test User Agent"
+
+    page = FakePage()
+    events = []
+
+    monkeypatch.setattr("platforms.chatgpt.oauth.generate_oauth_url", lambda **kwargs: oauth_start)
+    monkeypatch.setattr(browser_register_module, "_get_page_oauth_url", lambda page: "")
+
+    def derive(page):
+        if "/consent" in page.url:
+            page_type = "consent"
+        elif "/mfa" in page.url:
+            page_type = "mfa_challenge"
+        else:
+            page_type = "login_password"
+        return {"page_type": page_type, "continue_url": ""}
+
+    def submit_password(page, password, log):
+        page.url = "https://auth.openai.com/mfa"
+        return {"ok": True, "status": 200, "text": ""}
+
+    def fetch_mfa():
+        page.url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        return "123456"
+
+    monkeypatch.setattr(browser_register_module, "_derive_oauth_state_from_page", derive)
+    monkeypatch.setattr(browser_register_module, "_submit_oauth_password_direct", submit_password)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_submit_otp_via_page",
+        lambda *args, **kwargs: pytest.fail("consent page must not receive the stale MFA code"),
+    )
+    monkeypatch.setattr(
+        browser_register_module,
+        "_complete_oauth_in_browser",
+        lambda *args, **kwargs: {"callback_url": "http://localhost:1455/auth/callback?code=done&state=state_123"},
+    )
+
+    result = browser_register_module._do_codex_oauth(
+        page,
+        {},
+        "user@example.com",
+        "Secret123!",
+        lambda: "email-code-must-not-be-used",
+        None,
+        None,
+        events.append,
+        mfa_callback=fetch_mfa,
+    )
+
+    assert result["callback_url"].endswith("code=done&state=state_123")
+    assert any("页面已前进: consent" in event for event in events)
+
+
+def test_otp_submit_accepts_consent_page_that_advanced_before_input_fill(monkeypatch):
+    class EmptyLocator:
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            return 0
+
+        def wait_for(self, **kwargs):
+            raise RuntimeError("not visible")
+
+        def is_visible(self, **kwargs):
+            return False
+
+    class ConsentPage:
+        url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+
+        def wait_for_load_state(self, *args, **kwargs):
+            return None
+
+        def locator(self, *args, **kwargs):
+            return EmptyLocator()
+
+        def get_by_label(self, *args, **kwargs):
+            return EmptyLocator()
+
+        def get_by_role(self, *args, **kwargs):
+            return EmptyLocator()
+
+    monkeypatch.setattr(browser_register_module.time, "sleep", lambda _seconds: None)
+    response = browser_register_module._submit_otp_via_page(
+        ConsentPage(),
+        "123456",
+        lambda message: None,
+    )
+
+    assert response["ok"] is True
+    assert response["status"] == 200
+
+
 def test_protocol_codex_password_challenge_sends_and_validates_email_otp():
     engine = object.__new__(RegistrationEngine)
     engine._otp_sent_at = None
@@ -758,6 +869,196 @@ def test_url_only_password_page_reports_protocol_and_browser_failures():
     assert "邮箱 OTP 与密码重置分支均未完成" in engine._last_codex_error
     assert "协议分支=OTP send status=403" in engine._last_codex_error
     assert "浏览器分支=未找到一次性验证码登录入口" in engine._last_codex_error
+
+
+def test_codex_protocol_login_landing_falls_back_to_browser(monkeypatch):
+    engine = object.__new__(RegistrationEngine)
+    engine.email = "user@icloud.com"
+    engine.password = ""
+    engine.proxy_url = None
+    engine.phone_callback = None
+    engine._last_codex_error = ""
+    engine._codex_direct_token_info = None
+    engine._log = lambda message, level="info": None
+    engine._debug_log = lambda message, level="info": None
+    engine._codex_api_auth_url = lambda oauth: oauth.auth_url
+    engine._complete_codex_login_password_in_browser = lambda: {
+        "access_token": "at",
+        "refresh_token": "rt",
+    }
+
+    oauth = SimpleNamespace(
+        auth_url="https://auth.openai.com/oauth/authorize?state=state_123",
+        state="state_123",
+        code_verifier="verifier_123",
+    )
+    engine._start_codex_oauth_session = lambda auth_url: (session, "did_123", "chrome136")
+
+    class Response:
+        def __init__(self, status_code=200, *, data=None, location=""):
+            self.status_code = status_code
+            self._data = data or {}
+            self.headers = {"Location": location} if location else {}
+            self.text = ""
+
+        def json(self):
+            return self._data
+
+    class Session:
+        def post(self, url, **kwargs):
+            if url.endswith("/sentinel/chat-requirements"):
+                return Response(403)
+            return Response(200, data={"page": {"type": ""}})
+
+        def get(self, url, **kwargs):
+            if url == oauth.auth_url:
+                return Response(302, location="https://auth.openai.com/log-in")
+            return Response(200)
+
+    session = Session()
+    login_client = SimpleNamespace(default_headers={"User-Agent": "Test"})
+    monkeypatch.setattr("platforms.chatgpt.register.generate_oauth_url", lambda **kwargs: oauth)
+    monkeypatch.setattr("platforms.chatgpt.register.OpenAIHTTPClient", lambda proxy_url=None: login_client)
+
+    callback = engine._acquire_codex_callback()
+
+    assert callback == "browser-token-ready"
+    assert engine._codex_direct_token_info == {"access_token": "at", "refresh_token": "rt"}
+
+
+def test_codex_oauth_passkey_challenge_switches_to_email_otp(monkeypatch):
+    oauth_start = SimpleNamespace(
+        auth_url="https://auth.openai.com/oauth/authorize?state=state_123",
+        state="state_123",
+        code_verifier="verifier_123",
+        redirect_uri="http://localhost:1455/auth/callback",
+        client_id="client_123",
+    )
+
+    class FakePage:
+        url = "about:blank"
+
+        def goto(self, url, **kwargs):
+            self.url = "https://auth.openai.com/auth_challenge/passkey"
+
+        def evaluate(self, script):
+            return "Test User Agent"
+
+    page = FakePage()
+    events = []
+
+    monkeypatch.setattr("platforms.chatgpt.oauth.generate_oauth_url", lambda **kwargs: oauth_start)
+    monkeypatch.setattr(browser_register_module, "_get_page_oauth_url", lambda page: "")
+    monkeypatch.setattr(
+        browser_register_module,
+        "_derive_oauth_state_from_page",
+        lambda page: {
+            "page_type": browser_register_module._infer_page_type(None, page.url),
+            "continue_url": "",
+        },
+    )
+
+    def switch_to_email(page, log, otp_sent_callback=None):
+        events.append("switch")
+        otp_sent_callback()
+        page.url = "https://auth.openai.com/email-verification"
+        return True
+
+    def submit_otp(page, code, log):
+        events.append(("otp", code))
+        page.url = "http://localhost:1455/auth/callback?code=done&state=state_123"
+        return {"ok": True, "status": 200, "text": ""}
+
+    monkeypatch.setattr(browser_register_module, "_switch_mfa_to_email_otp", switch_to_email)
+    monkeypatch.setattr(browser_register_module, "_submit_otp_via_page", submit_otp)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_submit_callback_result",
+        lambda callback_url, oauth_start, proxy: {"callback_url": callback_url},
+    )
+
+    result = browser_register_module._do_codex_oauth(
+        page,
+        {},
+        "user@example.com",
+        "",
+        lambda: "123456",
+        None,
+        None,
+        lambda message: None,
+        otp_sent_callback=lambda: events.append("otp_sent"),
+    )
+
+    assert result["callback_url"].endswith("code=done&state=state_123")
+    assert events == ["switch", "otp_sent", ("otp", "123456")]
+
+
+def test_codex_oauth_passkey_challenge_uses_imported_recovery_key(monkeypatch):
+    oauth_start = SimpleNamespace(
+        auth_url="https://auth.openai.com/oauth/authorize?state=state_123",
+        state="state_123",
+        code_verifier="verifier_123",
+        redirect_uri="http://localhost:1455/auth/callback",
+        client_id="client_123",
+    )
+
+    class FakePage:
+        url = "about:blank"
+
+        def goto(self, url, **kwargs):
+            self.url = "https://auth.openai.com/auth_challenge/passkey"
+
+        def evaluate(self, script):
+            return "Test User Agent"
+
+    page = FakePage()
+    events = []
+    monkeypatch.setattr("platforms.chatgpt.oauth.generate_oauth_url", lambda **kwargs: oauth_start)
+    monkeypatch.setattr(browser_register_module, "_get_page_oauth_url", lambda page: "")
+    monkeypatch.setattr(
+        browser_register_module,
+        "_derive_oauth_state_from_page",
+        lambda page: {
+            "page_type": browser_register_module._infer_page_type(None, page.url),
+            "continue_url": "",
+        },
+    )
+
+    def open_recovery(page, log):
+        events.append("open_recovery")
+        page.url = "https://auth.openai.com/auth_challenge/recovery-key"
+        return True
+
+    def submit_recovery(page, recovery_key, log):
+        events.append(("recovery_key", recovery_key))
+        page.url = "http://localhost:1455/auth/callback?code=done&state=state_123"
+        return {"ok": True, "status": 200, "text": ""}
+
+    monkeypatch.setattr(browser_register_module, "_open_passkey_recovery", open_recovery)
+    monkeypatch.setattr(browser_register_module, "_submit_recovery_key_via_page", submit_recovery)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_submit_callback_result",
+        lambda callback_url, oauth_start, proxy: {"callback_url": callback_url},
+    )
+
+    result = browser_register_module._do_codex_oauth(
+        page,
+        {},
+        "user@example.com",
+        "",
+        lambda: "123456",
+        None,
+        None,
+        lambda message: None,
+        recovery_key="XLBGXYJXP4V3H7FBHONVOUUTJ7YMOKG4",
+    )
+
+    assert result["callback_url"].endswith("code=done&state=state_123")
+    assert events == [
+        "open_recovery",
+        ("recovery_key", "XLBGXYJXP4V3H7FBHONVOUUTJ7YMOKG4"),
+    ]
 
 
 def test_password_mfa_page_does_not_use_email_otp_protocol():
@@ -1066,6 +1367,13 @@ def test_mfa_route_detects_email_code_form_from_dom():
         browser_register_module._derive_registration_state_from_page(EmailMfaPage())["page_type"]
         == "email_otp_verification"
     )
+
+
+def test_consent_url_overrides_stale_mfa_flow_state():
+    assert browser_register_module._infer_page_type(
+        {"page": {"type": "mfa_challenge"}},
+        "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+    ) == "consent"
 
 
 def test_mfa_url_browser_login_fetches_remote_code(monkeypatch):

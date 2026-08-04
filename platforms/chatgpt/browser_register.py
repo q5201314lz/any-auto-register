@@ -1200,6 +1200,74 @@ def _switch_mfa_to_email_otp(page, log, otp_sent_callback=None) -> bool:
     return True
 
 
+def _open_passkey_recovery(page, log) -> bool:
+    recovery_selectors = [
+        'a[href*="/auth_challenge/recovery-key"]',
+        'button:has-text("Recovery key")',
+        'a:has-text("Recovery key")',
+        'button:has-text("恢复密钥")',
+        'a:has-text("恢复密钥")',
+    ]
+    selector = _click_first(page, recovery_selectors, timeout=3)
+    if not selector:
+        other_selector = _click_first(page, MFA_OTHER_METHOD_SELECTORS, timeout=3)
+        if other_selector:
+            log(f"  OAuth Passkey 已打开其他验证方式: {other_selector}")
+            time.sleep(0.8)
+        selector = _click_first(page, recovery_selectors, timeout=3)
+    if not selector:
+        return False
+    log(f"  OAuth Passkey 已选择 Recovery key: {selector}")
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if "/auth_challenge/recovery-key" in str(page.url or "").lower():
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def _submit_recovery_key_via_page(page, recovery_key: str, log) -> dict:
+    key = str(recovery_key or "").strip()
+    if not key:
+        return {"ok": False, "status": 0, "url": str(page.url or ""), "text": "Recovery key 为空"}
+    input_selector = _find_first_selector(
+        page,
+        [
+            'input[name*="recovery" i]',
+            'input[id*="recovery" i]',
+            'input[autocomplete="one-time-code"]',
+            'input[type="text"]',
+        ],
+    )
+    if not input_selector or not _fill_input_like_user(page, input_selector, key):
+        return {"ok": False, "status": 0, "url": str(page.url or ""), "text": "Recovery key 页面未找到可填写输入框"}
+    start_url = str(page.url or "")
+    submit_selector = _click_first(
+        page,
+        [
+            'button[type="submit"]',
+            'button:has-text("Continue")',
+            'button:has-text("Verify")',
+            'button:has-text("继续")',
+            'button:has-text("验证")',
+        ],
+        timeout=5,
+    )
+    if not submit_selector and not _submit_form_with_fallback(page, input_selector):
+        return {"ok": False, "status": 0, "url": start_url, "text": "Recovery key 页面未找到提交按钮"}
+    log(f"  OAuth Recovery key 已提交: {submit_selector or 'form fallback'}")
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        current_url = str(page.url or "")
+        if current_url != start_url and "/auth_challenge/recovery-key" not in current_url.lower():
+            return {"ok": True, "status": 200, "url": current_url, "text": ""}
+        error_text = _extract_auth_error_text(page)
+        if error_text:
+            return {"ok": False, "status": 400, "url": current_url, "text": error_text}
+        time.sleep(0.25)
+    return {"ok": False, "status": 0, "url": str(page.url or ""), "text": "Recovery key 提交后未跳转"}
+
+
 def _get_page_oauth_url(page) -> str:
     try:
         return str(
@@ -1746,12 +1814,27 @@ def _generate_datadog_trace_headers() -> dict:
 
 def _infer_page_type(data: dict | None, current_url: str = "") -> str:
     raw = data if isinstance(data, dict) else {}
+    url = (current_url or "").lower()
+    # The state endpoint can briefly retain the previous MFA page after the
+    # browser has already advanced to consent. Terminal OAuth routes in the
+    # actual browser URL are authoritative and must not be handled as stale MFA.
+    if "code=" in url:
+        return "oauth_callback"
+    if "sign-in-with-chatgpt" in url and "consent" in url:
+        return "consent"
+    if "workspace" in url and "select" in url:
+        return "workspace_selection"
+    if "organization" in url and "select" in url:
+        return "organization_selection"
+    if "add-phone" in url:
+        return "add_phone"
+    if "/auth_challenge/recovery-key" in url:
+        return "recovery_key_challenge"
+    if "/auth_challenge/passkey" in url or url.rstrip("/").endswith("/auth_challenge"):
+        return "passkey_challenge"
     page_type = str(((raw.get("page") or {}).get("type")) or "").strip().lower().replace("-", "_").replace("/", "_").replace(" ", "_")
     if page_type:
         return page_type
-    url = (current_url or "").lower()
-    if "code=" in url:
-        return "oauth_callback"
     if "create-account/password" in url:
         return "create_account_password"
     if "email-verification" in url or "email-otp" in url:
@@ -1762,14 +1845,6 @@ def _infer_page_type(data: dict | None, current_url: str = "") -> str:
         return "about_you"
     if "log-in/password" in url:
         return "login_password"
-    if "sign-in-with-chatgpt" in url and "consent" in url:
-        return "consent"
-    if "workspace" in url and "select" in url:
-        return "workspace_selection"
-    if "organization" in url and "select" in url:
-        return "organization_selection"
-    if "add-phone" in url:
-        return "add_phone"
     if "/api/oauth/oauth2/auth" in url:
         return "external_url"
     if "chatgpt.com" in url:
@@ -2345,6 +2420,7 @@ def _do_codex_oauth(
     log,
     mfa_callback=None,
     reset_password: str = "",
+    recovery_key: str = "",
     otp_sent_callback=None,
     auth_context: dict | None = None,
 ) -> dict | None:
@@ -2459,11 +2535,43 @@ def _do_codex_oauth(
                         )
                 continue
 
+            if state["page_type"] == "passkey_challenge":
+                if recovery_key and _open_passkey_recovery(page, log):
+                    continue
+                if otp_callback and _switch_mfa_to_email_otp(
+                    page,
+                    log,
+                    otp_sent_callback=otp_sent_callback,
+                ):
+                    log("  OAuth Passkey 挑战已切换为邮箱验证")
+                    continue
+                raise RuntimeError(
+                    "OAuth Passkey 挑战无法切换邮箱验证: "
+                    f"{_auth_page_diagnostic(page)}"
+                )
+
+            if state["page_type"] == "recovery_key_challenge":
+                recovery_resp = _submit_recovery_key_via_page(page, recovery_key, log)
+                if recovery_resp.get("ok"):
+                    continue
+                raise RuntimeError(
+                    "OAuth Recovery key 校验失败: "
+                    f"{str(recovery_resp.get('text') or '')[:300]}"
+                )
+
             if _is_mfa_page_type(state["page_type"]):
                 mfa_error = ""
                 if mfa_callback:
                     mfa_code = str(mfa_callback() or "").strip()
                     if mfa_code:
+                        refreshed_state = _derive_oauth_state_from_page(page)
+                        refreshed_page_type = str(refreshed_state.get("page_type") or "")
+                        if refreshed_page_type and not _is_mfa_page_type(refreshed_page_type):
+                            log(
+                                "  OAuth MFA 取码期间页面已前进: "
+                                f"{refreshed_page_type}，跳过重复提交"
+                            )
+                            continue
                         log("  OAuth 提交 MFA 验证码...")
                         mfa_resp = _submit_otp_via_page(page, mfa_code, log)
                         log(f"  OAuth MFA 提交状态: {mfa_resp.get('status', 0)}")
@@ -3957,7 +4065,19 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
                 continue
 
     if not filled:
-        return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到可填写输入框"}
+        current_url = str(page.url or "")
+        page_type = str(_derive_registration_state_from_page(page).get("page_type") or "")
+        if page_type in {
+            "consent",
+            "workspace_selection",
+            "organization_selection",
+            "add_phone",
+            "external_url",
+            "oauth_callback",
+            "chatgpt_home",
+        } or "code=" in current_url:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        return {"ok": False, "status": 0, "url": current_url, "data": None, "text": "验证码页未找到可填写输入框"}
 
     _browser_pause(page)
     submit_selector = _click_first(
@@ -3992,7 +4112,7 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
         if (
             "/mfa-challenge" in str(current_url or "").lower()
             and str(current_url or "") != submission_url
-        ) or page_type == "mfa_challenge":
+        ):
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if page_type in {"reset_password_new_password", "login_password"}:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
@@ -4838,6 +4958,7 @@ class ChatGPTBrowserRegister:
         proxy: Optional[str] = None,
         otp_callback: Optional[Callable[[], str]] = None,
         mfa_callback: Optional[Callable[[], str]] = None,
+        recovery_key: str = "",
         phone_callback: Optional[Callable[[], str]] = None,
         reset_password: str = "",
         otp_sent_callback: Optional[Callable[[], None]] = None,
@@ -4847,6 +4968,7 @@ class ChatGPTBrowserRegister:
         self.proxy = proxy
         self.otp_callback = otp_callback
         self.mfa_callback = mfa_callback
+        self.recovery_key = str(recovery_key or "").strip()
         self.phone_callback = phone_callback
         self.reset_password = str(reset_password or "")
         self.otp_sent_callback = otp_sent_callback
@@ -4922,6 +5044,7 @@ class ChatGPTBrowserRegister:
                             self.otp_callback, self.phone_callback, self.proxy, self.log,
                             mfa_callback=self.mfa_callback,
                             reset_password=self.reset_password,
+                            recovery_key=self.recovery_key,
                             otp_sent_callback=self.otp_sent_callback,
                             auth_context=auth_context,
                         )

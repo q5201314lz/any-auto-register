@@ -1863,6 +1863,7 @@ class RegistrationEngine:
                 proxy=self.proxy_url,
                 otp_callback=wait_for_browser_otp,
                 mfa_callback=current_mfa_code if has_mfa else None,
+                recovery_key=str(getattr(self, "totp_secret", "") or "").strip(),
                 phone_callback=self.phone_callback,
                 reset_password=(
                     self._generate_password()
@@ -2222,6 +2223,18 @@ class RegistrationEngine:
                 response = login_session.get(current_url, allow_redirects=False, timeout=15)
 
             self._log(f"Codex login 最终: status={response.status_code}, url={current_url[:100]}", "warning")
+            parsed_final_url = urllib.parse.urlparse(current_url)
+            if (
+                parsed_final_url.netloc.lower() == "auth.openai.com"
+                and parsed_final_url.path.rstrip("/") in {"/log-in", "/log-in/password"}
+            ):
+                self._log("Codex 协议 OAuth 停留在登录页，切换浏览器完成邮箱验证...")
+                token_info = self._complete_codex_login_password_in_browser()
+                if token_info:
+                    self._codex_direct_token_info = token_info
+                    return "browser-token-ready"
+                if not self._last_codex_error:
+                    self._last_codex_error = "浏览器 OAuth 未完成登录页验证"
             return None
 
         except Exception as e:

@@ -150,6 +150,19 @@ def test_hyphen_login_mfa_row_ignores_trailing_access_token(tmp_path):
     assert credentials["totp_secret"] == "TZ75BLYLJZWSN2SLXM6POOEUGTL26ZOI"
 
 
+def test_mixed_hyphen_login_mfa_row_is_supported():
+    entries = parse_xinlan_common_rows(
+        "02_bracero.cargo@icloud.com---boji1334ydboji1334yd----"
+        "7SA6WIUSDSGH37MKWBKBHYOWNBF7V7WF"
+    )
+
+    assert len(entries) == 1
+    assert entries[0].email == "02_bracero.cargo@icloud.com"
+    assert entries[0].password == "boji1334ydboji1334yd"
+    assert entries[0].totp_secret == "7SA6WIUSDSGH37MKWBKBHYOWNBF7V7WF"
+    assert entries[0].login_mode == "password_mfa"
+
+
 def test_registered_account_rows_ignore_trailing_plus_status_and_keep_credentials(tmp_path):
     rows = (
         "pipe@example.com|Password123!|JBSWY3DPEHPK3PXP|Plus\n"
@@ -307,6 +320,21 @@ def test_flysms_pickup_rows_support_six_hyphens_and_fragment_key():
     assert entry.receive_provider == "icloud_api"
     assert entry.icloud_api_url.startswith("https://flysms.xyz/icloud/pickup#")
     assert entry.icloud_api_token == ""
+
+
+def test_flysms_pickup_row_preserves_trailing_mfa_secret():
+    row = (
+        "cobra.toccata.9t@icloud.com----"
+        "https://flysms.xyz/icloud/pickup#email=cobra.toccata.9t%40icloud.com"
+        "&key=tok_example----XLBGXYJXP4V3H7FBHONVOUUTJ7YMOKG4"
+    )
+
+    entry = parse_xinlan_common_rows(row)[0]
+
+    assert entry.email == "cobra.toccata.9t@icloud.com"
+    assert entry.login_mode == "email_otp_only"
+    assert entry.icloud_api_url.startswith("https://flysms.xyz/icloud/pickup#")
+    assert entry.totp_secret == "XLBGXYJXP4V3H7FBHONVOUUTJ7YMOKG4"
 
 
 def test_flysms_pickup_rows_with_explicit_token_are_not_password_rows():

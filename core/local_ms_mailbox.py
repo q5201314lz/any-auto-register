@@ -245,6 +245,17 @@ def split_xinlan_common_line(line: str) -> list[str]:
             labeled_password.group(1) if labeled_password else "",
             labeled_totp.group(1) if labeled_totp else "",
         ])
+    if text.count("----") == 1:
+        mixed_prefix, mixed_mfa = text.rsplit("----", 1)
+        if "----" not in mixed_prefix and mixed_prefix.count("---") == 1:
+            mixed_email, mixed_password = mixed_prefix.split("---", 1)
+            normalized_mfa = re.sub(r"[\s-]+", "", mixed_mfa).upper()
+            if (
+                "@" in mixed_email
+                and mixed_password.strip()
+                and re.fullmatch(r"[A-Z2-7]{16,}", normalized_mfa)
+            ):
+                return [mixed_email.strip(), mixed_password.strip(), normalized_mfa]
     # Some relay exports append a previously issued access token after the
     # inbox URL.  Split that explicit four-hyphen metadata boundary before the
     # generic URL-only matcher, whose ``\S+`` URL would otherwise swallow it.
@@ -424,12 +435,18 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
             and _looks_like_http_url(_safe_text(parts[1]))
         )
         if icloud_api_row:
+            trailing_totp = ""
+            if len(parts) >= 3:
+                maybe_totp = re.sub(r"[\s-]+", "", _safe_text(parts[2])).upper()
+                if re.fullmatch(r"[A-Z2-7]{16,}", maybe_totp):
+                    trailing_totp = maybe_totp
             entry = LocalMicrosoftMailboxEntry(
                 email=email,
                 login_account=email,
                 login_mode="email_otp_only",
                 receive_provider="icloud_api",
                 icloud_api_url=_safe_text(parts[1]),
+                totp_secret=trailing_totp,
                 raw=line,
             )
             if entry.key in seen:
