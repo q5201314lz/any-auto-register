@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import csv
 import email as email_lib
+import html as html_lib
 import hashlib
 import imaplib
 import json
@@ -70,19 +71,23 @@ class _MailboxCardHTMLParser(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         classes = self._classes(attrs)
-        if tag == "article" and "mail-card" in classes:
+        if tag == "article" and ({"mail-card", "mail"} & classes):
             self._current = {"subject": [], "date": [], "body": []}
             self._capture_field = ""
             self._capture_tag = ""
             return
         if self._current is None:
             return
-        if tag == "span" and "subject" in classes:
+        if (tag == "span" or tag == "h2") and "subject" in classes:
             self._capture_field, self._capture_tag = "subject", tag
         elif tag == "span" and "date" in classes:
             self._capture_field, self._capture_tag = "date", tag
         elif tag == "pre" and "body" in classes:
             self._capture_field, self._capture_tag = "body", tag
+        elif tag == "iframe":
+            srcdoc = next((value or "" for key, value in attrs if key == "srcdoc"), "")
+            if srcdoc:
+                self._current["body"].append(html_lib.unescape(srcdoc))
 
     def handle_endtag(self, tag: str) -> None:
         if self._capture_tag == tag:
@@ -128,6 +133,7 @@ class LocalMicrosoftMailboxEntry:
     receive_provider: str = "microsoft"
     icloud_api_url: str = ""
     icloud_api_token: str = ""
+    auxiliary_phone_url: str = ""
     raw: str = ""
 
     @property
@@ -183,6 +189,7 @@ class LocalMicrosoftMailboxEntry:
             "receive_provider": self.receive_provider,
             "icloud_api_url": self.icloud_api_url,
             "icloud_api_token": self.icloud_api_token,
+            "auxiliary_phone_url": self.auxiliary_phone_url,
         }
 
 
@@ -323,6 +330,30 @@ def split_xinlan_common_line(line: str) -> list[str]:
     return _strip_trailing_statuses([item.strip() for item in re.split(r"\s+", text) if item.strip()])
 
 
+def _parse_labeled_auxiliary_row(line: str) -> dict[str, str] | None:
+    """Parse a mailbox URL plus a per-account Codex phone helper URL."""
+    match = re.fullmatch(
+        r"\s*邮箱接验证码登录\s*-{2,}\s*"
+        r"(?P<email>[^\s]+?@[^\s]+?)-{3,}\s*"
+        r"邮箱接码链接\s*[：:+]?\s*"
+        r"(?P<mail_url>https?://.*?)(?=-{4,}\s*辅助绑定)"
+        r"-{4,}\s*辅助绑定\s*(?:coedx|codex)\s*电话\s*[+：:]?\s*"
+        r"(?P<phone_url>https?://\S+)\s*",
+        str(line or ""),
+        flags=re.I,
+    )
+    if not match:
+        return None
+    values = {key: _safe_text(value) for key, value in match.groupdict().items()}
+    if (
+        "@" not in values["email"]
+        or not _looks_like_http_url(values["mail_url"])
+        or not _looks_like_http_url(values["phone_url"])
+    ):
+        return None
+    return values
+
+
 def _email_domain(value: str) -> str:
     return str(value or "").strip().lower().rsplit("@", 1)[-1]
 
@@ -360,6 +391,21 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
     for raw_line in str(text or "").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or line.startswith("//") or line.startswith("'"):
+            continue
+        labeled_auxiliary = _parse_labeled_auxiliary_row(line)
+        if labeled_auxiliary:
+            entry = LocalMicrosoftMailboxEntry(
+                email=labeled_auxiliary["email"],
+                login_account=labeled_auxiliary["email"],
+                login_mode="email_otp_only",
+                receive_provider="icloud_api",
+                icloud_api_url=labeled_auxiliary["mail_url"],
+                auxiliary_phone_url=labeled_auxiliary["phone_url"],
+                raw=line,
+            )
+            if entry.key not in seen:
+                seen.add(entry.key)
+                entries.append(entry)
             continue
         parts = split_xinlan_common_line(line)
         if not parts:

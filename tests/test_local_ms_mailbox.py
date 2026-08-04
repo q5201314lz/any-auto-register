@@ -24,6 +24,46 @@ def _entry() -> LocalMicrosoftMailboxEntry:
     )
 
 
+def test_labeled_mailbox_row_preserves_per_account_codex_phone_url():
+    row = (
+        "邮箱接验证码登录--broke.troughs9j@icloud.com---"
+        "邮箱接码链接https://assurivo.com/console/open.php?"
+        "mail=broke.troughs9j%40icloud.com&pwd=mail_secret&limit=5----"
+        "辅助绑定coedx电话+https://longnotes.cn/m/share_token"
+    )
+
+    entries = parse_xinlan_common_rows(row)
+
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.email == "broke.troughs9j@icloud.com"
+    assert entry.login_mode == "email_otp_only"
+    assert entry.icloud_api_url.startswith("https://assurivo.com/console/open.php?")
+    assert entry.auxiliary_phone_url == "https://longnotes.cn/m/share_token"
+    assert entry.credentials()["auxiliary_phone_url"] == "https://longnotes.cn/m/share_token"
+
+
+def test_assurivo_iframe_srcdoc_is_available_for_otp_extraction():
+    mailbox = LocalMicrosoftMailboxPool()
+    entry = LocalMicrosoftMailboxEntry(
+        email="user@icloud.com",
+        receive_provider="icloud_api",
+        icloud_api_url="https://assurivo.com/console/open.php?mail=user%40icloud.com&pwd=secret",
+    )
+    page = (
+        '<article class="mail"><div class="mail-head">'
+        '<h2 class="subject">Your OpenAI code</h2></div>'
+        '<iframe class="body-frame" srcdoc="&lt;html&gt;&lt;body&gt;'
+        'Your verification code is &lt;strong&gt;654321&lt;/strong&gt;'
+        '&lt;/body&gt;&lt;/html&gt;"></iframe></article>'
+    )
+
+    messages = mailbox._server_rendered_html_messages(entry, page)
+
+    assert len(messages) == 1
+    assert "654321" in messages[0]["bodyPreview"]
+
+
 def test_three_column_login_mfa_row_ignores_product_description():
     entries = parse_xinlan_common_rows(
         "account@icloud.com----LoginPassword123----JBSWY3DPEHPK3PXP\n"
