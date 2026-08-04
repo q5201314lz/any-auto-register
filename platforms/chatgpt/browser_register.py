@@ -6,8 +6,10 @@ import os
 import random
 import re
 import secrets
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from typing import Callable, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -23,6 +25,33 @@ from .constants import (
     SENTINEL_BASE,
     OAUTH_CONSENT_FORM_SELECTOR,
 )
+
+
+def _browser_concurrency_limit() -> int:
+    default_limit = 5 if (os.cpu_count() or 1) >= 8 else 2
+    try:
+        configured = os.environ.get("CHATGPT_CODEX_BROWSER_CONCURRENCY", str(default_limit))
+        return min(5, max(1, int(configured or default_limit)))
+    except (TypeError, ValueError):
+        return default_limit
+
+
+CODEX_BROWSER_CONCURRENCY = _browser_concurrency_limit()
+_CODEX_BROWSER_SEMAPHORE = threading.BoundedSemaphore(CODEX_BROWSER_CONCURRENCY)
+
+
+@contextmanager
+def _codex_browser_slot(log):
+    started = time.time()
+    if not _CODEX_BROWSER_SEMAPHORE.acquire(timeout=600):
+        raise RuntimeError("等待 Codex 浏览器资源槽超时")
+    waited = time.time() - started
+    if waited >= 1:
+        log(f"  已等待 {waited:.1f} 秒获得 Codex 浏览器资源槽（上限 {CODEX_BROWSER_CONCURRENCY}）")
+    try:
+        yield
+    finally:
+        _CODEX_BROWSER_SEMAPHORE.release()
 
 EMAIL_INPUT_SELECTORS = [
     'input#login-email',
@@ -4797,26 +4826,27 @@ class ChatGPTBrowserRegister:
         proxy = _build_proxy_config(self.proxy)
         launch_opts = _camoufox_launch_options(headless=self.headless, proxy=proxy)
 
-        with Camoufox(**launch_opts) as browser:
-            page = browser.new_page()
-            self.log("启动浏览器上下文注册状态机")
-            final_state = _browser_registration_flow(
-                page,
-                email,
-                password,
-                self.otp_callback,
-                self.phone_callback,
-                self.log,
-            )
-            self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
+        with _codex_browser_slot(self.log):
+            with Camoufox(**launch_opts) as browser:
+                page = browser.new_page()
+                self.log("启动浏览器上下文注册状态机")
+                final_state = _browser_registration_flow(
+                    page,
+                    email,
+                    password,
+                    self.otp_callback,
+                    self.phone_callback,
+                    self.log,
+                )
+                self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
 
-            # 获取 session token 和 cookies
-            cookies_dict = _get_cookies(page)
+                # 获取 session token 和 cookies
+                cookies_dict = _get_cookies(page)
 
-            # ═══ 通过 Codex CLI OAuth 获取正确的 token ═══
-            # 注册完成后的浏览器上下文 session 状态不稳定（NS_BINDING_ABORTED），
-            # 直接用全新浏览器做 OAuth 更可靠
-            self.log("执行 Codex CLI OAuth 流程获取 token...")
+                # ═══ 通过 Codex CLI OAuth 获取正确的 token ═══
+                # 注册完成后的浏览器上下文 session 状态不稳定（NS_BINDING_ABORTED），
+                # 直接用全新浏览器做 OAuth 更可靠
+                self.log("执行 Codex CLI OAuth 流程获取 token...")
 
         # 直接用全新浏览器做 OAuth（注册后的浏览器上下文不可靠）
         codex_result = self._retry_oauth_fresh_browser(email, password)
@@ -4851,20 +4881,21 @@ class ChatGPTBrowserRegister:
                 "effective_password": self.effective_password or str(password or ""),
             }
             try:
-                with Camoufox(**launch_opts) as browser:
-                    page = browser.new_page()
-                    self.log(f"  全新浏览器 OAuth 开始 ({attempt + 1}/{attempt_limit})...")
-                    result = _do_codex_oauth(
-                        page, {}, email, password,
-                        self.otp_callback, self.phone_callback, self.proxy, self.log,
-                        mfa_callback=self.mfa_callback,
-                        reset_password=self.reset_password,
-                        otp_sent_callback=self.otp_sent_callback,
-                        auth_context=auth_context,
-                    )
-                    if result:
-                        return result
-                    self.last_oauth_error = "Codex OAuth 浏览器流程未完成 callback"
+                with _codex_browser_slot(self.log):
+                    with Camoufox(**launch_opts) as browser:
+                        page = browser.new_page()
+                        self.log(f"  全新浏览器 OAuth 开始 ({attempt + 1}/{attempt_limit})...")
+                        result = _do_codex_oauth(
+                            page, {}, email, password,
+                            self.otp_callback, self.phone_callback, self.proxy, self.log,
+                            mfa_callback=self.mfa_callback,
+                            reset_password=self.reset_password,
+                            otp_sent_callback=self.otp_sent_callback,
+                            auth_context=auth_context,
+                        )
+                        if result:
+                            return result
+                        self.last_oauth_error = "Codex OAuth 浏览器流程未完成 callback"
             except Exception as exc:
                 self.last_oauth_error = str(exc).strip() or exc.__class__.__name__
                 self.log(f"  全新浏览器 OAuth 异常: {self.last_oauth_error}")
