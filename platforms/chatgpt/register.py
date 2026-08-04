@@ -1009,7 +1009,7 @@ class RegistrationEngine:
             self._log(f"发送验证码失败: {e}", "error")
             return False
 
-    def _get_verification_code(self) -> Optional[str]:
+    def _get_verification_code(self, timeout: int = 120) -> Optional[str]:
         """获取验证码"""
         try:
             self._log(f"正在等待邮箱 {self.email} 的验证码...")
@@ -1018,7 +1018,7 @@ class RegistrationEngine:
             code = self.email_service.get_verification_code(
                 email=self.email,
                 email_id=email_id,
-                timeout=120,
+                timeout=max(1, int(timeout or 120)),
                 pattern=OTP_CODE_PATTERN,
                 otp_sent_at=self._otp_sent_at,
             )
@@ -1818,12 +1818,28 @@ class RegistrationEngine:
             from core.totp import fetch_totp_code, generate_totp
             from platforms.chatgpt.browser_register import ChatGPTBrowserRegister
 
-            def wait_for_browser_otp() -> Optional[str]:
-                # The browser state machine only invokes this after the button click
-                # has transitioned to the email verification page.
+            def mark_browser_otp_sent() -> None:
                 self._otp_sent_at = time.time()
+                self._log("Codex login 已请求新的邮箱验证码")
+
+            cached_mfa_otp = ""
+
+            def wait_for_browser_otp(*, purpose: str = "") -> Optional[str]:
+                nonlocal cached_mfa_otp
+                if getattr(self, "_otp_sent_at", None) is None:
+                    mark_browser_otp_sent()
                 self._log("Codex login 已确认进入验证码页面，开始读取新邮件")
-                return self._get_verification_code()
+                if purpose == "mfa" and cached_mfa_otp:
+                    code = self._get_verification_code(timeout=20)
+                    if code:
+                        cached_mfa_otp = code
+                        return code
+                    self._log("Codex login 未收到新的 MFA 邮件，复用本次会话仍有效的邮箱验证码")
+                    return cached_mfa_otp
+                code = self._get_verification_code()
+                if purpose == "mfa" and code:
+                    cached_mfa_otp = code
+                return code
 
             def current_mfa_code() -> Optional[str]:
                 secret = str(getattr(self, "totp_secret", "") or "").strip()
@@ -1845,9 +1861,15 @@ class RegistrationEngine:
             browser_flow = ChatGPTBrowserRegister(
                 headless=True,
                 proxy=self.proxy_url,
-                otp_callback=None if has_mfa else wait_for_browser_otp,
+                otp_callback=wait_for_browser_otp,
                 mfa_callback=current_mfa_code if has_mfa else None,
                 phone_callback=self.phone_callback,
+                reset_password=(
+                    self._generate_password()
+                    if getattr(self, "_has_supplied_login_password", False)
+                    else (self.password or self._generate_password())
+                ),
+                otp_sent_callback=mark_browser_otp_sent,
                 log_fn=self._log,
             )
             browser_password = self.password
@@ -1862,6 +1884,9 @@ class RegistrationEngine:
                     self._log("Codex login 该邮箱仅提供收码地址，强制使用一次性验证码登录")
                 browser_password = ""
             token_info = browser_flow._retry_oauth_fresh_browser(self.email, browser_password)
+            effective_password = str(getattr(browser_flow, "effective_password", "") or "").strip()
+            if effective_password:
+                self.password = effective_password
             if not isinstance(token_info, dict):
                 browser_error = str(getattr(browser_flow, "last_oauth_error", "") or "").strip()
                 self._last_codex_error = browser_error or "浏览器 OAuth 未完成"
@@ -1903,7 +1928,7 @@ class RegistrationEngine:
             return "", token_info
         browser_error = str(self._last_codex_error or "浏览器一次性验证码入口不可用").strip()
         self._last_codex_error = (
-            "该 OpenAI 账号不支持邮箱一次性验证码登录，必须提供正确的 OpenAI 登录密码："
+            "该 OpenAI 账号的邮箱 OTP 与密码重置分支均未完成："
             f"协议分支={protocol_error}；浏览器分支={browser_error}"
         )
         return None, None
