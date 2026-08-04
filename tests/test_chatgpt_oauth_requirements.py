@@ -540,6 +540,122 @@ def test_protocol_codex_password_challenge_sends_and_validates_email_otp():
     assert session.calls[2][1].endswith("/api/accounts/client_auth_session_dump")
 
 
+def test_protocol_email_otp_mfa_challenge_finishes_in_browser():
+    engine = object.__new__(RegistrationEngine)
+    engine._last_codex_error = ""
+    engine._codex_direct_token_info = None
+    logs = []
+    engine._log = lambda message, level="info": logs.append(message)
+    engine._complete_codex_login_password_in_browser = lambda: {
+        "access_token": "at",
+        "refresh_token": "rt",
+    }
+
+    callback = engine._complete_codex_protocol_mfa_challenge()
+
+    assert callback == "browser-token-ready"
+    assert engine._codex_direct_token_info["refresh_token"] == "rt"
+    assert any("邮箱 OTP 后进入 MFA" in message for message in logs)
+
+
+def test_protocol_email_otp_mfa_challenge_preserves_browser_error():
+    engine = object.__new__(RegistrationEngine)
+    engine._last_codex_error = ""
+    engine._codex_direct_token_info = None
+    engine._log = lambda message, level="info": None
+
+    def fail_browser():
+        engine._last_codex_error = "MFA only offers authenticator"
+        return None
+
+    engine._complete_codex_login_password_in_browser = fail_browser
+
+    assert engine._complete_codex_protocol_mfa_challenge() is None
+    assert engine._last_codex_error == "MFA only offers authenticator"
+
+
+def test_stalled_browser_otp_reenters_same_oauth_url():
+    class Page:
+        url = "https://auth.openai.com/email-verification"
+
+        def __init__(self):
+            self.calls = []
+
+        def goto(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            self.url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+
+    page = Page()
+    logs = []
+    oauth_url = "https://auth.openai.com/oauth/authorize?state=state_123"
+
+    assert browser_register_module._recover_stalled_otp_submission(
+        page,
+        oauth_url,
+        logs.append,
+    ) is True
+    assert page.calls == [
+        (
+            oauth_url,
+            {"wait_until": "domcontentloaded", "timeout": 30000},
+        )
+    ]
+    assert any("重新进入授权页" in message for message in logs)
+
+
+def test_browser_login_otp_treats_mfa_route_transition_as_success(monkeypatch):
+    class Target:
+        def wait_for(self, **kwargs):
+            return None
+
+        def click(self, **kwargs):
+            return None
+
+        def fill(self, value):
+            return None
+
+        def type(self, value, **kwargs):
+            return None
+
+        def input_value(self):
+            return "123456"
+
+    class Candidate:
+        first = Target()
+
+    class Page:
+        url = "https://auth.openai.com/email-verification"
+
+        def locator(self, selector):
+            return Candidate()
+
+        def get_by_label(self, pattern):
+            return Candidate()
+
+        def get_by_role(self, role, name=None):
+            return Candidate()
+
+    page = Page()
+
+    def click_continue(current_page, selectors, timeout=0):
+        current_page.url = "https://auth.openai.com/mfa-challenge"
+        return 'button[type="submit"]'
+
+    monkeypatch.setattr(browser_register_module, "_click_first", click_continue)
+    monkeypatch.setattr(browser_register_module, "_browser_pause", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        browser_register_module,
+        "_derive_registration_state_from_page",
+        lambda current_page: {"page_type": "email_otp_verification"},
+    )
+
+    result = browser_register_module._submit_otp_via_page(page, "123456", lambda message: None)
+
+    assert result["ok"] is True
+    assert result["status"] == 200
+    assert result["url"].endswith("/mfa-challenge")
+
+
 def test_protocol_otp_send_rejects_redirect_false_positive():
     engine = object.__new__(RegistrationEngine)
     engine._otp_sent_at = None

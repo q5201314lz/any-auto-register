@@ -282,6 +282,23 @@ def test_flysms_pickup_rows_with_explicit_token_are_not_password_rows():
     assert entry.icloud_api_token == "tok_example"
 
 
+def test_relay_url_ignores_trailing_access_token_metadata():
+    access_token = "eyJheader.payload.signature"
+    row = (
+        "audial_panache.6x@icloud.com----"
+        "https://mail.ai1998.xyz/messages/share/audial_panache.6x%40icloud.com----"
+        f"{access_token}"
+    )
+
+    entry = parse_xinlan_common_rows(row)[0]
+
+    assert entry.login_mode == "email_otp_only"
+    assert entry.icloud_api_url == (
+        "https://mail.ai1998.xyz/messages/share/audial_panache.6x%40icloud.com"
+    )
+    assert access_token not in entry.icloud_api_url
+
+
 def test_flysms_pickup_api_reads_message_detail(monkeypatch):
     class Response:
         status_code = 200
@@ -323,6 +340,86 @@ def test_flysms_pickup_api_reads_message_detail(monkeypatch):
     assert captured[0][1]["headers"]["authorization"] == "Bearer tok_example"
     assert captured[0][1]["headers"]["x-mailbox-email"] == "tooling-tragic7c@icloud.com"
     assert captured[1][0].endswith("/u-1")
+
+
+def test_flysms_pickup_caches_immutable_message_details(monkeypatch):
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = ""
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    list_payload = {"messages": [{"uid": "u-1", "mailbox": "INBOX"}]}
+    responses = iter([
+        Response(list_payload),
+        Response({"message": {"uid": "u-1", "text": "Your code is 654321"}}),
+        Response(list_payload),
+    ])
+    captured = []
+
+    def fake_get(url, **kwargs):
+        captured.append(url)
+        return next(responses)
+
+    monkeypatch.setattr("core.local_ms_mailbox.requests.get", fake_get)
+    monkeypatch.setattr("core.local_ms_mailbox.time.sleep", lambda seconds: None)
+    LocalMicrosoftMailboxPool._flysms_next_request_at = 0.0
+    entry = LocalMicrosoftMailboxEntry(
+        email="cache-test@icloud.com",
+        receive_provider="icloud_api",
+        icloud_api_url=(
+            "https://flysms.xyz/icloud/pickup#email=cache-test%40icloud.com"
+            "&key=tok_example"
+        ),
+    )
+    mailbox = LocalMicrosoftMailboxPool()
+
+    first = mailbox._icloud_api_messages(entry)
+    second = mailbox._icloud_api_messages(entry)
+
+    assert "654321" in first[0]["bodyPreview"]
+    assert "654321" in second[0]["bodyPreview"]
+    assert len(captured) == 3
+    assert sum(url.endswith("/u-1") for url in captured) == 1
+
+
+def test_flysms_detail_rate_limit_does_not_consume_message_uid(monkeypatch):
+    class Response:
+        text = ""
+
+        def __init__(self, status_code, payload=None, headers=None):
+            self.status_code = status_code
+            self.payload = payload or {}
+            self.headers = headers or {"content-type": "application/json"}
+
+        def json(self):
+            return self.payload
+
+    responses = iter([
+        Response(200, {"messages": [{"uid": "u-new", "mailbox": "INBOX"}]}),
+        Response(429, {"error": "Too many requests"}, {"retry-after": "54"}),
+    ])
+    monkeypatch.setattr("core.local_ms_mailbox.requests.get", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr("core.local_ms_mailbox.time.sleep", lambda seconds: None)
+    LocalMicrosoftMailboxPool._flysms_next_request_at = 0.0
+    entry = LocalMicrosoftMailboxEntry(
+        email="rate-limit@icloud.com",
+        receive_provider="icloud_api",
+        icloud_api_url=(
+            "https://flysms.xyz/icloud/pickup#email=rate-limit%40icloud.com"
+            "&key=tok_example"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="邮件详情读取失败: HTTP 429.*Retry-After=54s"):
+        LocalMicrosoftMailboxPool()._icloud_api_messages(entry)
+
+    LocalMicrosoftMailboxPool._flysms_next_request_at = 0.0
 
 
 def test_tokenized_icloud_api_reads_root_code_from_json(monkeypatch):

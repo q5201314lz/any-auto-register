@@ -1933,6 +1933,18 @@ class RegistrationEngine:
         )
         return None, None
 
+    def _complete_codex_protocol_mfa_challenge(self) -> Optional[str]:
+        """Continue an email-OTP login when OpenAI adds an MFA challenge."""
+        self._log("Codex login 邮箱 OTP 后进入 MFA，切换浏览器完成验证...")
+        token_info = self._complete_codex_login_password_in_browser()
+        if token_info and token_info.get("refresh_token"):
+            self._codex_direct_token_info = token_info
+            self._log("Codex login 浏览器 MFA 已完成")
+            return "browser-token-ready"
+        if not self._last_codex_error:
+            self._last_codex_error = "Codex 邮箱 OTP 后的 MFA 验证未完成"
+        return None
+
     def _acquire_codex_callback(self) -> Optional[str]:
         """
         注册完成后，通过 Codex CLI OAuth 完整登录流程获取 callback URL。
@@ -2182,6 +2194,8 @@ class RegistrationEngine:
 
             # 8. 如果 OTP 后进入 Codex consent/workspace 页面，先完成 workspace/organization 选择。
             current_page_type = locals().get("otp_page") or locals().get("pwd_page") or locals().get("page_type") or ""
+            if current_page_type == "mfa_challenge":
+                return self._complete_codex_protocol_mfa_challenge()
             if current_page_type == "sign_in_with_chatgpt_codex_consent":
                 self._log("Codex login 进入 consent，开始选择 workspace...")
                 callback = self._complete_codex_consent_with_session(login_session, codex_oauth, login_client)

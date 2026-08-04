@@ -2365,6 +2365,7 @@ def _do_codex_oauth(
     auth_context = auth_context if isinstance(auth_context, dict) else {}
     active_password = str(auth_context.get("effective_password") or password or "")
     replacement_password = str(reset_password or "").strip()
+    otp_stall_recoveries = 0
     log(f"  OAuth state={oauth_start.state[:20]}...")
 
     try:
@@ -2541,7 +2542,16 @@ def _do_codex_oauth(
                 otp_resp = _submit_otp_via_page(page, code, log)
                 log(f"  OAuth 验证码页提交状态: {otp_resp.get('status', 0)}")
                 if not otp_resp.get("ok"):
-                    raise RuntimeError(f"OAuth 验证码校验失败: {(otp_resp.get('text') or '')[:300]}")
+                    otp_error = str(otp_resp.get("text") or "")
+                    if (
+                        "提交后未跳转" in otp_error
+                        and otp_stall_recoveries < 1
+                        and _recover_stalled_otp_submission(page, oauth_start.auth_url, log)
+                    ):
+                        otp_stall_recoveries += 1
+                        continue
+                    raise RuntimeError(f"OAuth 验证码校验失败: {otp_error[:300]}")
+                otp_stall_recoveries = 0
                 continue
 
             if state["page_type"] == "about_you":
@@ -3860,6 +3870,7 @@ def _submit_password_via_page(page, password: str, log) -> dict:
 
 
 def _submit_otp_via_page(page, code: str, log) -> dict:
+    submission_url = str(page.url or "")
     otp = str(code or "").strip()
     if not otp:
         return {"ok": False, "status": 400, "url": page.url, "data": None, "text": "验证码为空"}
@@ -3973,6 +3984,16 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
         current_url = page.url
         last_url = current_url or last_url
         page_type = str(_derive_registration_state_from_page(page).get("page_type") or "")
+        # A successful login OTP can advance from /email-verification to an
+        # MFA email challenge whose DOM is still classified as another OTP
+        # form.  Treat that route transition as progress so the OAuth state
+        # machine can select the MFA email branch instead of retrying the
+        # already-consumed login code.
+        if (
+            "/mfa-challenge" in str(current_url or "").lower()
+            and str(current_url or "") != submission_url
+        ) or page_type == "mfa_challenge":
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if page_type in {"reset_password_new_password", "login_password"}:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if "about-you" in current_url:
@@ -3989,6 +4010,17 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
             return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
         time.sleep(0.5)
     return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "验证码页提交后未跳转"}
+
+
+def _recover_stalled_otp_submission(page, oauth_url: str, log) -> bool:
+    """Re-enter OAuth once when an OTP submit neither advances nor errors."""
+    log("  OAuth 验证码提交无跳转，重新进入授权页确认验证状态...")
+    try:
+        page.goto(oauth_url, wait_until="domcontentloaded", timeout=30000)
+        return True
+    except Exception as exc:
+        log(f"  OAuth 验证码无跳转恢复失败: {exc}")
+        return False
 
 
 def _submit_about_you_via_page(page, log) -> dict:

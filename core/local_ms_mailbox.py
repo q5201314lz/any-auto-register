@@ -238,6 +238,21 @@ def split_xinlan_common_line(line: str) -> list[str]:
             labeled_password.group(1) if labeled_password else "",
             labeled_totp.group(1) if labeled_totp else "",
         ])
+    # Some relay exports append a previously issued access token after the
+    # inbox URL.  Split that explicit four-hyphen metadata boundary before the
+    # generic URL-only matcher, whose ``\S+`` URL would otherwise swallow it.
+    relay_with_metadata = re.fullmatch(
+        r"(?P<email>[^\s@]+@(?:(?!-{3,})[^\s])+)-{3,}"
+        r"(?P<url>https?://.*?)-{4}(?P<metadata>\S+)",
+        text,
+        flags=re.I,
+    )
+    if relay_with_metadata:
+        return [
+            relay_with_metadata.group("email"),
+            relay_with_metadata.group("url"),
+            relay_with_metadata.group("metadata"),
+        ]
     # URL-only relay rows may use any separator length from three hyphens up.
     # Match them before the four-hyphen field parser so six hyphens do not
     # leave a broken `--https://...` value.
@@ -525,6 +540,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
     """Use existing mailbox accounts from a local text pool."""
 
     _lock = threading.Lock()
+    _flysms_request_lock = threading.Lock()
+    _flysms_next_request_at = 0.0
 
     def __init__(
         self,
@@ -552,6 +569,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         self.failure_cooldown_seconds = max(int(failure_cooldown_seconds or 0), 0)
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
         self._oauth_mail_strategy: dict[str, str] = {}
+        self._flysms_detail_cache: dict[tuple[str, str], dict] = {}
 
     @classmethod
     def from_config(cls, config: dict) -> "LocalMicrosoftMailboxPool":
@@ -1403,16 +1421,17 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             "user-agent": "Mozilla/5.0",
             "cache-control": "no-cache, no-store",
         }
-        response = requests.get(
+        response = self._flysms_get(
             api_url,
             headers=headers,
-            params={"limit": "30", "_": time.time_ns()},
-            proxies=self.proxy,
+            params={"limit": "5", "_": time.time_ns()},
             timeout=25,
         )
         if response.status_code != 200:
+            retry_after = str(response.headers.get("retry-after") or "").strip()
+            retry_detail = f"，Retry-After={retry_after}s" if retry_after else ""
             raise RuntimeError(
-                f"flysms 邮件列表读取失败: HTTP {response.status_code} {response.text[:200]}"
+                f"flysms 邮件列表读取失败: HTTP {response.status_code}{retry_detail} {response.text[:200]}"
             )
         payload = response.json() or {}
         items = payload.get("messages") or payload.get("items") or []
@@ -1420,28 +1439,44 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             return []
 
         messages: list[dict] = []
-        for item in items[:30]:
+        for item in items[:5]:
             if not isinstance(item, dict):
                 continue
             merged = dict(item)
             uid = str(item.get("uid") or item.get("id") or "").strip()
             mailbox = str(item.get("mailbox") or "INBOX").strip()
             if uid:
-                try:
-                    detail_response = requests.get(
-                        f"{api_url}/{quote(uid, safe='')}",
-                        headers=headers,
-                        params={"mailbox": mailbox},
-                        proxies=self.proxy,
-                        timeout=15,
-                    )
-                    if detail_response.status_code == 200:
-                        detail_payload = detail_response.json() or {}
-                        detail = detail_payload.get("message") or detail_payload
-                        if isinstance(detail, dict):
-                            merged.update(detail)
-                except Exception:
-                    pass
+                cache_key = (email.lower(), uid)
+                detail = self._flysms_detail_cache.get(cache_key)
+                if detail is None:
+                    try:
+                        detail_response = self._flysms_get(
+                            f"{api_url}/{quote(uid, safe='')}",
+                            headers=headers,
+                            params={"mailbox": mailbox},
+                            timeout=15,
+                        )
+                        if detail_response.status_code == 429:
+                            retry_after = str(detail_response.headers.get("retry-after") or "").strip()
+                            retry_detail = f"，Retry-After={retry_after}s" if retry_after else ""
+                            raise RuntimeError(
+                                f"flysms 邮件详情读取失败: HTTP 429{retry_detail} "
+                                f"{detail_response.text[:200]}"
+                            )
+                        if detail_response.status_code == 200:
+                            detail_payload = detail_response.json() or {}
+                            detail = detail_payload.get("message") or detail_payload
+                            if isinstance(detail, dict):
+                                self._flysms_detail_cache[cache_key] = dict(detail)
+                    except RuntimeError:
+                        # Do not return an incomplete message with the real UID:
+                        # wait_for_code would mark it as seen before its OTP body
+                        # can be fetched after the rate-limit window.
+                        raise
+                    except Exception:
+                        detail = None
+                if isinstance(detail, dict):
+                    merged.update(detail)
             subject = self._first_json_text(merged, ("subject", "title"))
             body = self._first_json_text(
                 merged,
@@ -1459,6 +1494,32 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 "receivedDateTime": received,
             })
         return messages
+
+    def _flysms_get(self, url: str, *, headers: dict, params: dict, timeout: int):
+        """Serialize FlySMS requests and honor its global Retry-After window."""
+        with self._flysms_request_lock:
+            wait_seconds = self._flysms_next_request_at - time.time()
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            response = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                proxies=self.proxy,
+                timeout=timeout,
+            )
+            now = time.time()
+            if response.status_code == 429:
+                try:
+                    retry_after = max(float(response.headers.get("retry-after") or 60), 1.0)
+                except (TypeError, ValueError):
+                    retry_after = 60.0
+                type(self)._flysms_next_request_at = now + min(retry_after + 1.0, 120.0)
+            else:
+                # Avoid a burst of list/detail requests when several FlySMS
+                # mailboxes are processed by the same concurrent task.
+                type(self)._flysms_next_request_at = now + 0.5
+            return response
 
     @staticmethod
     def _json_code_values(payload: Any) -> list[str]:
@@ -1746,7 +1807,11 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         start = time.time()
         try:
             entry = self._entry_for_account(account)
-            poll_interval = 10 if self._mailroom_public_endpoint(entry.icloud_api_url) else 5
+            slow_relay = bool(
+                self._mailroom_public_endpoint(entry.icloud_api_url)
+                or self._flysms_pickup_endpoint(entry)
+            )
+            poll_interval = 10 if slow_relay else 5
         except Exception:
             poll_interval = 5
         # Microsoft Graph 的 receivedDateTime 与本机触发时间之间可能有 1-2 秒偏差，
