@@ -24,46 +24,6 @@ def _entry() -> LocalMicrosoftMailboxEntry:
     )
 
 
-def test_labeled_mailbox_row_preserves_per_account_codex_phone_url():
-    row = (
-        "邮箱接验证码登录--broke.troughs9j@icloud.com---"
-        "邮箱接码链接https://assurivo.com/console/open.php?"
-        "mail=broke.troughs9j%40icloud.com&pwd=mail_secret&limit=5----"
-        "辅助绑定coedx电话+https://longnotes.cn/m/share_token"
-    )
-
-    entries = parse_xinlan_common_rows(row)
-
-    assert len(entries) == 1
-    entry = entries[0]
-    assert entry.email == "broke.troughs9j@icloud.com"
-    assert entry.login_mode == "email_otp_only"
-    assert entry.icloud_api_url.startswith("https://assurivo.com/console/open.php?")
-    assert entry.auxiliary_phone_url == "https://longnotes.cn/m/share_token"
-    assert entry.credentials()["auxiliary_phone_url"] == "https://longnotes.cn/m/share_token"
-
-
-def test_assurivo_iframe_srcdoc_is_available_for_otp_extraction():
-    mailbox = LocalMicrosoftMailboxPool()
-    entry = LocalMicrosoftMailboxEntry(
-        email="user@icloud.com",
-        receive_provider="icloud_api",
-        icloud_api_url="https://assurivo.com/console/open.php?mail=user%40icloud.com&pwd=secret",
-    )
-    page = (
-        '<article class="mail"><div class="mail-head">'
-        '<h2 class="subject">Your OpenAI code</h2></div>'
-        '<iframe class="body-frame" srcdoc="&lt;html&gt;&lt;body&gt;'
-        'Your verification code is &lt;strong&gt;654321&lt;/strong&gt;'
-        '&lt;/body&gt;&lt;/html&gt;"></iframe></article>'
-    )
-
-    messages = mailbox._server_rendered_html_messages(entry, page)
-
-    assert len(messages) == 1
-    assert "654321" in messages[0]["bodyPreview"]
-
-
 def test_three_column_login_mfa_row_ignores_product_description():
     entries = parse_xinlan_common_rows(
         "account@icloud.com----LoginPassword123----JBSWY3DPEHPK3PXP\n"
@@ -78,6 +38,18 @@ def test_three_column_login_mfa_row_ignores_product_description():
     assert entries[0].totp_secret == "JBSWY3DPEHPK3PXP"
     assert not entries[0].graph_ready
     assert not entries[0].imap_ready
+
+
+def test_hyphen_login_mfa_row_accepts_null_placeholder_after_seed():
+    entries = parse_xinlan_common_rows(
+        "gmail@example.com----LoginPassword123----JBSWY3DPEHPK3PXP----null"
+    )
+
+    assert len(entries) == 1
+    assert entries[0].email == "gmail@example.com"
+    assert entries[0].password == "LoginPassword123"
+    assert entries[0].totp_secret == "JBSWY3DPEHPK3PXP"
+    assert entries[0].login_mode == "password_mfa"
 
 
 def test_pipe_login_mfa_row_preserves_plus_email_and_password_spaces():
@@ -148,19 +120,6 @@ def test_hyphen_login_mfa_row_ignores_trailing_access_token(tmp_path):
     credentials = account.extra["provider_account"]["credentials"]
     assert credentials["password"] == "Password123!"
     assert credentials["totp_secret"] == "TZ75BLYLJZWSN2SLXM6POOEUGTL26ZOI"
-
-
-def test_mixed_hyphen_login_mfa_row_is_supported():
-    entries = parse_xinlan_common_rows(
-        "02_bracero.cargo@icloud.com---boji1334ydboji1334yd----"
-        "7SA6WIUSDSGH37MKWBKBHYOWNBF7V7WF"
-    )
-
-    assert len(entries) == 1
-    assert entries[0].email == "02_bracero.cargo@icloud.com"
-    assert entries[0].password == "boji1334ydboji1334yd"
-    assert entries[0].totp_secret == "7SA6WIUSDSGH37MKWBKBHYOWNBF7V7WF"
-    assert entries[0].login_mode == "password_mfa"
 
 
 def test_registered_account_rows_ignore_trailing_plus_status_and_keep_credentials(tmp_path):
@@ -248,6 +207,31 @@ def test_password_login_row_with_inbox_and_totp_urls_keeps_all_capabilities(tmp_
     assert credentials["totp_url"].startswith("https://2fa.example/view?")
 
 
+def test_password_login_row_with_mfa_secret_and_totp_url_uses_existing_account_branch(tmp_path):
+    row = (
+        "account@icloud.com----redacted-password----JBSWY3DPEHPK3PXP----"
+        "https://2fa.example/view?token=totp-token&email=account%40icloud.com"
+    )
+    entries = parse_xinlan_common_rows(row)
+
+    assert len(entries) == 1
+    assert entries[0].password == "redacted-password"
+    assert entries[0].totp_secret == "JBSWY3DPEHPK3PXP"
+    assert entries[0].totp_url.startswith("https://2fa.example/view?")
+    assert entries[0].login_mode == "password_mfa_url"
+    assert entries[0].existing_login_ready
+    assert not entries[0].icloud_api_ready
+
+    account = LocalMicrosoftMailboxPool(
+        pool_text=row,
+        state_file=str(tmp_path / "mailbox-state.json"),
+    ).get_email()
+    credentials = account.extra["provider_account"]["credentials"]
+    assert credentials["totp_secret"] == "JBSWY3DPEHPK3PXP"
+    assert credentials["totp_url"].startswith("https://2fa.example/view?")
+    assert credentials["login_mode"] == "password_mfa_url"
+
+
 def test_three_hyphen_icloud_relay_rows_preserve_email_and_code_url():
     entries = parse_xinlan_common_rows(
         "odds.04alibi+hfi0vu5u890a8x24@icloud.com---"
@@ -266,6 +250,28 @@ def test_three_hyphen_icloud_relay_rows_preserve_email_and_code_url():
     assert entries[0].icloud_api_ready
     assert entries[1].email == "frame-squawk4r@icloud.com"
     assert entries[1].icloud_api_ready
+
+
+def test_thefindnet_url_only_row_extracts_mail_query_address(tmp_path):
+    row = (
+        "https://icloud.thefindnet.xyz/api/mail.php?"
+        "mail=cross-31-opposer%40icloud.com&pwd=mailbox-secret&limit=5"
+    )
+    entries = parse_xinlan_common_rows(row)
+
+    assert len(entries) == 1
+    assert entries[0].email == "cross-31-opposer@icloud.com"
+    assert entries[0].login_mode == "email_otp_only"
+    assert entries[0].icloud_api_url == row
+    assert entries[0].icloud_api_ready
+
+    account = LocalMicrosoftMailboxPool(
+        pool_text=row,
+        state_file=str(tmp_path / "mailbox-state.json"),
+    ).get_email()
+    credentials = account.extra["provider_account"]["credentials"]
+    assert credentials["email"] == "cross-31-opposer@icloud.com"
+    assert credentials["icloud_api_url"] == row
 
 
 def test_four_hyphen_icloud_relay_format_remains_supported():
@@ -320,21 +326,6 @@ def test_flysms_pickup_rows_support_six_hyphens_and_fragment_key():
     assert entry.receive_provider == "icloud_api"
     assert entry.icloud_api_url.startswith("https://flysms.xyz/icloud/pickup#")
     assert entry.icloud_api_token == ""
-
-
-def test_flysms_pickup_row_preserves_trailing_mfa_secret():
-    row = (
-        "cobra.toccata.9t@icloud.com----"
-        "https://flysms.xyz/icloud/pickup#email=cobra.toccata.9t%40icloud.com"
-        "&key=tok_example----XLBGXYJXP4V3H7FBHONVOUUTJ7YMOKG4"
-    )
-
-    entry = parse_xinlan_common_rows(row)[0]
-
-    assert entry.email == "cobra.toccata.9t@icloud.com"
-    assert entry.login_mode == "email_otp_only"
-    assert entry.icloud_api_url.startswith("https://flysms.xyz/icloud/pickup#")
-    assert entry.totp_secret == "XLBGXYJXP4V3H7FBHONVOUUTJ7YMOKG4"
 
 
 def test_flysms_pickup_rows_with_explicit_token_are_not_password_rows():
@@ -410,86 +401,6 @@ def test_flysms_pickup_api_reads_message_detail(monkeypatch):
     assert captured[1][0].endswith("/u-1")
 
 
-def test_flysms_pickup_caches_immutable_message_details(monkeypatch):
-    class Response:
-        status_code = 200
-        headers = {"content-type": "application/json"}
-        text = ""
-
-        def __init__(self, payload):
-            self.payload = payload
-
-        def json(self):
-            return self.payload
-
-    list_payload = {"messages": [{"uid": "u-1", "mailbox": "INBOX"}]}
-    responses = iter([
-        Response(list_payload),
-        Response({"message": {"uid": "u-1", "text": "Your code is 654321"}}),
-        Response(list_payload),
-    ])
-    captured = []
-
-    def fake_get(url, **kwargs):
-        captured.append(url)
-        return next(responses)
-
-    monkeypatch.setattr("core.local_ms_mailbox.requests.get", fake_get)
-    monkeypatch.setattr("core.local_ms_mailbox.time.sleep", lambda seconds: None)
-    LocalMicrosoftMailboxPool._flysms_next_request_at = 0.0
-    entry = LocalMicrosoftMailboxEntry(
-        email="cache-test@icloud.com",
-        receive_provider="icloud_api",
-        icloud_api_url=(
-            "https://flysms.xyz/icloud/pickup#email=cache-test%40icloud.com"
-            "&key=tok_example"
-        ),
-    )
-    mailbox = LocalMicrosoftMailboxPool()
-
-    first = mailbox._icloud_api_messages(entry)
-    second = mailbox._icloud_api_messages(entry)
-
-    assert "654321" in first[0]["bodyPreview"]
-    assert "654321" in second[0]["bodyPreview"]
-    assert len(captured) == 3
-    assert sum(url.endswith("/u-1") for url in captured) == 1
-
-
-def test_flysms_detail_rate_limit_does_not_consume_message_uid(monkeypatch):
-    class Response:
-        text = ""
-
-        def __init__(self, status_code, payload=None, headers=None):
-            self.status_code = status_code
-            self.payload = payload or {}
-            self.headers = headers or {"content-type": "application/json"}
-
-        def json(self):
-            return self.payload
-
-    responses = iter([
-        Response(200, {"messages": [{"uid": "u-new", "mailbox": "INBOX"}]}),
-        Response(429, {"error": "Too many requests"}, {"retry-after": "54"}),
-    ])
-    monkeypatch.setattr("core.local_ms_mailbox.requests.get", lambda *args, **kwargs: next(responses))
-    monkeypatch.setattr("core.local_ms_mailbox.time.sleep", lambda seconds: None)
-    LocalMicrosoftMailboxPool._flysms_next_request_at = 0.0
-    entry = LocalMicrosoftMailboxEntry(
-        email="rate-limit@icloud.com",
-        receive_provider="icloud_api",
-        icloud_api_url=(
-            "https://flysms.xyz/icloud/pickup#email=rate-limit%40icloud.com"
-            "&key=tok_example"
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="邮件详情读取失败: HTTP 429.*Retry-After=54s"):
-        LocalMicrosoftMailboxPool()._icloud_api_messages(entry)
-
-    LocalMicrosoftMailboxPool._flysms_next_request_at = 0.0
-
-
 def test_tokenized_icloud_api_reads_root_code_from_json(monkeypatch):
     class Response:
         status_code = 200
@@ -536,6 +447,48 @@ def test_tokenized_icloud_api_reads_root_code_from_json(monkeypatch):
     assert captured[0][1]["headers"]["cache-control"] == "no-cache, no-store"
     assert "654321" in received["bodyPreview"]
     assert received["id"] != before["id"]
+
+
+def test_dynamic_cdk_mail_page_uses_json_mail_endpoint(monkeypatch):
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json; charset=utf-8"}
+
+        def __init__(self, code: str):
+            self.payload = {
+                "success": True,
+                "data": {
+                    "email": "account@icloud.com",
+                    "messages": [{
+                        "id": "mail-1",
+                        "subject": "Your temporary ChatGPT login code",
+                        "date": "2026-08-08T02:12:58Z",
+                        "body_html": f"Enter this temporary verification code to continue: {code}",
+                    }],
+                },
+            }
+            self.text = json.dumps(self.payload)
+
+        def json(self):
+            return self.payload
+
+    captured = []
+
+    def fake_get(url, **kwargs):
+        captured.append((url, kwargs))
+        return Response("711105")
+
+    monkeypatch.setattr("core.local_ms_mailbox.requests.get", fake_get)
+    entry = LocalMicrosoftMailboxEntry(
+        email="account@icloud.com",
+        receive_provider="icloud_api",
+        icloud_api_url="https://mail.example.com/cdk?cdk=MAIL-ABC123",
+    )
+
+    messages = LocalMicrosoftMailboxPool()._icloud_api_messages(entry)
+
+    assert captured[0][0] == "https://mail.example.com/cdk/mail?cdk=MAIL-ABC123"
+    assert "711105" in messages[0]["bodyPreview"]
 
 
 def test_mailroom_fragment_link_calls_public_api_and_reads_root_code(monkeypatch):

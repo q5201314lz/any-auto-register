@@ -396,12 +396,40 @@ def _is_flysms_pickup_url(value: str) -> bool:
     )
 
 
+def _parse_thefindnet_pickup_url(value: str) -> str:
+    parsed = urlparse(str(value or "").strip())
+    host = parsed.netloc.lower().split(":", 1)[0]
+    if (
+        parsed.scheme not in {"http", "https"}
+        or host != "icloud.thefindnet.xyz"
+        or parsed.path.rstrip("/").lower() != "/api/mail.php"
+    ):
+        return ""
+    query = parse_qs(parsed.query)
+    email = unquote(str((query.get("mail") or [""])[0])).strip()
+    return email if "@" in email else ""
+
+
 def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
     entries: list[LocalMicrosoftMailboxEntry] = []
     seen: set[str] = set()
     for raw_line in str(text or "").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or line.startswith("//") or line.startswith("'"):
+            continue
+        thefindnet_email = _parse_thefindnet_pickup_url(line)
+        if thefindnet_email:
+            entry = LocalMicrosoftMailboxEntry(
+                email=thefindnet_email,
+                login_account=thefindnet_email,
+                login_mode="email_otp_only",
+                receive_provider="icloud_api",
+                icloud_api_url=line,
+                raw=line,
+            )
+            if entry.key not in seen:
+                seen.add(entry.key)
+                entries.append(entry)
             continue
         labeled_auxiliary = _parse_labeled_auxiliary_row(line)
         if labeled_auxiliary:
@@ -496,6 +524,7 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
         )
         login_with_mfa = False
         login_with_mfa_and_access_token = False
+        login_with_mfa_and_totp_url = False
         if len(parts) in (3, 4):
             maybe_totp = re.sub(r"[\s-]+", "", _safe_text(parts[2])).upper()
             login_with_mfa = bool(re.fullmatch(r"[A-Z2-7]{16,}", maybe_totp))
@@ -504,6 +533,9 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
                 login_with_mfa_and_access_token = bool(
                     login_with_mfa
                     and re.fullmatch(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", maybe_access_token)
+                )
+                login_with_mfa_and_totp_url = bool(
+                    login_with_mfa and _looks_like_http_url(_safe_text(parts[3]))
                 )
 
         if flysms_pickup:
@@ -537,6 +569,16 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
                 icloud_api_url=_safe_text(parts[2]),
                 raw=line,
             )
+        elif login_with_mfa_and_totp_url:
+            entry = LocalMicrosoftMailboxEntry(
+                email=email,
+                password=_safe_text(parts[1]),
+                login_account=email,
+                totp_secret=maybe_totp,
+                totp_url=_safe_text(parts[3]),
+                login_mode="password_mfa_url",
+                raw=line,
+            )
         elif password_with_inbox:
             entry = LocalMicrosoftMailboxEntry(
                 email=email,
@@ -547,7 +589,16 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
                 icloud_api_url=_safe_text(parts[2]),
                 raw=line,
             )
-        elif login_with_mfa and (len(parts) == 3 or login_with_mfa_and_access_token):
+        elif login_with_mfa and (
+            len(parts) == 3
+            or login_with_mfa_and_access_token
+            # Some Gmail exports append a literal `null` placeholder after
+            # the MFA seed. It is still the password+MFA branch, not OAuth.
+            or (
+                len(parts) == 4
+                and _safe_text(parts[3]).strip().lower() in {"", "null", "none", "n/a", "-"}
+            )
+        ):
             # `|` 货商格式可能包含有意义的密码空格；只清理邮箱和 MFA，
             # 密码保留第一个与最后一个 `|` 之间的原始内容。
             preserve_password_spaces = "----" not in line and line.count("|") >= 2
@@ -1447,6 +1498,17 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         return f"{parsed.scheme}://{parsed.netloc}/public-api/v1/check", fragment
 
     @staticmethod
+    def _cdk_mail_endpoint(url: str) -> str | None:
+        """Resolve dynamic CDK mailbox pages to their JSON mail endpoint."""
+        parsed = urlparse(str(url or "").strip())
+        if not parsed.scheme or not parsed.netloc or parsed.path.rstrip("/").lower() != "/cdk":
+            return None
+        cdk = str((parse_qs(parsed.query).get("cdk") or [""])[0]).strip()
+        if not cdk or len(cdk) > 512 or re.search(r"[\s/\\]", cdk):
+            return None
+        return f"{parsed.scheme}://{parsed.netloc}/cdk/mail?cdk={quote(cdk, safe='')}"
+
+    @staticmethod
     def _rangertalking_verification_endpoint(entry: LocalMicrosoftMailboxEntry) -> str | None:
         if not entry.icloud_api_token or not _is_rangertalking_pickup_url(entry.icloud_api_url):
             return None
@@ -1630,6 +1692,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         if flysms_endpoint:
             return self._flysms_api_messages(entry, flysms_endpoint)
         mailroom_endpoint = self._mailroom_public_endpoint(entry.icloud_api_url)
+        cdk_mail_endpoint = self._cdk_mail_endpoint(entry.icloud_api_url)
         headers = {
             "accept": "application/json,text/html,text/plain,*/*",
             "user-agent": "Mozilla/5.0",
@@ -1638,7 +1701,15 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         }
         tokenized_latest_endpoint = self._tokenized_latest_endpoint(entry.icloud_api_url)
         rangertalking_endpoint = self._rangertalking_verification_endpoint(entry)
-        if mailroom_endpoint:
+        if cdk_mail_endpoint:
+            response = requests.get(
+                cdk_mail_endpoint,
+                headers=headers,
+                params={"limit": 50, "_": time.time_ns()},
+                proxies=self.proxy,
+                timeout=25,
+            )
+        elif mailroom_endpoint:
             api_url, share_token = mailroom_endpoint
             response = requests.post(
                 api_url,
@@ -1726,6 +1797,8 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                             "body",
                             "body_preview",
                             "bodyPreview",
+                            "body_html",
+                            "preview",
                             "content",
                             "html",
                             "text",
@@ -1873,6 +1946,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             slow_relay = bool(
                 self._mailroom_public_endpoint(entry.icloud_api_url)
                 or self._flysms_pickup_endpoint(entry)
+                or self._cdk_mail_endpoint(entry.icloud_api_url)
             )
             poll_interval = 10 if slow_relay else 5
         except Exception:
