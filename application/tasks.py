@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -17,7 +18,7 @@ from core.account_graph import (
     patch_account_graph,
     recover_lifecycle_status_for_valid_account,
 )
-from core.base_platform import AccountStatus, RegisterConfig
+from core.base_platform import Account, AccountStatus, RegisterConfig
 from core.datetime_utils import format_local_clock, serialize_datetime
 from core.db import AccountModel, TaskEventModel, TaskLog, TaskModel, engine, save_account
 from core.platform_accounts import build_platform_account
@@ -54,6 +55,7 @@ _task_locks: dict[str, threading.Lock] = {}
 _task_locks_guard = threading.Lock()
 _task_cancel_events: dict[str, threading.Event] = {}
 _task_cancel_events_guard = threading.Lock()
+_ldxp_task_creation_lock = threading.Lock()
 
 
 def _cancel_event(task_id: str) -> threading.Event:
@@ -223,11 +225,64 @@ def _task_account_keys(task_type: str, payload: dict[str, Any]) -> list[str]:
     return []
 
 
+def _serialized_task_progress(
+    task: TaskModel,
+    result: dict[str, Any],
+    payload: dict[str, Any] | None = None,
+) -> tuple[int, int]:
+    progress_total = int(task.progress_total or 0)
+    progress_current = int(task.progress_current or 0)
+    if task.type != TASK_TYPE_REGISTER or task.status not in TERMINAL_TASK_STATUSES:
+        return progress_current, progress_total
+
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
+    if str(extra.get("identity_provider") or "").strip() != "nnai_cdk":
+        try:
+            target_count = max(int(data.get("target_count") or payload.get("count") or 0), 0)
+        except (TypeError, ValueError):
+            target_count = 0
+        if target_count:
+            return target_count, target_count
+    try:
+        attempts = max(int(data.get("attempts") or 0), 0)
+    except (TypeError, ValueError):
+        attempts = 0
+    if attempts:
+        return attempts, attempts
+    return progress_current, progress_total
+
+
+def _serialized_task_counts(
+    task: TaskModel,
+    result: dict[str, Any],
+    payload: dict[str, Any],
+) -> tuple[int, int]:
+    success_count = max(int(task.success_count or 0), 0)
+    error_count = max(int(task.error_count or 0), 0)
+    if task.type != TASK_TYPE_REGISTER or task.status not in TERMINAL_TASK_STATUSES:
+        return success_count, error_count
+
+    extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
+    if str(extra.get("identity_provider") or "").strip() == "nnai_cdk":
+        return success_count, error_count
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    try:
+        target_count = max(int(data.get("target_count") or payload.get("count") or 0), 0)
+    except (TypeError, ValueError):
+        target_count = 0
+    if not target_count:
+        return success_count, error_count
+    bounded_success = min(success_count, target_count)
+    return success_count, max(target_count - bounded_success, 0)
+
+
 def serialize_task(task: TaskModel) -> dict[str, Any]:
     result = task.get_result()
     payload = task.get_payload()
-    progress_total = int(task.progress_total or 0)
-    progress_current = int(task.progress_current or 0)
+    progress_current, progress_total = _serialized_task_progress(task, result, payload)
+    success_count, error_count = _serialized_task_counts(task, result, payload)
     return {
         "id": task.id,
         "task_id": task.id,
@@ -242,8 +297,8 @@ def serialize_task(task: TaskModel) -> dict[str, Any]:
             "total": progress_total,
             "label": f"{progress_current}/{progress_total}" if progress_total else "0/0",
         },
-        "success": int(task.success_count or 0),
-        "error_count": int(task.error_count or 0),
+        "success": success_count,
+        "error_count": error_count,
         "errors": list(result.get("errors", [])),
         "cashier_urls": list(result.get("cashier_urls", [])),
         "data": result.get("data"),
@@ -297,6 +352,330 @@ def create_task(
     return serialize_task(task)
 
 
+def _active_register_tasks() -> list[dict[str, Any]]:
+    with Session(engine) as session:
+        tasks = session.exec(
+            select(TaskModel)
+            .where(TaskModel.type == TASK_TYPE_REGISTER)
+            .where(TaskModel.status.in_([TASK_STATUS_PENDING] + list(ACTIVE_TASK_STATUSES)))
+            .order_by(TaskModel.created_at)
+        ).all()
+    return [serialize_task(task) for task in tasks]
+
+
+def _ldxp_max_inflight_tasks() -> int:
+    try:
+        return max(1, int(os.getenv("ACCOUNT_MANAGER_LDXP_MAX_INFLIGHT_TASKS", "5")))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _is_ldxp_automatic_source(value: Any) -> bool:
+    return str(value or "").startswith("ldxp_public_order")
+
+
+def _create_register_task_record(payload: dict[str, Any], *, progress_total: int) -> dict[str, Any]:
+    extra = dict(payload.get("extra") or {})
+    trade_no = str(extra.get("source_trade_no") or "").strip()
+    parent_task_id = str(extra.get("parent_task_id") or "").strip()
+    is_ldxp_automatic = _is_ldxp_automatic_source(extra.get("source")) and bool(trade_no)
+    if not is_ldxp_automatic:
+        return create_task(
+            task_type=TASK_TYPE_REGISTER,
+            platform=str(payload.get("platform", "")),
+            payload=payload,
+            progress_total=progress_total,
+        )
+
+    # The API and the order monitor can submit the same order concurrently.
+    # Serialize the check-and-create sequence inside the single service process.
+    with _ldxp_task_creation_lock:
+        active_tasks = _active_register_tasks()
+        effective_active_tasks = [
+            task for task in active_tasks
+            if str(task.get("id") or "").strip() != parent_task_id
+        ]
+        for task in effective_active_tasks:
+            active_extra = dict(((task.get("payload") or {}).get("extra") or {}))
+            if (
+                _is_ldxp_automatic_source(active_extra.get("source"))
+                and str(active_extra.get("source_trade_no") or "").strip() == trade_no
+            ):
+                existing = dict(task)
+                existing["deduplicated"] = True
+                return existing
+
+        max_inflight = _ldxp_max_inflight_tasks()
+        if len(effective_active_tasks) >= max_inflight:
+            raise RuntimeError(
+                f"注册机自动队列已满: 当前在途 {len(effective_active_tasks)}/{max_inflight}，请稍后重试"
+            )
+        return create_task(
+            task_type=TASK_TYPE_REGISTER,
+            platform=str(payload.get("platform", "")),
+            payload=payload,
+            progress_total=progress_total,
+        )
+
+
+def _nnai_cdk_codes_from_extra(extra: dict[str, Any]) -> list[str]:
+    raw = str(
+        extra.get("nnai_cdk_text")
+        or extra.get("cdk_pool_text")
+        or extra.get("local_mail_pool_text")
+        or extra.get("local_ms_pool_text")
+        or ""
+    )
+    seen: set[str] = set()
+    codes: list[str] = []
+    for line in raw.splitlines():
+        code = line.strip()
+        if not code:
+            continue
+        normalized = code.upper()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        codes.append(code)
+    return codes
+
+
+def _is_nnai_cdk_task(extra: dict[str, Any]) -> bool:
+    return str(extra.get("identity_provider") or "").strip().lower() == "nnai_cdk"
+
+
+def _chunks(values: list[str], size: int) -> list[list[str]]:
+    return [values[i:i + size] for i in range(0, len(values), size)]
+
+
+def _credential_value(data: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = data.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _account_from_sub2api_item(item: dict[str, Any], *, source_trade_no: str, source_code: str) -> Account:
+    credentials = dict(item.get("credentials") or {})
+    merged = {**item, **credentials}
+    email = _credential_value(merged, "email", "account_email", "username")
+    refresh_token = _credential_value(merged, "refresh_token", "refreshToken", "rt")
+    access_token = _credential_value(merged, "access_token", "accessToken", "at")
+    if not email:
+        raise RuntimeError("nnai 导出账号缺少 email")
+    if not refresh_token:
+        raise RuntimeError(f"nnai 导出账号缺少 refresh_token: {email}")
+    extra = dict(credentials)
+    for key in (
+        "access_token", "accessToken", "refresh_token", "refreshToken", "rt",
+        "id_token", "idToken", "session_token", "sessionToken", "client_id",
+        "clientId", "chatgpt_account_id", "account_id", "user_id", "plan_type",
+        "plan", "expires_at", "expiresAt",
+    ):
+        if key in merged and merged[key] is not None:
+            extra[key] = merged[key]
+    extra["refresh_token"] = refresh_token
+    if access_token:
+        extra["access_token"] = access_token
+    if source_trade_no:
+        extra["source_trade_no"] = source_trade_no
+        extra["source"] = "ldxp_public_order"
+    if source_code:
+        extra["source_cdk"] = source_code
+    return Account(
+        platform="chatgpt",
+        email=email,
+        password=_credential_value(merged, "password"),
+        user_id=_credential_value(merged, "chatgpt_account_id", "account_id", "user_id"),
+        token=access_token,
+        status=AccountStatus.SUBSCRIBED,
+        extra=extra,
+    )
+
+
+def _create_nnai_mailbox_child_task(payload: dict[str, Any], rows: list[str], logger: TaskLogger) -> str:
+    clean_rows = []
+    seen = set()
+    for row in rows:
+        raw = str(row or "").strip()
+        if raw and raw not in seen:
+            seen.add(raw)
+            clean_rows.append(raw)
+    if not clean_rows:
+        return ""
+    parent_extra = dict(payload.get("extra") or {})
+    source_trade_no = str(parent_extra.get("source_trade_no") or "").strip()
+    raw_text = "\n".join(clean_rows)
+    child_payload = {
+        "platform": "chatgpt",
+        "email": None,
+        "count": len(clean_rows),
+        "concurrency": min(5, max(1, len(clean_rows))),
+        "run_all_mailboxes": len(clean_rows) > 1,
+        "executor_type": "protocol",
+        "captcha_solver": "auto",
+        "extra": {
+            "identity_provider": "mailbox",
+            "mail_provider": "local_ms_pool",
+            "oauth_provider": "openai",
+            "local_ms_pool_text": raw_text,
+            "local_mail_pool_text": raw_text,
+            "local_ms_pool_allow_reuse": False,
+            "local_mail_pool_allow_reuse": False,
+            "local_mail_pool_avoid_repeat": True,
+            "source_trade_no": source_trade_no,
+            "source": "ldxp_public_order_nnai_child",
+            "parent_nnai_task": True,
+            "parent_task_id": logger.task_id,
+        },
+    }
+    child = create_register_task(child_payload)
+    try:
+        from services.task_runtime import task_runtime
+
+        task_runtime.wake_up()
+    except Exception as exc:
+        logger.log(f"nnai 子任务已创建但唤醒失败: {exc}", level="warning")
+    task_id = str(child.get("id") or "")
+    logger.log(f"nnai 已转成邮箱取码注册任务: {task_id} | {len(clean_rows)} 个", event_type="summary")
+    return task_id
+
+
+def _execute_nnai_cdk_task(payload: dict[str, Any], logger: TaskLogger) -> None:
+    import requests
+
+    extra = dict(payload.get("extra") or {})
+    codes = _nnai_cdk_codes_from_extra(extra)
+    if not codes:
+        logger.finish(TASK_STATUS_FAILED, error="nnai CDK 任务缺少卡密")
+        return
+    source_trade_no = str(extra.get("source_trade_no") or "").strip()
+    logger.set_progress(0, len(codes))
+    logger.log(f"nnai CDK 任务开始：{len(codes)} 个卡密，按 5 个一批兑换", event_type="summary")
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://redeem.nnai.uk",
+        "Referer": "https://redeem.nnai.uk/account",
+    })
+    success = 0
+    delegated = 0
+    errors: list[str] = []
+    saved_emails: list[str] = []
+    mailbox_rows: list[str] = []
+    child_task_id = ""
+    for batch_index, batch in enumerate(_chunks(codes, 5), start=1):
+        if logger.is_cancel_requested():
+            logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+            return
+        normalized = [c.strip().upper() for c in batch if c.strip()]
+        logger.log(f"nnai 批次 {batch_index}: 开始兑换 {len(normalized)} 个")
+        try:
+            r = session.post(
+                "https://redeem.nnai.uk/api/internal/oauth/redeem",
+                json={"codes": normalized},
+                timeout=60,
+            )
+            data = r.json()
+            if r.status_code >= 400 or data.get("ok") is False:
+                raise RuntimeError(data.get("error") or r.text[:160])
+            results = data.get("results") or []
+            export_codes: list[str] = []
+            for item in results:
+                if not item.get("ok"):
+                    code = str(item.get("code") or "")[:30]
+                    err = str(item.get("error") or "兑换失败")
+                    errors.append(f"{code}: {err}")
+                    logger.log(f"nnai 兑换失败 {code}: {err}", level="error")
+                    continue
+                card = dict(item.get("card") or {})
+                code = str(card.get("code") or item.get("code") or "").strip()
+                if not code:
+                    continue
+                if card.get("hasRefreshToken") is False:
+                    account = str(card.get("account") or "").strip()
+                    receive_url = str(card.get("receiveUrl") or "").strip()
+                    if account and receive_url:
+                        mailbox_rows.append(f"{account}----{receive_url}")
+                        delegated += 1
+                        logger.log(f"nnai 兑换成功无 RT，转邮箱取码登录: {account}")
+                    else:
+                        errors.append(f"{code}: 无 refresh token，且缺少邮箱/取码链接")
+                        logger.log(f"nnai 兑换成功但缺少 RT 和邮箱取码信息: {code[:30]}", level="error")
+                    continue
+                export_codes.append(code)
+            if not export_codes:
+                logger.set_progress(min(success + len(batch), len(codes)), len(codes))
+                continue
+            e = session.get(
+                "https://redeem.nnai.uk/api/internal/oauth/export",
+                params={"format": "sub2api", "codes": "\n".join(export_codes)},
+                timeout=60,
+            )
+            try:
+                exported = e.json()
+            except Exception as exc:
+                raise RuntimeError(f"nnai 导出非 JSON: HTTP {e.status_code} {e.text[:160]}") from exc
+            accounts = exported.get("accounts") if isinstance(exported, dict) else None
+            if not accounts:
+                raise RuntimeError("nnai 导出 JSON 无 accounts")
+            for idx, item in enumerate(accounts):
+                try:
+                    source_code = export_codes[idx] if idx < len(export_codes) else ""
+                    account = _account_from_sub2api_item(
+                        dict(item or {}),
+                        source_trade_no=source_trade_no,
+                        source_code=source_code,
+                    )
+                    saved_account = save_account(account)
+                    logger.record_success()
+                    success += 1
+                    saved_emails.append(account.email)
+                    logger.log(f"✓ nnai 注册/兑换成功: {account.email}")
+                    _save_task_log("chatgpt", account.email, "success")
+                    _auto_upload_cpa(logger, account)
+                    _auto_push_sub2api(logger, saved_account)
+                    _auto_push_any2api(logger, account)
+                except Exception as exc:
+                    msg = str(exc)
+                    errors.append(msg)
+                    logger.record_error(msg)
+                    logger.log(f"nnai 保存/上传失败: {msg}", level="error")
+            logger.set_progress(min(success + len(errors), len(codes)), len(codes))
+        except Exception as exc:
+            msg = str(exc)
+            errors.append(msg)
+            logger.record_error(msg)
+            logger.log(f"nnai 批次 {batch_index} 异常: {msg}", level="error")
+            logger.set_progress(min(success + len(errors), len(codes)), len(codes))
+    if mailbox_rows:
+        try:
+            child_task_id = _create_nnai_mailbox_child_task(payload, mailbox_rows, logger)
+        except Exception as exc:
+            msg = f"nnai 邮箱取码子任务创建失败: {exc}"
+            errors.append(msg)
+            logger.record_error(msg)
+            logger.log(msg, level="error")
+    logger.set_progress(len(codes), len(codes))
+    logger.set_result_data({
+        "target_count": len(codes),
+        "attempts": len(codes),
+        "success": success,
+        "delegated": delegated,
+        "fail": len(errors),
+        "emails": saved_emails,
+        "child_task_id": child_task_id,
+        "errors": errors[:20],
+    })
+    logger.log(f"nnai CDK 完成: 直接成功 {success} 个, 转注册 {delegated} 个, 失败 {len(errors)} 个", event_type="summary")
+    if logger.is_cancel_requested():
+        logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+        return
+    logger.finish(TASK_STATUS_FAILED if success == 0 and delegated == 0 else TASK_STATUS_SUCCEEDED, error="" if (success or delegated) else (errors[0] if errors else "nnai CDK 未成功"))
+
+
 def create_register_task(payload: dict[str, Any]) -> dict[str, Any]:
     payload = dict(payload or {})
     extra = dict(payload.get("extra") or {})
@@ -305,6 +684,14 @@ def create_register_task(payload: dict[str, Any]) -> dict[str, Any]:
     extra["local_mail_pool_include_retry_rows"] = False
     payload["extra"] = extra
     platform = str(payload.get("platform") or "").strip().lower()
+    if platform == "chatgpt" and _is_nnai_cdk_task(extra):
+        codes = _nnai_cdk_codes_from_extra(extra)
+        if not codes:
+            raise RuntimeError("nnai CDK 任务缺少卡密")
+        payload["count"] = len(codes)
+        payload["concurrency"] = 1
+        payload["run_all_mailboxes"] = False
+        return _create_register_task_record(payload, progress_total=len(codes))
     if platform == "chatgpt":
         _preflight_chatgpt_register_task(payload, extra)
         requested_concurrency = max(_int_config(payload.get("concurrency"), 1), 1)
@@ -350,12 +737,7 @@ def create_register_task(payload: dict[str, Any]) -> dict[str, Any]:
         payload["extra"] = extra
 
     count = max(int(payload.get("count", 1) or 1), 1)
-    return create_task(
-        task_type=TASK_TYPE_REGISTER,
-        platform=str(payload.get("platform", "")),
-        payload=payload,
-        progress_total=count,
-    )
+    return _create_register_task_record(payload, progress_total=count)
 
 
 def create_account_check_task(account_id: int) -> dict[str, Any]:
@@ -446,9 +828,8 @@ def append_task_event(task_id: str, message: str, *, event_type: str = "log", le
 def mark_incomplete_tasks_interrupted() -> None:
     interrupted_task_ids: list[str] = []
     with Session(engine) as session:
-        non_terminal = [TASK_STATUS_PENDING] + list(ACTIVE_TASK_STATUSES)
         tasks = session.exec(
-            select(TaskModel).where(TaskModel.status.in_(non_terminal))
+            select(TaskModel).where(TaskModel.status.in_(list(ACTIVE_TASK_STATUSES)))
         ).all()
         interrupted_task_ids = [str(task.id) for task in tasks]
         now = _utcnow()
@@ -609,6 +990,13 @@ class TaskLogger:
 
         _mutate_task(self.task_id, _update)
 
+    def set_account_counts(self, success: int, errors: int) -> None:
+        def _update(task: TaskModel) -> None:
+            task.success_count = max(int(success), 0)
+            task.error_count = max(int(errors), 0)
+
+        _mutate_task(self.task_id, _update)
+
     def add_cashier_url(self, url: str) -> None:
         def _update(task: TaskModel) -> None:
             result = task.get_result()
@@ -633,6 +1021,7 @@ class TaskLogger:
                 return
             task.status = status
             task.finished_at = _utcnow()
+            task.progress_current = max(int(task.progress_total or 0), 0)
             if error:
                 task.error = error
 
@@ -794,23 +1183,29 @@ def execute_task(task_id: str) -> None:
         payload = task.get_payload()
 
     logger = TaskLogger(task_id)
-    logger.mark_running()
+    try:
+        logger.mark_running()
 
-    if logger.is_cancel_requested():
-        logger.finish(TASK_STATUS_CANCELLED, error="任务在启动后立即被取消")
-        return
+        if logger.is_cancel_requested():
+            logger.finish(TASK_STATUS_CANCELLED, error="任务在启动后立即被取消")
+            return
 
-    handlers: dict[str, Callable[[dict[str, Any], TaskLogger], None]] = {
-        TASK_TYPE_REGISTER: _execute_register_task,
-        TASK_TYPE_ACCOUNT_CHECK: _execute_account_check_task,
-        TASK_TYPE_ACCOUNT_CHECK_ALL: _execute_account_check_all_task,
-        TASK_TYPE_PLATFORM_ACTION: _execute_platform_action_task,
-    }
-    handler = handlers.get(task_type)
-    if not handler:
-        logger.finish(TASK_STATUS_FAILED, error=f"未知任务类型: {task_type}")
-        return
-    handler(payload, logger)
+        handlers: dict[str, Callable[[dict[str, Any], TaskLogger], None]] = {
+            TASK_TYPE_REGISTER: _execute_register_task,
+            TASK_TYPE_ACCOUNT_CHECK: _execute_account_check_task,
+            TASK_TYPE_ACCOUNT_CHECK_ALL: _execute_account_check_all_task,
+            TASK_TYPE_PLATFORM_ACTION: _execute_platform_action_task,
+        }
+        handler = handlers.get(task_type)
+        if not handler:
+            logger.finish(TASK_STATUS_FAILED, error=f"未知任务类型: {task_type}")
+            return
+        handler(payload, logger)
+    except Exception as exc:
+        error = f"任务执行器异常: {exc.__class__.__name__}: {exc}"
+        logger.record_error(error)
+        logger.log(error, level="error", event_type="state")
+        logger.finish(TASK_STATUS_FAILED, error=error)
 
 
 def _resolve_sms_provider_for_task(extra: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -828,7 +1223,7 @@ def _resolve_sms_provider_for_task(extra: dict[str, Any]) -> tuple[str, dict[str
     if not provider_key:
         provider_key = "sms_activate" if extra.get("sms_activate_api_key") else ""
     definition = definitions_repo.get_by_key("sms", provider_key) if provider_key else None
-    settings = settings_repo.resolve_runtime_settings("sms", provider_key, extra) if definition else dict(extra)
+    settings = settings_repo.resolve_sms_runtime_settings(provider_key, extra) if definition else dict(extra)
     return provider_key, settings
 
 
@@ -871,23 +1266,60 @@ def _is_rate_limit_failure(error: str) -> bool:
     return any(marker in text for marker in ("http 429", "rate_limit_exceeded", "too many requests"))
 
 
+def _is_phone_verification_rate_limit_failure(error: str) -> bool:
+    text = str(error or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "too many phone verification requests",
+            "phone_verification_rate_limit",
+            "phone verification request limit",
+            "手机号验证请求过多",
+            "手机验证码请求过多",
+        )
+    )
+
+
 def _classify_registration_failure(error: str) -> str:
     text = str(error or "")
     lowered = text.lower()
+    if _is_phone_verification_rate_limit_failure(text):
+        return "phone_verification_rate_limited"
     if _is_rate_limit_failure(text):
         return "openai_rate_limited"
+    if (
+        "deleted or deactivated" in lowered
+        or "account_deactivated" in lowered
+        or "账号已删除或停用" in text
+        or "账号已停用" in text
+    ):
+        return "account_deleted_or_deactivated"
     if "invalid_state" in lowered or "sign-in session is no longer valid" in lowered or "登录会话已失效" in text:
         return "oauth_invalid_state"
     if "incorrect email address or password" in lowered:
         return "login_password_rejected"
     if "不支持邮箱一次性验证码登录" in text or "必须提供正确的 openai 登录密码" in lowered:
         return "login_password_required"
+    if "mfa 密钥校验失败后切换邮箱验证" in lowered:
+        return "mfa_rejected_then_email_otp_timeout"
+    if "mfa" in lowered and ("incorrect code" in lowered or "校验失败" in text):
+        return "mfa_code_rejected"
+    if "herosms 获取号码失败" in lowered or "no_numbers" in lowered:
+        return "sms_number_unavailable"
+    if (
+        "邮箱验证码等待超时" in text
+        or "邮箱 otp 获取失败" in lowered
+        or "取码接口在等待时限内未返回新验证码" in text
+    ):
+        return "email_otp_timeout"
+    if "注册密码失败" in text or "登录密码提交失败" in text:
+        return "login_password_rejected"
     if "add_phone" in lowered or "手机验证" in text or "短信验证" in text:
         return "phone_verification_failed"
-    if "callback" in lowered or "consent" in lowered or "workspace" in lowered:
-        return "oauth_callback_incomplete"
     if "otp" in lowered or "验证码" in text:
         return "email_otp_failed"
+    if "callback" in lowered or "consent" in lowered or "workspace" in lowered:
+        return "oauth_callback_incomplete"
     if "不在本地邮箱池" in text or "格式不可用" in text:
         return "mailbox_unavailable"
     return "registration_failed"
@@ -895,19 +1327,78 @@ def _classify_registration_failure(error: str) -> str:
 
 def _registration_failure_reason(error: str, failure_kind: str) -> str:
     text = str(error or "").strip()
+    if failure_kind == "account_deleted_or_deactivated":
+        return text or "OpenAI 账号已删除或停用，现有卡密不可重试"
     if failure_kind == "oauth_callback_incomplete":
         return text or "Codex 授权页未生成 workspace/consent callback"
     if failure_kind == "oauth_invalid_state":
         return text or "OpenAI OAuth state 已失效"
     if failure_kind == "openai_rate_limited":
         return text or "OpenAI 返回 429 Too many requests"
+    if failure_kind == "phone_verification_rate_limited":
+        return text or "OpenAI 手机验证请求过多，当前会话换号无效，稍后重试"
     if failure_kind == "email_otp_failed":
         return text or "邮箱验证码发送、读取或校验失败"
+    if failure_kind == "email_otp_timeout":
+        return text or "邮箱取码接口在等待时限内未返回新的 OpenAI 验证码"
+    if failure_kind == "mfa_code_rejected":
+        return text or "OpenAI 拒绝了账号提供的 MFA 密钥生成的验证码"
+    if failure_kind == "mfa_rejected_then_email_otp_timeout":
+        return text or "账号 MFA 密钥无效，切换邮箱验证后仍未收到新验证码"
+    if failure_kind == "sms_number_unavailable":
+        return text or "配置的短信国家当前没有可租用号码"
+    if failure_kind == "login_password_rejected":
+        return text or "OpenAI 拒绝了账号登录密码"
     if failure_kind == "login_password_required":
         return text or "该 OpenAI 账号不支持邮箱一次性验证码登录，必须提供正确密码"
     if failure_kind == "phone_verification_failed":
         return text or "手机号租用、短信读取或校验失败"
     return text or "注册流程发生未分类错误"
+
+
+_FAILURE_KIND_LABELS = {
+    "openai_rate_limited": "OpenAI 429 限流",
+    "phone_verification_rate_limited": "OpenAI 手机验证请求限流",
+    "account_deleted_or_deactivated": "账号已删除或停用",
+    "oauth_invalid_state": "OAuth 会话失效",
+    "login_password_rejected": "登录密码被拒绝",
+    "login_password_required": "必须使用正确登录密码",
+    "mfa_code_rejected": "MFA 验证码被拒绝",
+    "mfa_rejected_then_email_otp_timeout": "MFA 密钥无效且邮箱验证超时",
+    "sms_number_unavailable": "配置国家无可用手机号",
+    "phone_verification_failed": "手机验证失败",
+    "email_otp_timeout": "邮箱验证码等待超时",
+    "email_otp_failed": "邮箱验证码失败",
+    "oauth_callback_incomplete": "OAuth 回调未完成",
+    "mailbox_unavailable": "邮箱资源不可用",
+    "registration_failed": "未分类注册失败",
+}
+
+
+def _redact_registration_failure(text: str) -> str:
+    value = str(text or "").strip()
+    return re.sub(
+        r"(?i)((?:api_key|auth_code|access_token|refresh_token|token|key|password)=)[^&\s]+",
+        r"\1***",
+        value,
+    )
+
+
+def _registration_final_error(failed_items: list[dict[str, Any]], errors: list[str]) -> str:
+    details: list[str] = []
+    for item in failed_items[:3]:
+        email = str(item.get("email") or "未知邮箱").strip()
+        failure_kind = str(item.get("failure_kind") or "registration_failed")
+        label = _FAILURE_KIND_LABELS.get(failure_kind, failure_kind)
+        reason = _redact_registration_failure(
+            str(item.get("failure_reason") or item.get("error") or "")
+        )
+        details.append(f"{email}: [{label}] {reason or label}")
+    if len(failed_items) > 3:
+        details.append(f"另有 {len(failed_items) - 3} 个邮箱失败，详见 failed_emails")
+    if details:
+        return " | ".join(details)
+    return _redact_registration_failure(errors[-1] if errors else "注册任务未产出成功账号")
 
 
 def _recent_chatgpt_rate_limit_remaining(cooldown_seconds: int) -> int:
@@ -997,8 +1488,11 @@ def _register_attempt_budget(
 ) -> int:
     if exhaustive_mailbox_run or not herosms_enabled:
         return max(count, 1)
-    multiplier = max(_int_config(sms_settings.get("register_account_max_attempts"), 1), 1)
-    return max(max_success * multiplier, 1)
+    # A failed phone/OTP attempt is handled by the phone callback's bounded
+    # number retry loop.  Re-running the complete account flow multiplies OTP
+    # traffic and causes duplicate queue entries/429s, so HeroSMS accounts are
+    # deliberately attempted once each.
+    return max(max_success, 1)
 
 
 def _auto_followup_windsurf_payment(
@@ -1115,10 +1609,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     email = payload.get("email") or None
     password = payload.get("password") or None
     proxy = payload.get("proxy") or None
+    extra = dict(payload.get("extra") or {})
+    if platform_name == "chatgpt" and _is_nnai_cdk_task(extra):
+        _execute_nnai_cdk_task(payload, logger)
+        return
     if not proxy:
         from core.http_client import resolve_proxy_url
         proxy = resolve_proxy_url(None)
-    extra = dict(payload.get("extra") or {})
     requested_concurrency = min(max(int(payload.get("concurrency", 1) or 1), 1), count, 5)
     if platform_name == "chatgpt":
         max_concurrency = _registration_policy_int(
@@ -1148,7 +1645,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     sms_provider_key, sms_settings = _resolve_sms_provider_for_task(extra)
     herosms_enabled = sms_provider_key in {"herosms", "herosms_api"} and bool(str(sms_settings.get("herosms_api_key") or "").strip())
     hero_extra_max = max(_int_config(sms_settings.get("register_phone_extra_max"), 3), 0) if herosms_enabled else 0
-    hero_attempt_multiplier = max(_int_config(sms_settings.get("register_account_max_attempts"), 1), 1) if herosms_enabled else 1
+    hero_attempt_multiplier = 1 if herosms_enabled else 1
     hero_reuse_to_max = False
     target_success = count
     max_success = count + hero_extra_max if herosms_enabled and hero_reuse_to_max else count
@@ -1203,7 +1700,12 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         resolved_proxy = proxy or proxy_pool.get_next()
         platform = _build_platform_instance(platform_name, payload, logger, resolved_proxy=resolved_proxy, shared_mailbox=shared_mailbox)
         try:
-            logger.log(f"开始注册第 {index + 1}/{count} 个账号")
+            if herosms_enabled:
+                logger.log(
+                    f"开始注册第 {index + 1}/{max_attempts} 次尝试（目标成功 {count} 个账号）"
+                )
+            else:
+                logger.log(f"开始注册第 {index + 1}/{count} 个账号")
             if resolved_proxy:
                 logger.log(f"使用代理: {resolved_proxy}")
             account = platform.register(email=email, password=password)
@@ -1294,7 +1796,6 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             max_success=max_success,
             sms_settings=sms_settings,
         )
-
         def _hero_phone_alive() -> bool:
             if not (herosms_enabled and hero_reuse_to_max):
                 return False
@@ -1364,7 +1865,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         success += 1
                     elif result != "__cancel_requested__":
                         errors.append(str(result))
-                    logger.set_progress(min(success if herosms_enabled else completed, progress_total), progress_total)
+                    logger.set_progress(min(success, target_success), target_success)
                 if _should_submit_more() and len(futures) < concurrency and not _wait_between_accounts():
                     cancelled = True
                     break
@@ -1382,11 +1883,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         return
 
     failed_items = list(failed_mailboxes.values())
+    failed_account_count = max(target_success - success, 0)
     result_data = {
         "target_count": target_success,
         "attempts": submitted,
         "success": success,
-        "fail": len(errors),
+        "fail": failed_account_count,
+        "attempt_errors": len(errors),
         "failed_email_count": len(failed_items),
         "failed_emails": failed_items,
     }
@@ -1396,18 +1899,20 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             "hero_sms_reuse": False,
         })
     logger.set_result_data(result_data)
+    logger.set_account_counts(success, failed_account_count)
+    logger.set_progress(target_success, target_success)
     if failed_items:
         logger.log(
             f"失败邮箱统计: 去重后 {len(failed_items)} 个，已释放占用，已保留至累计邮箱池等待手动重试",
             event_type="summary",
         )
-    summary = f"完成: 成功 {success} 个, 失败 {len(errors)} 个"
+    summary = f"完成: 成功 {success} 个, 失败 {failed_account_count} 个, 共尝试 {submitted} 次"
     logger.log(summary, event_type="summary")
     if logger.is_cancel_requested():
         logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
         return
     final_status = TASK_STATUS_FAILED if errors and success == 0 else TASK_STATUS_SUCCEEDED
-    final_error = "" if final_status == TASK_STATUS_SUCCEEDED else errors[0]
+    final_error = "" if final_status == TASK_STATUS_SUCCEEDED else _registration_final_error(failed_items, errors)
     logger.finish(final_status, error=final_error)
 
 

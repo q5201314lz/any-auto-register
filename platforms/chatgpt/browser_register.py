@@ -656,14 +656,39 @@ def _wait_for_any_selector(page, selectors: list[str], timeout: int = 30):
 
 
 def _click_first(page, selectors: list[str], *, timeout: int = 10) -> str | None:
-    found = _wait_for_any_selector(page, selectors, timeout=timeout)
-    if not found:
-        return None
-    try:
-        page.click(found)
-        return found
-    except Exception:
-        return None
+    # Lightweight test doubles and legacy page adapters do not expose the
+    # Playwright locator API. Keep their old query/click contract isolated
+    # from the production path below.
+    if not callable(getattr(page, "locator", None)):
+        found = _wait_for_any_selector(page, selectors, timeout=timeout)
+        if not found:
+            return None
+        try:
+            page.click(found)
+            return found
+        except Exception:
+            return None
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                count = locator.count()
+            except Exception:
+                continue
+            for index in range(count):
+                target = locator.nth(index)
+                try:
+                    if not target.is_visible(timeout=200) or not target.is_enabled(timeout=200):
+                        continue
+                    remaining_ms = max(250, int((deadline - time.time()) * 1000))
+                    target.click(timeout=min(2500, remaining_ms))
+                    return selector
+                except Exception:
+                    continue
+        time.sleep(0.2)
+    return None
 
 def _visible_button_texts(page) -> list[str]:
     try:
@@ -1186,18 +1211,18 @@ def _switch_mfa_to_email_otp(page, log, otp_sent_callback=None) -> bool:
         return False
     if callable(otp_sent_callback):
         otp_sent_callback()
-    try:
-        page.locator(direct_selector).first.click(timeout=2500)
-    except Exception:
+    if not _click_first(page, [direct_selector], timeout=3):
         return False
     log(f"  OAuth MFA 已切换为邮箱验证: {direct_selector}")
     deadline = time.time() + 15
     while time.time() < deadline:
         state = _derive_registration_state_from_page(page)
-        if not _is_mfa_page_type(str(state.get("page_type") or "")):
+        page_type = str(state.get("page_type") or "")
+        current_url = str(page.url or "").lower()
+        if page_type == "email_otp_verification" or "/mfa-challenge/email-otp" in current_url:
             return True
         time.sleep(0.25)
-    return True
+    return False
 
 
 def _open_passkey_recovery(page, log) -> bool:
@@ -2442,6 +2467,7 @@ def _do_codex_oauth(
     active_password = str(auth_context.get("effective_password") or password or "")
     replacement_password = str(reset_password or "").strip()
     otp_stall_recoveries = 0
+    previous_mfa_failure = ""
     log(f"  OAuth state={oauth_start.state[:20]}...")
 
     try:
@@ -2572,12 +2598,49 @@ def _do_codex_oauth(
                                 f"{refreshed_page_type}，跳过重复提交"
                             )
                             continue
-                        log("  OAuth 提交 MFA 验证码...")
-                        mfa_resp = _submit_otp_via_page(page, mfa_code, log)
-                        log(f"  OAuth MFA 提交状态: {mfa_resp.get('status', 0)}")
-                        if mfa_resp.get("ok"):
+                        mfa_succeeded = False
+                        for mfa_attempt in range(2):
+                            if mfa_attempt:
+                                log("  OAuth MFA 首次提交未通过，等待下一枚验证码后重试一次...")
+                                next_code = ""
+                                next_code_deadline = time.time() + 35
+                                while time.time() < next_code_deadline:
+                                    candidate = str(mfa_callback() or "").strip()
+                                    if candidate and candidate != mfa_code:
+                                        next_code = candidate
+                                        break
+                                    time.sleep(1)
+                                if not next_code:
+                                    mfa_error = (
+                                        f"{mfa_error}; 等待下一枚不同的 MFA 验证码超时"
+                                        if mfa_error
+                                        else "等待下一枚不同的 MFA 验证码超时"
+                                    )
+                                    break
+                                mfa_code = next_code
+
+                            log(f"  OAuth 提交 MFA 验证码 ({mfa_attempt + 1}/2)...")
+                            mfa_resp = _submit_otp_via_page(page, mfa_code, log)
+                            log(f"  OAuth MFA 提交状态: {mfa_resp.get('status', 0)}")
+                            if mfa_resp.get("ok"):
+                                mfa_succeeded = True
+                                break
+
+                            mfa_error = str(mfa_resp.get("text") or "OAuth MFA 校验失败")
+                            current_mfa_state = _derive_oauth_state_from_page(page)
+                            current_mfa_page_type = str(current_mfa_state.get("page_type") or "")
+                            if current_mfa_page_type and not _is_mfa_page_type(current_mfa_page_type):
+                                log(
+                                    "  OAuth MFA 提交返回未确认，但页面已前进: "
+                                    f"{current_mfa_page_type}"
+                                )
+                                mfa_succeeded = True
+                                break
+                            log(f"  OAuth MFA 未通过: {mfa_error[:300]}")
+
+                        if mfa_succeeded:
+                            previous_mfa_failure = ""
                             continue
-                        mfa_error = str(mfa_resp.get("text") or "OAuth MFA 校验失败")
                     else:
                         mfa_error = "OAuth MFA 验证码生成失败"
                 if otp_callback and _switch_mfa_to_email_otp(
@@ -2585,6 +2648,7 @@ def _do_codex_oauth(
                     log,
                     otp_sent_callback=otp_sent_callback,
                 ):
+                    previous_mfa_failure = mfa_error
                     continue
                 if mfa_error:
                     raise RuntimeError(
@@ -2646,7 +2710,17 @@ def _do_codex_oauth(
                 otp_purpose = "mfa" if "/mfa-challenge" in current_url.lower() else "login"
                 code = _invoke_otp_callback(otp_callback, purpose=otp_purpose)
                 if not code:
-                    raise RuntimeError("Codex OAuth 邮箱 OTP 获取失败")
+                    if otp_purpose == "mfa" and previous_mfa_failure:
+                        raise RuntimeError(
+                            "Codex OAuth MFA 密钥校验失败后切换邮箱验证，"
+                            "但取码接口在等待时限内未返回新验证码；"
+                            f"MFA 返回: {previous_mfa_failure[:220]}"
+                        )
+                    otp_stage = "MFA 邮箱兜底验证" if otp_purpose == "mfa" else "登录邮箱验证"
+                    raise RuntimeError(
+                        f"Codex OAuth {otp_stage}取码失败："
+                        "取码接口在等待时限内未返回新验证码"
+                    )
                 otp_resp = _submit_otp_via_page(page, code, log)
                 log(f"  OAuth 验证码页提交状态: {otp_resp.get('status', 0)}")
                 if not otp_resp.get("ok"):
@@ -2660,6 +2734,7 @@ def _do_codex_oauth(
                         continue
                     raise RuntimeError(f"OAuth 验证码校验失败: {otp_error[:300]}")
                 otp_stall_recoveries = 0
+                previous_mfa_failure = ""
                 continue
 
             if state["page_type"] == "about_you":
@@ -2968,6 +3043,18 @@ def _reset_phone_callback_for_retry(phone_callback, reason: str = "") -> None:
 
 def _is_retryable_add_phone_error(message: str) -> bool:
     text = str(message or "").lower()
+    # OpenAI applies this limit to the account/session, not to a particular
+    # rented number.  Swapping numbers cannot clear it and only consumes more
+    # activations, so let the order-level scheduler retry the account later.
+    session_rate_limit_hints = (
+        "too many phone verification requests",
+        "phone_verification_rate_limit",
+        "phone verification request limit",
+        "手机号验证请求过多",
+        "手机验证码请求过多",
+    )
+    if any(hint in text for hint in session_rate_limit_hints):
+        return False
     retry_hints = (
         "未获取到短信验证码",
         "未获取到手机号",
@@ -3012,15 +3099,15 @@ def _resolve_add_phone_attempt_limit(phone_callback, configured_limit: int | Non
 
     One attempt is deliberately the default: a rejected number, missing SMS,
     or invalid code ends the current mailbox task and lets the task runner move
-    to the next mailbox. Operators that want automatic number changes can
-    raise ``register_phone_max_attempts`` in the SMS provider settings.
+    to the next mailbox. Operators can configure up to three number attempts
+    with ``register_phone_max_attempts`` in the SMS provider settings.
     """
     raw_limit = configured_limit
     if raw_limit is None:
         config = getattr(phone_callback, "config", {}) or {}
         raw_limit = config.get("register_phone_max_attempts", 1)
     try:
-        return min(10, max(1, int(raw_limit)))
+        return min(3, max(1, int(raw_limit)))
     except (TypeError, ValueError):
         return 1
 
@@ -4122,14 +4209,17 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if "consent" in current_url or "sign-in-with-chatgpt" in current_url or "workspace" in current_url or "organization" in current_url:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-        try:
-            error_text = page.locator("text=Invalid code").first.text_content(timeout=400)
-        except Exception:
-            error_text = ""
+        error_text = _extract_auth_error_text(page)
         if error_text:
             return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
         time.sleep(0.5)
-    return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "验证码页提交后未跳转"}
+    return {
+        "ok": False,
+        "status": 0,
+        "url": last_url,
+        "data": None,
+        "text": f"验证码页提交后未跳转: {_auth_page_diagnostic(page)}",
+    }
 
 
 def _recover_stalled_otp_submission(page, oauth_url: str, log) -> bool:

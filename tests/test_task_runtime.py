@@ -10,6 +10,7 @@ import application.tasks as tasks_module
 from application.tasks import (
     TASK_TYPE_REGISTER,
     _classify_registration_failure,
+    _registration_final_error,
     _registration_failure_reason,
     _task_account_keys,
     create_register_task,
@@ -104,6 +105,16 @@ def test_chatgpt_rate_limit_cooldown_is_disabled_by_default(monkeypatch):
 
 def test_registration_failure_classification_keeps_actionable_reason():
     assert _classify_registration_failure("HTTP 429 rate_limit_exceeded") == "openai_rate_limited"
+    assert _classify_registration_failure(
+        "Codex add_phone 浏览器处理失败: You've made too many phone verification requests. Please try again later."
+    ) == "phone_verification_rate_limited"
+    assert (
+        _classify_registration_failure(
+            "Codex Auth 未获取到 callback URL: HTTP 403: Your account has been deleted or deactivated"
+        )
+        == "account_deleted_or_deactivated"
+    )
+    assert _classify_registration_failure("HTTP 409: account_deactivated") == "account_deleted_or_deactivated"
     assert _classify_registration_failure("Incorrect email address or password") == "login_password_rejected"
     password_required = "Codex callback 未获取：该 OpenAI 账号不支持邮箱一次性验证码登录，必须提供正确的 OpenAI 登录密码"
     assert _classify_registration_failure(password_required) == "login_password_required"
@@ -112,6 +123,37 @@ def test_registration_failure_classification_keeps_actionable_reason():
     assert _classify_registration_failure("add_phone required") == "phone_verification_failed"
     detail = "Codex consent 页面未生成有效授权表单: page=Try again"
     assert _registration_failure_reason(detail, "oauth_callback_incomplete") == detail
+
+
+def test_wrapped_failures_keep_the_specific_inner_stage():
+    assert _classify_registration_failure(
+        "Codex Auth 未获取到 callback URL: 邮箱验证码等待超时 (30s)"
+    ) == "email_otp_timeout"
+    assert _classify_registration_failure(
+        "Codex Auth 未获取到 callback URL: HeroSMS 获取号码失败: V1=NO_NUMBERS"
+    ) == "sms_number_unavailable"
+    assert _classify_registration_failure(
+        "Codex Auth 未获取到 callback URL: Codex OAuth MFA 密钥校验失败后切换邮箱验证，"
+        "但取码接口在等待时限内未返回新验证码；MFA 返回: Incorrect code"
+    ) == "mfa_rejected_then_email_otp_timeout"
+
+
+def test_final_error_uses_latest_per_email_reason_and_redacts_credentials():
+    final_error = _registration_final_error(
+        [
+            {
+                "email": "mail@example.com",
+                "failure_kind": "openai_rate_limited",
+                "failure_reason": "HTTP 429 api_key=secret-value&country=57",
+            }
+        ],
+        ["first timeout"],
+    )
+
+    assert "mail@example.com" in final_error
+    assert "OpenAI 429 限流" in final_error
+    assert "api_key=***" in final_error
+    assert "secret-value" not in final_error
 
 
 def test_wake_up_dispatches_new_task_immediately(monkeypatch):

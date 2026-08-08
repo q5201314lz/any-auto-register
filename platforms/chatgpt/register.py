@@ -42,6 +42,10 @@ from .constants import (
 
 
 logger = logging.getLogger(__name__)
+EMAIL_OTP_WAIT_MAX_SECONDS = max(
+    30,
+    int(os.getenv("CHATGPT_EMAIL_OTP_WAIT_MAX_SECONDS", "90") or "90"),
+)
 
 
 def _copy_session_cookies(src, dst) -> None:
@@ -352,6 +356,7 @@ class RegistrationEngine:
         self._otp_page_type: Optional[str] = None
         self._last_codex_error: str = ""
         self._last_oauth_error: str = ""
+        self._last_email_otp_error: str = ""
         self._last_codex_consent_detail: str = ""
         self._codex_direct_token_info: Optional[Dict[str, Any]] = None
         self._codex_otp_continue_url: str = ""
@@ -1009,16 +1014,18 @@ class RegistrationEngine:
             self._log(f"发送验证码失败: {e}", "error")
             return False
 
-    def _get_verification_code(self, timeout: int = 120) -> Optional[str]:
+    def _get_verification_code(self, timeout: int = EMAIL_OTP_WAIT_MAX_SECONDS) -> Optional[str]:
         """获取验证码"""
+        wait_timeout = min(max(1, int(timeout or EMAIL_OTP_WAIT_MAX_SECONDS)), EMAIL_OTP_WAIT_MAX_SECONDS)
+        self._last_email_otp_error = ""
         try:
-            self._log(f"正在等待邮箱 {self.email} 的验证码...")
+            self._log(f"正在等待邮箱 {self.email} 的验证码，最多 {wait_timeout} 秒...")
 
             email_id = self.email_info.get("service_id") if self.email_info else None
             code = self.email_service.get_verification_code(
                 email=self.email,
                 email_id=email_id,
-                timeout=max(1, int(timeout or 120)),
+                timeout=wait_timeout,
                 pattern=OTP_CODE_PATTERN,
                 otp_sent_at=self._otp_sent_at,
             )
@@ -1027,11 +1034,17 @@ class RegistrationEngine:
                 self._log(f"成功获取验证码: {code}")
                 return code
             else:
-                self._log("等待验证码超时", "error")
+                self._last_email_otp_error = f"邮箱验证码等待超时 ({wait_timeout}s)，已进入下一个邮箱"
+                self._log(self._last_email_otp_error, "error")
                 return None
 
+        except TimeoutError:
+            self._last_email_otp_error = f"邮箱验证码等待超时 ({wait_timeout}s)，已进入下一个邮箱"
+            self._log(self._last_email_otp_error, "error")
+            return None
         except Exception as e:
-            self._log(f"获取验证码失败: {e}", "error")
+            self._last_email_otp_error = f"邮箱验证码读取失败: {e}"
+            self._log(self._last_email_otp_error, "error")
             return None
 
     def _validate_verification_code(self, code: str) -> bool:
@@ -1775,7 +1788,9 @@ class RegistrationEngine:
         self._log("Codex login 等待邮箱一次性验证码...")
         code = self._get_verification_code()
         if not code:
-            self._last_codex_error = "Codex 邮箱验证码读取失败：邮箱接口在 120 秒内未返回本次新验证码"
+            self._last_codex_error = self._last_email_otp_error or (
+                f"Codex 邮箱验证码读取失败：邮箱接口在 {EMAIL_OTP_WAIT_MAX_SECONDS} 秒内未返回本次新验证码"
+            )
             self._log(self._last_codex_error, "error")
             return None
 
@@ -1815,7 +1830,7 @@ class RegistrationEngine:
     def _complete_codex_login_password_in_browser(self) -> Optional[Dict[str, Any]]:
         """Finish a password challenge via MFA or the passwordless email fallback."""
         try:
-            from core.totp import fetch_totp_code, generate_totp
+            from core.totp import fetch_totp_code, generate_fresh_totp
             from platforms.chatgpt.browser_register import ChatGPTBrowserRegister
 
             def mark_browser_otp_sent() -> None:
@@ -1823,6 +1838,8 @@ class RegistrationEngine:
                 self._log("Codex login 已请求新的邮箱验证码")
 
             cached_mfa_otp = ""
+            cached_totp_code = ""
+            cached_totp_window = -1
 
             def wait_for_browser_otp(*, purpose: str = "") -> Optional[str]:
                 nonlocal cached_mfa_otp
@@ -1842,15 +1859,23 @@ class RegistrationEngine:
                 return code
 
             def current_mfa_code() -> Optional[str]:
+                nonlocal cached_totp_code, cached_totp_window
                 secret = str(getattr(self, "totp_secret", "") or "").strip()
                 totp_url = str(getattr(self, "totp_url", "") or "").strip()
+                current_window = int(time.time() // 30)
+                if cached_totp_code and cached_totp_window == current_window:
+                    return cached_totp_code
                 if totp_url:
                     code = fetch_totp_code(totp_url, proxy_url=self.proxy_url)
+                    cached_totp_code = code
+                    cached_totp_window = int(time.time() // 30)
                     self._log("Codex login 已从 MFA 地址获取当前验证码")
                     return code
                 if not secret:
                     return None
-                code = generate_totp(secret)
+                code = generate_fresh_totp(secret)
+                cached_totp_code = code
+                cached_totp_window = int(time.time() // 30)
                 self._log("Codex login 已生成当前 MFA 验证码")
                 return code
 
@@ -2426,9 +2451,15 @@ class RegistrationEngine:
             result.email = self.email or email
             self._is_existing_account = True
 
-            # MFA 导入账号由凭据格式决定登录方式，不能让协议页状态将其降级为邮箱 OTP。
-            if self.totp_secret or self.totp_url:
-                self._log("2. 已识别密码 + MFA 账号，固定走密码和 MFA 登录...")
+            # Supplier-provided passwords must start in browser OAuth so a
+            # password-only account is not downgraded to protocol email OTP.
+            # URL-only rows still have no supplied password and keep the email
+            # OTP path, including post-OTP MFA challenges.
+            if self._has_supplied_login_password:
+                if self.totp_secret or self.totp_url:
+                    self._log("2. 已识别密码 + MFA 账号，固定走密码和 MFA 登录...")
+                else:
+                    self._log("2. 已识别密码账号，固定走密码登录...")
                 token_info = self._complete_codex_login_password_in_browser()
                 if token_info:
                     self._codex_direct_token_info = token_info
@@ -2608,7 +2639,7 @@ class RegistrationEngine:
             self._log("10. 等待验证码...")
             code = self._get_verification_code()
             if not code:
-                result.error_message = "获取验证码失败"
+                result.error_message = self._last_email_otp_error or "获取验证码失败"
                 return result
 
             # 11. 验证验证码

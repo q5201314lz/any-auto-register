@@ -46,6 +46,22 @@ def generate_totp(
     return str(value % (10 ** digits)).zfill(digits)
 
 
+def generate_fresh_totp(
+    secret: str,
+    *,
+    period: int = 30,
+    digits: int = 6,
+    min_validity_seconds: float = 5,
+) -> str:
+    """Generate a code with enough lifetime left for a browser form submit."""
+    now = time.time()
+    remaining = period - (now % period)
+    if 0 <= remaining <= min_validity_seconds:
+        time.sleep(remaining + 0.1)
+        now = time.time()
+    return generate_totp(secret, timestamp=now, period=period, digits=digits)
+
+
 def _totp_api_url(url: str) -> str:
     parsed = urlparse(str(url or "").strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -55,8 +71,28 @@ def _totp_api_url(url: str) -> str:
     return urlunparse(parsed)
 
 
+def _totp_secret_from_url_path(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    host = parsed.netloc.lower().split(":", 1)[0]
+    path_parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if host in {"2fa.show", "2fa.fb.tools"} and path_parts:
+        candidate = path_parts[0]
+    elif host == "2fa.live" and len(path_parts) == 2 and path_parts[0].lower() == "tok":
+        candidate = path_parts[1]
+    else:
+        return ""
+    normalized = normalize_totp_secret(candidate)
+    if re.fullmatch(r"[A-Z2-7]{16,}", normalized):
+        return normalized
+    return ""
+
+
 def fetch_totp_code(url: str, *, proxy_url: str | None = None, timeout: int = 20) -> str:
     """Read a six-digit MFA code from a tokenized 2FA viewer/API URL."""
+    path_secret = _totp_secret_from_url_path(url)
+    if path_secret:
+        return generate_fresh_totp(path_secret)
+
     api_url = _totp_api_url(url)
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     headers = {
