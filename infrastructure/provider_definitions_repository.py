@@ -310,7 +310,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
             {"key": "herosms_auto_country", "label": "自动选择最优国家", "type": "toggle", "hint": "启用后忽略默认国家，自动选择价格最低且库存充足的国家"},
             {"key": "herosms_auto_country_min_stock", "label": "自动选国最低库存", "placeholder": "20"},
             {"key": "herosms_auto_country_max_price", "label": "自动选国最高价格", "placeholder": "0 (不限)"},
-            {"key": "register_phone_max_attempts", "label": "手机号验证尝试次数", "placeholder": "1", "hint": "1 表示首次失败就结束当前邮箱任务并继续下一个；大于 1 会自动换号重试。"},
+            {"key": "register_phone_max_attempts", "label": "手机号验证尝试次数", "placeholder": "5", "hint": "手机号被占用、短信超时或验证码失败时自动换号重试，最多 5 次；账号级请求过频交给任务调度器稍后重试。"},
             {"key": "register_account_max_attempts", "label": "注册失败补跑倍数", "placeholder": "1", "hint": "1 表示每个目标只执行一遍；大于 1 才会在失败后补跑。"},
             {"key": "register_phone_extra_max", "label": "号码复用额外上限", "placeholder": "3"},
             {"key": "register_reuse_phone_to_max", "label": "复用号码至最大", "type": "toggle"},
@@ -329,7 +329,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "fields": [
             {"key": "sms_activate_api_key", "label": "API Key", "secret": True},
             {"key": "sms_activate_default_country", "label": "默认国家代码", "placeholder": "ru"},
-            {"key": "register_phone_max_attempts", "label": "手机号验证尝试次数", "placeholder": "1", "hint": "1 表示首次失败就结束当前邮箱任务并继续下一个；大于 1 会自动换号重试。"},
+            {"key": "register_phone_max_attempts", "label": "手机号验证尝试次数", "placeholder": "5", "hint": "手机号被占用、短信超时或验证码失败时自动换号重试，最多 5 次；账号级请求过频交给任务调度器稍后重试。"},
         ],
     },
     {
@@ -348,7 +348,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
             {"key": "smsbower_default_service", "label": "默认服务", "type": "async-select", "asyncUrl": "/sms/smsbower/services", "asyncValueKey": "code", "asyncLabelKey": "name", "placeholder": "请选择服务..."},
             {"key": "smsbower_max_price", "label": "最大价格 (可选)", "placeholder": "-1"},
             {"key": "smsbower_auto_country", "label": "自动选择最优国家", "type": "toggle", "hint": "启用后忽略默认国家，自动选择价格最低且库存充足的国家"},
-            {"key": "register_phone_max_attempts", "label": "手机号验证尝试次数", "placeholder": "1", "hint": "1 表示首次失败就结束当前邮箱任务并继续下一个；大于 1 会自动换号重试。"},
+            {"key": "register_phone_max_attempts", "label": "手机号验证尝试次数", "placeholder": "5", "hint": "手机号被占用、短信超时或验证码失败时自动换号重试，最多 5 次；账号级请求过频交给任务调度器稍后重试。"},
             {"key": "register_account_max_attempts", "label": "注册失败补跑倍数", "placeholder": "1", "hint": "1 表示每个目标只执行一遍；大于 1 才会在失败后补跑。"},
             {"key": "register_phone_extra_max", "label": "号码复用额外上限", "placeholder": "3"},
             {"key": "register_reuse_phone_to_max", "label": "复用号码至最大", "type": "toggle"},

@@ -3097,19 +3097,18 @@ def _is_retryable_add_phone_error(message: str) -> bool:
 def _resolve_add_phone_attempt_limit(phone_callback, configured_limit: int | None = None) -> int:
     """Resolve the per-account phone verification attempt limit.
 
-    One attempt is deliberately the default: a rejected number, missing SMS,
-    or invalid code ends the current mailbox task and lets the task runner move
-    to the next mailbox. Operators can configure up to three number attempts
-    with ``register_phone_max_attempts`` in the SMS provider settings.
+    Five attempts are the default: a rejected number, missing SMS, or invalid
+    code causes a fresh number to be tried. Operators can lower or raise the
+    setting up to the five-attempt cap with ``register_phone_max_attempts``.
     """
     raw_limit = configured_limit
     if raw_limit is None:
         config = getattr(phone_callback, "config", {}) or {}
-        raw_limit = config.get("register_phone_max_attempts", 1)
+        raw_limit = config.get("register_phone_max_attempts", 5)
     try:
-        return min(3, max(1, int(raw_limit)))
+        return min(5, max(1, int(raw_limit)))
     except (TypeError, ValueError):
-        return 1
+        return 5
 
 
 def _handle_add_phone_challenge(
@@ -3126,7 +3125,7 @@ def _handle_add_phone_challenge(
 
     流程: 选择国家 -> 输入本地号码 -> 点击发送 -> 填写 OTP -> 点击验证。
     如果手机号被使用、页面拒绝、验证码错误/超时等，会按接码配置换号重试。
-    默认只尝试一次，失败后由任务调度器继续下一个邮箱。
+    默认最多尝试五次；手机号被占用、短信超时或验证码失败时会换号重试。
     """
     if not phone_callback:
         raise RuntimeError(

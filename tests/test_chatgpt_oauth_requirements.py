@@ -19,12 +19,66 @@ from platforms.chatgpt.register import RegistrationEngine, SignupFormResult, _se
 
 @pytest.mark.parametrize(
     ("configured", "expected"),
-    [(1, 1), (2, 2), (3, 3), (5, 3), (99, 3), (0, 1), ("invalid", 1)],
+    [(1, 1), (2, 2), (3, 3), (5, 5), (99, 5), (0, 1), ("invalid", 5)],
 )
-def test_add_phone_attempt_limit_is_configurable_but_capped_at_three(configured, expected):
+def test_add_phone_attempt_limit_is_configurable_but_capped_at_five(configured, expected):
     callback = SimpleNamespace(config={"register_phone_max_attempts": configured})
 
     assert browser_register_module._resolve_add_phone_attempt_limit(callback) == expected
+
+
+def test_add_phone_attempt_limit_defaults_to_five():
+    callback = SimpleNamespace(config={})
+
+    assert browser_register_module._resolve_add_phone_attempt_limit(callback) == 5
+
+
+def test_add_phone_retry_releases_failed_number_and_tries_again(monkeypatch):
+    class PhoneCallback:
+        config = {"register_phone_max_attempts": 5}
+        phase = "need_code"
+        activation = object()
+        completed = False
+        awaiting_external_success = True
+
+        def __init__(self):
+            self.cleanup_calls = 0
+            self.failed_reasons = []
+
+        def mark_send_failed(self, reason):
+            self.failed_reasons.append(reason)
+
+        def cleanup(self):
+            self.cleanup_calls += 1
+
+    callback = PhoneCallback()
+    page = SimpleNamespace(url="https://auth.openai.com/add-phone", goto=lambda *args, **kwargs: None)
+    attempts = []
+
+    def do_attempt(*args, **kwargs):
+        attempts.append(len(attempts) + 1)
+        if len(attempts) == 1:
+            raise RuntimeError("手机号提交失败: phone_number_in_use")
+        return {"page_type": "consent"}
+
+    monkeypatch.setattr(browser_register_module, "_do_add_phone_attempt", do_attempt)
+    monkeypatch.setattr(browser_register_module.time, "sleep", lambda _seconds: None)
+
+    result = browser_register_module._handle_add_phone_challenge(
+        page,
+        callback,
+        device_id="device-id",
+        user_agent="test-agent",
+        log=lambda _message: None,
+    )
+
+    assert result == {"page_type": "consent"}
+    assert attempts == [1, 2]
+    assert callback.cleanup_calls == 1
+    assert callback.failed_reasons == ["手机号提交失败: phone_number_in_use"]
+    assert callback.phase == "need_number"
+    assert callback.activation is None
+    assert callback.awaiting_external_success is False
 
 
 def test_add_phone_account_rate_limit_does_not_swap_numbers():
