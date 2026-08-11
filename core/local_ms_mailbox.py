@@ -1373,6 +1373,20 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         )
 
     @staticmethod
+    def _nnai_email_history_endpoint(
+        entry: LocalMicrosoftMailboxEntry,
+    ) -> tuple[str, str] | None:
+        parsed = urlparse(str(entry.icloud_api_url or "").strip())
+        host = str(parsed.hostname or "").lower()
+        if host != "getemail.nnai.uk" and not host.endswith(".getemail.nnai.uk"):
+            return None
+        query = parse_qs(parsed.query)
+        email = str((query.get("email") or query.get("mail") or [""])[0]).strip()
+        if not email or email.lower() != entry.email.strip().lower():
+            return None
+        return "https://redeem.nnai.uk/api/internal/oauth/email-history", email
+
+    @staticmethod
     def _yangyang_messages_endpoint(url: str) -> tuple[str, str, str, str] | None:
         parsed = urlparse(str(url or "").strip())
         if not parsed.scheme or not parsed.netloc:
@@ -1693,6 +1707,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             return self._flysms_api_messages(entry, flysms_endpoint)
         mailroom_endpoint = self._mailroom_public_endpoint(entry.icloud_api_url)
         cdk_mail_endpoint = self._cdk_mail_endpoint(entry.icloud_api_url)
+        nnai_endpoint = self._nnai_email_history_endpoint(entry)
         headers = {
             "accept": "application/json,text/html,text/plain,*/*",
             "user-agent": "Mozilla/5.0",
@@ -1701,7 +1716,16 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         }
         tokenized_latest_endpoint = self._tokenized_latest_endpoint(entry.icloud_api_url)
         rangertalking_endpoint = self._rangertalking_verification_endpoint(entry)
-        if cdk_mail_endpoint:
+        if nnai_endpoint:
+            api_url, email = nnai_endpoint
+            response = requests.get(
+                api_url,
+                headers=headers,
+                params={"email": email, "_": time.time_ns()},
+                proxies=self.proxy,
+                timeout=25,
+            )
+        elif cdk_mail_endpoint:
             response = requests.get(
                 cdk_mail_endpoint,
                 headers=headers,

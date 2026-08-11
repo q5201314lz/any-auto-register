@@ -491,6 +491,55 @@ def test_dynamic_cdk_mail_page_uses_json_mail_endpoint(monkeypatch):
     assert "711105" in messages[0]["bodyPreview"]
 
 
+def test_nnai_retired_pickup_host_uses_redeem_email_history(monkeypatch):
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json; charset=utf-8"}
+        text = ""
+
+        def json(self):
+            return {
+                "ok": True,
+                "email": "account@icloud.com",
+                "messages": [
+                    {
+                        "subject": "Your temporary ChatGPT login code",
+                        "receivedAt": 1786076123,
+                        "verificationCode": "654321",
+                    }
+                ],
+            }
+
+    captured = []
+
+    def fake_get(url, **kwargs):
+        captured.append((url, kwargs))
+        return Response()
+
+    monkeypatch.setattr("core.local_ms_mailbox.requests.get", fake_get)
+    entry = LocalMicrosoftMailboxEntry(
+        email="account@icloud.com",
+        receive_provider="icloud_api",
+        icloud_api_url="https://getemail.nnai.uk/?email=account%40icloud.com",
+    )
+
+    messages = LocalMicrosoftMailboxPool()._icloud_api_messages(entry)
+
+    assert captured[0][0] == "https://redeem.nnai.uk/api/internal/oauth/email-history"
+    assert captured[0][1]["params"]["email"] == "account@icloud.com"
+    assert "654321" in messages[0]["bodyPreview"]
+
+
+def test_nnai_pickup_email_must_match_row_email():
+    entry = LocalMicrosoftMailboxEntry(
+        email="expected@icloud.com",
+        receive_provider="icloud_api",
+        icloud_api_url="https://getemail.nnai.uk/?email=other%40icloud.com",
+    )
+
+    assert LocalMicrosoftMailboxPool._nnai_email_history_endpoint(entry) is None
+
+
 def test_mailroom_fragment_link_calls_public_api_and_reads_root_code(monkeypatch):
     class Response:
         status_code = 200
